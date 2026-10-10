@@ -223,8 +223,10 @@ curl -s -XPOST $H/api/control/resume
   is a run, numbered: the reply to `resume` (and to `run`) has `"run":N`.
   `GET /api/control/wait?run=N` waits until run N stops, and if it stopped
   already, before the wait came, answers at once with that stop: its
-  `reason`, `run` and what else the stop reported, and the registers as
-  they are now. A plain `wait` only says the machine is paused.
+  `reason`, `run` and what else the stop reported, and the registers and
+  `icount` as they are now, with `"paused":false` if the machine went on since. A
+  plain `wait` answers with the last stop while the machine is paused,
+  and otherwise waits for the next one.
   `/api/status` has `run` and, while paused, `stop`. The last 16 stops are
   kept for this.
 - **Run to an address:** `POST /api/control/resume {"until":"1000:0120"}`

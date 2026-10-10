@@ -471,7 +471,8 @@ pub struct DebugHub {
     /// Skip the breakpoint check for the first instruction after resuming,
     /// so continuing from a breakpoint doesn't immediately re-trigger it.
     skip_bp_once: bool,
-    pause_hit: Option<PauseReason>,
+    /// A stop not reported yet, with the run it ended.
+    pause_hit: Option<(PauseReason, u64)>,
     pause_waiters: Vec<oneshot::Sender<Reply>>,
     /// Continuations: bumped each time the machine goes from paused to
     /// running, so the run going now (or that the pause ended) is `runs`.
@@ -833,8 +834,7 @@ impl DebugHub {
     /// Call after the execution batch: delivers pause notifications and
     /// streams new trace entries.
     pub fn end_batch(&mut self, cpu: &Cpu) {
-        if let Some(reason) = self.pause_hit.take() {
-            let regs = regs_json(cpu);
+        if let Some((reason, run)) = self.pause_hit.take() {
             let reason_str = match reason {
                 PauseReason::Request => "request",
                 PauseReason::Breakpoint => "breakpoint",
@@ -845,7 +845,7 @@ impl DebugHub {
                 PauseReason::ProgramStart => "program_start",
                 PauseReason::ProgramExit => "program_exit",
             };
-            let mut reply = json!({"paused": true, "reason": reason_str, "run": self.runs, "icount": cpu.executed, "registers": regs});
+            let mut reply = json!({"paused": true, "reason": reason_str, "run": run, "icount": cpu.executed});
             match reason {
                 PauseReason::ProgramStart => reply["program"] = program_json(cpu),
                 PauseReason::ProgramExit => reply["exit"] = exit_json(cpu),
@@ -865,14 +865,11 @@ impl DebugHub {
                     "new": format!("{:0width$X}", new, width = digits),
                 });
             }
-            let mut stop = reply.clone();
-            if let Value::Object(o) = &mut stop {
-                o.remove("registers");
-            }
             if self.stops.len() == STOPS_KEPT {
                 self.stops.pop_front();
             }
-            self.stops.push_back(stop);
+            self.stops.push_back(reply.clone());
+            reply["registers"] = regs_json(cpu);
             let mut event = reply.clone();
             event["type"] = "paused".into();
             self.emit(event);
@@ -1090,7 +1087,7 @@ impl DebugHub {
     fn enter_pause(&mut self, reason: PauseReason) {
         self.paused = true;
         self.step_budget = None;
-        self.pause_hit = Some(reason);
+        self.pause_hit = Some((reason, self.runs));
     }
 
     /// Let the machine run again, as the next run, if it is paused.
@@ -1108,9 +1105,11 @@ impl DebugHub {
         self.paused && self.pause_hit.is_none()
     }
 
-    /// The reply about a stop, with the registers as they are now.
+    /// The reply about a stop, with the registers and icount as they are
+    /// now (so the two match) and whether the machine is still paused.
     fn stop_reply(&self, cpu: &Cpu, stop: Option<&Value>) -> Value {
-        let mut reply = stop.cloned().unwrap_or_else(|| json!({"paused": true, "run": self.runs}));
+        let mut reply = stop.cloned().unwrap_or_else(|| json!({"run": self.runs}));
+        reply["paused"] = self.paused.into();
         reply["icount"] = cpu.executed.into();
         reply["registers"] = regs_json(cpu);
         reply
@@ -2544,6 +2543,22 @@ mod tests {
         ask(&mut cpu, &mut hub, Cmd::Pause, 5).unwrap();
         let stop = answer(&mut cpu, &mut hub, rx, 0).unwrap();
         assert_eq!((stop["reason"].as_str(), stop["run"].as_u64()), (Some("request"), Some(run + 1)));
+    }
+
+    #[test]
+    fn a_stop_resumed_before_it_was_reported_keeps_its_run() {
+        let (mut cpu, mut hub) = machine("pending");
+        let before = hub.runs;
+        let paused = send(&mut cpu, &mut hub, Cmd::Pause);
+        let resumed = ask(&mut cpu, &mut hub, Cmd::Resume { until: None }, 0).unwrap();
+        assert_eq!(resumed["run"].as_u64(), Some(before + 1));
+        let stop = answer(&mut cpu, &mut hub, paused, 1).unwrap();
+        assert_eq!((stop["reason"].as_str(), stop["run"].as_u64()), (Some("request"), Some(before)));
+        // The run going now has no stop yet: a wait for it waits.
+        let rx = send(&mut cpu, &mut hub, Cmd::WaitPause { run: Some(before + 1) });
+        ask(&mut cpu, &mut hub, Cmd::Pause, 5).unwrap();
+        let stop = answer(&mut cpu, &mut hub, rx, 0).unwrap();
+        assert_eq!(stop["run"].as_u64(), Some(before + 1));
     }
 
     /// Run until the hub pauses, for at most 50 frames.
