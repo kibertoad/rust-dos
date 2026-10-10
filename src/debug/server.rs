@@ -522,13 +522,15 @@ async fn control(State(s): State<AppState>, Path(action): Path<String>, body: By
 }
 
 #[derive(Deserialize)]
-struct TimeoutQuery {
+struct PauseWaitQuery {
     timeout_ms: Option<u64>,
+    /// The run to wait for the end of, as resume and run replies give it.
+    run: Option<u64>,
 }
 
-async fn wait_pause(State(s): State<AppState>, Query(q): Query<TimeoutQuery>) -> ApiResult {
+async fn wait_pause(State(s): State<AppState>, Query(q): Query<PauseWaitQuery>) -> ApiResult {
     let t = Duration::from_millis(q.timeout_ms.unwrap_or(30_000));
-    s.call_json(Cmd::WaitPause, t).await
+    s.call_json(Cmd::WaitPause { run: q.run }, t).await
 }
 
 async fn regs_get(State(s): State<AppState>) -> ApiResult {
@@ -981,7 +983,11 @@ EXECUTION CONTROL
                              (reason "program_start"); 422 if it started none
   POST /api/control/reboot_shell                     kill the running program
   POST /api/control/reboot                           reset the machine, as Ctrl+Alt+Del
-  GET  /api/control/wait?timeout_ms=30000            block until the emulator pauses
+  GET  /api/control/wait?timeout_ms=30000[&run=N]    block until the emulator pauses; with
+                             run (from resume's, run's or a stop's "run"), until that
+                             continuation ended, answering at once if it already did
+  Each continuation from a pause is a run; replies to pauses, /api/status and the
+  paused/resumed events carry "run", and the stop a run ended in has its "reason".
   GET  /api/registers        PUT /api/registers {"ax":"1234","flags":"0202"}
   GET  /api/memory?addr=DS:SI&len=256[&format=hex|base64|raw]
   PUT  /api/memory {"addr":"B800:0000","hex":"41 1F"}  (or "base64")

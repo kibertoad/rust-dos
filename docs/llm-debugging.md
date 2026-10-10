@@ -214,6 +214,14 @@ curl -s -XPOST $H/api/control/resume
 - **Why `wait=false`:** use it for input that should trigger a breakpoint.
   Otherwise the input call can block until it times out, because the
   emulator stops at the breakpoint before all of the input is delivered.
+- **Waiting without a race:** each time the machine goes on from a pause
+  is a run, numbered: the reply to `resume` (and to `run`) has `"run":N`.
+  `GET /api/control/wait?run=N` waits until run N stops, and if it stopped
+  already, before the wait came, answers at once with that stop: its
+  `reason`, `run` and what else the stop reported, and the registers as
+  they are now. A plain `wait` only says the machine is paused.
+  `/api/status` has `run` and, while paused, `stop`. The last 16 stops are
+  kept for this.
 - **Run to an address:** `POST /api/control/resume {"until":"1000:0120"}`
   runs to that address once, without adding a permanent breakpoint.
 - **Step over:** `POST /api/control/step_over` runs a `CALL`, `INT`, `LOOP`

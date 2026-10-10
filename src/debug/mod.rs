@@ -35,6 +35,8 @@ pub use pm::{parse_addr, parse_hex};
 use trace::{TraceEntry, TraceRing};
 
 const LOG_RING_CAPACITY: usize = 5000;
+/// The stops `wait?run=` finds by their run.
+const STOPS_KEPT: usize = 16;
 
 /// State shared between the emulator thread and the server thread.
 pub struct Shared {
@@ -123,7 +125,9 @@ pub enum Cmd {
     /// Step, but run a call, interrupt, loop or repeated string instruction
     /// through to the instruction after it.
     StepOver,
-    WaitPause,
+    /// Wait for the machine to stop: at the end of continuation `run`
+    /// (answered at once if it ended already), or the next stop.
+    WaitPause { run: Option<u64> },
     RebootShell,
     Reboot,
     GetRegs,
@@ -469,6 +473,12 @@ pub struct DebugHub {
     skip_bp_once: bool,
     pause_hit: Option<PauseReason>,
     pause_waiters: Vec<oneshot::Sender<Reply>>,
+    /// Continuations: bumped each time the machine goes from paused to
+    /// running, so the run going now (or that the pause ended) is `runs`.
+    runs: u64,
+    /// The last stops, newest last, each with the run it ended (the reply
+    /// to the pause, less the registers).
+    stops: VecDeque<Value>,
     /// Exceptions (bit n = vector n) and mode switches to pause after, and
     /// the counts of them last seen.
     break_exceptions: u32,
@@ -575,6 +585,8 @@ impl DebugHub {
             skip_bp_once: false,
             pause_hit: None,
             pause_waiters: Vec::new(),
+            runs: 0,
+            stops: VecDeque::with_capacity(STOPS_KEPT),
             break_exceptions: 0,
             break_mode_switch: false,
             seen_exceptions: 0,
@@ -830,7 +842,7 @@ impl DebugHub {
                 PauseReason::ProgramStart => "program_start",
                 PauseReason::ProgramExit => "program_exit",
             };
-            let mut reply = json!({"paused": true, "reason": reason_str, "icount": cpu.executed, "registers": regs});
+            let mut reply = json!({"paused": true, "reason": reason_str, "run": self.runs, "icount": cpu.executed, "registers": regs});
             match reason {
                 PauseReason::ProgramStart => reply["program"] = program_json(cpu),
                 PauseReason::ProgramExit => reply["exit"] = exit_json(cpu),
@@ -850,6 +862,14 @@ impl DebugHub {
                     "new": format!("{:0width$X}", new, width = digits),
                 });
             }
+            let mut stop = reply.clone();
+            if let Value::Object(o) = &mut stop {
+                o.remove("registers");
+            }
+            if self.stops.len() == STOPS_KEPT {
+                self.stops.pop_front();
+            }
+            self.stops.push_back(stop);
             let mut event = reply.clone();
             event["type"] = "paused".into();
             self.emit(event);
@@ -1039,7 +1059,7 @@ impl DebugHub {
             if !run.stop_at_entry
                 && let Some(run) = self.run_wait.take()
             {
-                let _ = run.reply.send(Reply::Json(json!({"ok": true, "program": program_json(cpu)})));
+                let _ = run.reply.send(Reply::Json(json!({"ok": true, "run": self.runs, "program": program_json(cpu)})));
             }
         } else if cpu.shell_idle() && !cpu.batch.is_active() && cpu.pending_command.is_none() {
             self.start_once = false;
@@ -1055,11 +1075,27 @@ impl DebugHub {
         self.pause_hit = Some(reason);
     }
 
-    fn resume(&mut self) {
+    /// Let the machine run again, as the next run, if it is paused.
+    fn resume(&mut self, cpu: &Cpu) {
         if self.paused {
             self.paused = false;
             self.skip_bp_once = true;
+            self.runs += 1;
+            self.emit(json!({"type": "resumed", "run": self.runs, "icount": cpu.executed}));
         }
+    }
+
+    /// The machine is paused and its stop was reported.
+    fn stopped(&self) -> bool {
+        self.paused && self.pause_hit.is_none()
+    }
+
+    /// The reply about a stop, with the registers as they are now.
+    fn stop_reply(&self, cpu: &Cpu, stop: Option<&Value>) -> Value {
+        let mut reply = stop.cloned().unwrap_or_else(|| json!({"paused": true, "run": self.runs}));
+        reply["icount"] = cpu.executed.into();
+        reply["registers"] = regs_json(cpu);
+        reply
     }
 
     // ----- input ------------------------------------------------------------
@@ -1308,8 +1344,8 @@ impl DebugHub {
                 Reply::Json(json!({"ok": true}))
             }
             Cmd::Pause => {
-                if self.paused && self.pause_hit.is_none() {
-                    Reply::Json(json!({"paused": true, "icount": cpu.executed, "registers": regs_json(cpu)}))
+                if self.stopped() {
+                    Reply::Json(self.stop_reply(cpu, self.stops.back()))
                 } else {
                     if !self.paused {
                         self.enter_pause(PauseReason::Request);
@@ -1329,16 +1365,12 @@ impl DebugHub {
                         }
                     }
                 }
-                let was = self.paused;
-                self.resume();
-                if was {
-                    self.emit(json!({"type": "resumed", "icount": cpu.executed}));
-                }
-                Reply::Json(json!({"ok": true, "paused": false}))
+                self.resume(cpu);
+                Reply::Json(json!({"ok": true, "paused": false, "run": self.runs}))
             }
             Cmd::Step { count } => {
                 self.step_budget = Some(count.max(1));
-                self.resume();
+                self.resume(cpu);
                 self.pause_waiters.push(req.reply);
                 return;
             }
@@ -1347,30 +1379,31 @@ impl DebugHub {
                     Some(next) => self.temp_breakpoint = Some(next),
                     None => self.step_budget = Some(1),
                 }
-                let was = self.paused;
-                self.resume();
-                if was {
-                    self.emit(json!({"type": "resumed", "icount": cpu.executed}));
-                }
+                self.resume(cpu);
                 self.pause_waiters.push(req.reply);
                 return;
             }
-            Cmd::WaitPause => {
-                if self.paused && self.pause_hit.is_none() {
-                    Reply::Json(json!({"paused": true, "icount": cpu.executed, "registers": regs_json(cpu)}))
-                } else {
-                    self.pause_waiters.push(req.reply);
-                    return;
-                }
+            Cmd::WaitPause { run: None } if self.stopped() => Reply::Json(self.stop_reply(cpu, self.stops.back())),
+            Cmd::WaitPause { run: Some(run) } if run > self.runs => {
+                Reply::bad(format!("run {} hasn't started: the machine is at run {}", run, self.runs))
+            }
+            Cmd::WaitPause { run: Some(run) } if run < self.runs || self.stopped() => {
+                // The stop that ended it, or the oldest kept after it.
+                let stop = self.stops.iter().find(|s| s["run"].as_u64().is_some_and(|r| r >= run));
+                Reply::Json(self.stop_reply(cpu, stop))
+            }
+            Cmd::WaitPause { .. } => {
+                self.pause_waiters.push(req.reply);
+                return;
             }
             Cmd::RebootShell => {
                 cpu.state = CpuState::RebootShell;
-                self.resume();
+                self.resume(cpu);
                 Reply::Json(json!({"ok": true}))
             }
             Cmd::Reboot => {
                 cpu.bus.reset_requested = true;
-                self.resume();
+                self.resume(cpu);
                 Reply::Json(json!({"ok": true}))
             }
             Cmd::GetRegs => Reply::Json(regs_json(cpu)),
@@ -1531,11 +1564,7 @@ impl DebugHub {
                     self.seen_starts = cpu.programs.started;
                     self.start_once = stop_at_entry;
                     self.run_wait = Some(RunWait { before: cpu.programs.started, stop_at_entry, reply: req.reply });
-                    let was = self.paused;
-                    self.resume();
-                    if was {
-                        self.emit(json!({"type": "resumed", "icount": cpu.executed}));
-                    }
+                    self.resume(cpu);
                     return;
                 }
             }
@@ -1774,6 +1803,9 @@ impl DebugHub {
         // to end did.
         status["program"] = cpu.program.clone().into();
         status["last_exit"] = exit_json(cpu);
+        // The run going now, or that the pause ended, and its stop.
+        status["run"] = self.runs.into();
+        status["stop"] = if self.stopped() { self.stops.back().cloned().unwrap_or_default() } else { Value::Null };
         status
     }
 
@@ -2362,7 +2394,9 @@ mod tests {
     fn run(cpu: &mut Cpu, hub: &mut DebugHub, frames: usize) {
         for _ in 0..frames {
             hub.poll(cpu);
+            // Paused, the main loop runs empty batches.
             if hub.paused {
+                hub.end_batch(cpu);
                 continue;
             }
             let hot = hub.begin_batch(cpu);
@@ -2426,10 +2460,48 @@ mod tests {
         ask(&mut cpu, &mut hub, break_on(None, Some(true)), 0).unwrap();
         ask(&mut cpu, &mut hub, Cmd::Run { command: "PROBE.COM".into(), stop_at_entry: true }, 50).unwrap();
         ask(&mut cpu, &mut hub, Cmd::Resume { until: None }, 0).unwrap();
-        let stop = ask(&mut cpu, &mut hub, Cmd::WaitPause, 50).unwrap();
+        let stop = ask(&mut cpu, &mut hub, Cmd::WaitPause { run: None }, 50).unwrap();
         assert_eq!(stop["reason"], "program_exit");
         assert!(hub.paused);
         assert_eq!(stop["exit"], serde_json::json!({"name": "PROBE.COM", "code": 0, "resident": false}));
+    }
+
+    #[test]
+    fn a_wait_for_a_run_that_already_stopped_gets_its_stop() {
+        let (mut cpu, mut hub) = machine("race");
+        let entry = ask(&mut cpu, &mut hub, Cmd::Run { command: "PROBE.COM".into(), stop_at_entry: true }, 50).unwrap();
+        let cs = entry["registers"]["cs"].as_str().unwrap().to_string();
+        ask(&mut cpu, &mut hub, Cmd::AddBreakpoint(format!("{}:0106", cs)), 0).unwrap();
+        let resumed = ask(&mut cpu, &mut hub, Cmd::Resume { until: None }, 0).unwrap();
+        let run = resumed["run"].as_u64().unwrap();
+        assert_eq!(run, entry["run"].as_u64().unwrap() + 1);
+        // The breakpoint is hit before anyone waits for it.
+        run_frames(&mut cpu, &mut hub);
+        let stop = ask(&mut cpu, &mut hub, Cmd::WaitPause { run: Some(run) }, 0).unwrap();
+        assert_eq!((stop["reason"].as_str(), stop["run"].as_u64()), (Some("breakpoint"), Some(run)));
+        assert_eq!(stop["registers"]["ip"], "0106");
+        // The stop at the entry point is still there for its run.
+        let earlier = ask(&mut cpu, &mut hub, Cmd::WaitPause { run: Some(run - 1) }, 0).unwrap();
+        assert_eq!(earlier["reason"], "program_start");
+        let err = ask(&mut cpu, &mut hub, Cmd::WaitPause { run: Some(run + 1) }, 0).unwrap_err();
+        assert_eq!(err.0, 400, "a run that hasn't started");
+        // Waiting for the next run waits for its stop.
+        let resumed = ask(&mut cpu, &mut hub, Cmd::Resume { until: None }, 0).unwrap();
+        let rx = send(&mut cpu, &mut hub, Cmd::WaitPause { run: resumed["run"].as_u64() });
+        ask(&mut cpu, &mut hub, Cmd::Pause, 5).unwrap();
+        let stop = answer(&mut cpu, &mut hub, rx, 0).unwrap();
+        assert_eq!((stop["reason"].as_str(), stop["run"].as_u64()), (Some("request"), Some(run + 1)));
+    }
+
+    /// Run until the hub pauses, for at most 50 frames.
+    fn run_frames(cpu: &mut Cpu, hub: &mut DebugHub) {
+        for _ in 0..50 {
+            if hub.paused {
+                return;
+            }
+            run(cpu, hub, 1);
+        }
+        panic!("the machine didn't stop");
     }
 
     #[test]
@@ -2447,7 +2519,7 @@ mod tests {
         let (mut cpu, mut hub) = machine("every");
         ask(&mut cpu, &mut hub, break_on(Some(true), None), 0).unwrap();
         cpu.queue_batch_lines(["PROBE.COM"]);
-        let stop = ask(&mut cpu, &mut hub, Cmd::WaitPause, 50).unwrap();
+        let stop = ask(&mut cpu, &mut hub, Cmd::WaitPause { run: None }, 50).unwrap();
         assert_eq!((stop["reason"].as_str(), stop["registers"]["ip"].as_str()), (Some("program_start"), Some("0100")));
     }
 
