@@ -11,7 +11,7 @@
 //! Paths are the components of a DOS path from the root ("GAMES", "DOOM"),
 //! with "." and ".." already folded away.
 
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -62,6 +62,17 @@ pub fn dos_now() -> (u16, u16) {
 pub struct EntryRef {
     sector: u64,
     index: usize,
+}
+
+/// Where a read of a file stopped in its cluster chain: the chain starting
+/// at `first`, its `index`th cluster `cluster`, with the FAT as it was at
+/// `version` (`FatVolume::read_from`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    first: u32,
+    index: u64,
+    cluster: u32,
+    version: u64,
 }
 
 /// A file or directory.
@@ -384,6 +395,10 @@ struct State {
     dirty: BTreeSet<u64>,
     /// The image's write count the FAT was read at, or last written at.
     generation: u64,
+    /// Counts the changes to the FAT, and the times it was read again: a
+    /// `Cursor` taken at another count may point into a chain that is no
+    /// longer there.
+    version: u64,
     /// Where to look for a free cluster first.
     next_free: u32,
     /// The free clusters, once counted.
@@ -450,6 +465,7 @@ impl State {
     }
 
     fn set(&mut self, n: u32, value: u32) {
+        self.version += 1;
         let old = self.get(n);
         let at = n as usize;
         match self.params.kind {
@@ -592,6 +608,7 @@ impl FatVolume {
             chunks: RefCell::new(vec![None; fat_len.div_ceil(FAT_CHUNK)]),
             dirty: BTreeSet::new(),
             generation: disk.generation(),
+            version: 0,
             next_free: 2,
             free: None,
             fsinfo: None,
@@ -622,7 +639,11 @@ impl FatVolume {
         let mut state = self.state.borrow_mut();
         if state.generation != self.disk.generation() {
             match Self::load(&self.disk, self.start, self.sectors) {
-                Ok(fresh) => *state = fresh,
+                Ok(fresh) => {
+                    let version = state.version + 1;
+                    *state = fresh;
+                    state.version = version;
+                }
                 // A boot sector overwritten with junk: keep going with what
                 // was there.
                 Err(_) => state.generation = self.disk.generation(),
@@ -1056,6 +1077,14 @@ impl FatVolume {
     /// Read from `offset` of `file` into `buf`: the number of bytes read,
     /// fewer at the end of the file.
     pub fn read(&self, file: &Entry, offset: u64, buf: &mut [u8]) -> Result<usize, u8> {
+        self.read_from(file, offset, buf, &Cell::new(None))
+    }
+
+    /// `read`, starting the walk along the file's cluster chain where the
+    /// last read through `cursor` stopped when that is on the way, and
+    /// leaving `cursor` where this one stops. A file read in small pieces
+    /// would otherwise walk its chain from the first cluster on each read.
+    pub fn read_from(&self, file: &Entry, offset: u64, buf: &mut [u8], cursor: &Cell<Option<Cursor>>) -> Result<usize, u8> {
         let state = self.state();
         let size = file.size as u64;
         if offset >= size || buf.is_empty() {
@@ -1063,15 +1092,20 @@ impl FatVolume {
         }
         let len = (buf.len() as u64).min(size - offset) as usize;
         let cluster_bytes = state.params.cluster_bytes;
-        let mut cluster = file.cluster;
-        if !(2..=state.max_cluster()).contains(&cluster) {
+        if !(2..=state.max_cluster()).contains(&file.cluster) {
             return Ok(0);
         }
-        for _ in 0..offset / cluster_bytes {
+        let target = offset / cluster_bytes;
+        let (mut index, mut cluster) = match cursor.get() {
+            Some(c) if c.first == file.cluster && c.version == state.version && c.index <= target => (c.index, c.cluster),
+            _ => (0, file.cluster),
+        };
+        while index < target {
             match state.next(cluster) {
                 Some(next) => cluster = next,
                 None => return Ok(0),
             }
+            index += 1;
         }
         let mut sector_buf = [0u8; SECTOR_SIZE];
         let mut done = 0;
@@ -1090,20 +1124,55 @@ impl FatVolume {
                     Some(next) => cluster = next,
                     None => break,
                 }
+                index += 1;
             }
         }
+        cursor.set(Some(Cursor { first: file.cluster, index, cluster, version: state.version }));
         Ok(done)
     }
 
-    /// Write `data` at `offset` of the clusters `chain`.
-    fn write_chain(&self, state: &State, chain: &[u32], offset: u64, data: &[u8]) -> Result<(), u8> {
+    /// The clusters of the chain that starts at `first`, from its
+    /// `start`th (or its last, if it is shorter) up to its `needed`th, and
+    /// the index of the first of them. The walk starts at `cursor` when
+    /// that is on the way. Nothing for an empty chain.
+    fn chain_from(state: &State, first: u32, start: u64, needed: u64, cursor: Option<Cursor>) -> (u64, Vec<u32>) {
+        if !(2..=state.max_cluster()).contains(&first) {
+            return (0, Vec::new());
+        }
+        let (mut index, mut cluster) = match cursor {
+            Some(c) if c.first == first && c.version == state.version && c.index <= start => (c.index, c.cluster),
+            _ => (0, first),
+        };
+        while index < start {
+            match state.next(cluster) {
+                Some(next) => cluster = next,
+                None => break,
+            }
+            index += 1;
+        }
+        let base = index;
+        let mut chain = vec![cluster];
+        while index + 1 < needed {
+            match state.next(cluster) {
+                Some(next) => cluster = next,
+                None => break,
+            }
+            index += 1;
+            chain.push(cluster);
+        }
+        (base, chain)
+    }
+
+    /// Write `data` at `offset` of the file whose clusters from its
+    /// `base`th on are `chain`.
+    fn write_chain(&self, state: &State, base: u64, chain: &[u32], offset: u64, data: &[u8]) -> Result<(), u8> {
         let cluster_bytes = state.params.cluster_bytes;
         let mut sector_buf = [0u8; SECTOR_SIZE];
         let mut done = 0;
         let mut pos = offset;
         while done < data.len() {
             let within = pos % cluster_bytes;
-            let sector = state.params.cluster_sector(chain[(pos / cluster_bytes) as usize])
+            let sector = state.params.cluster_sector(chain[(pos / cluster_bytes - base) as usize])
                 + within / SECTOR_SIZE as u64;
             let skip = (within % SECTOR_SIZE as u64) as usize;
             let n = (SECTOR_SIZE - skip).min(data.len() - done);
@@ -1122,6 +1191,14 @@ impl FatVolume {
     /// growing it as needed. Returns the bytes written: fewer when the disk
     /// fills up. Writing past the end fills the gap with zeros.
     pub fn write(&self, at: EntryRef, offset: u64, data: &[u8]) -> Result<usize, u8> {
+        self.write_from(at, offset, data, &Cell::new(None))
+    }
+
+    /// `write`, walking the file's cluster chain from `cursor` as
+    /// `read_from` does, and leaving `cursor` at the last cluster written.
+    /// A file written in small pieces would otherwise have its whole chain
+    /// walked on each write.
+    pub fn write_from(&self, at: EntryRef, offset: u64, data: &[u8], cursor: &Cell<Option<Cursor>>) -> Result<usize, u8> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -1132,9 +1209,12 @@ impl FatVolume {
         let end = (offset + data.len() as u64).min(u32::MAX as u64);
         let cluster_bytes = state.params.cluster_bytes;
 
-        let mut chain = if entry.cluster == 0 { Vec::new() } else { state.chain(entry.cluster) };
-        let needed = end.div_ceil(cluster_bytes) as usize;
-        while chain.len() < needed {
+        // The clusters from the one the write (or the gap before it)
+        // starts in, the chain's `base`th.
+        let needed = end.div_ceil(cluster_bytes);
+        let start = offset.min(old_size) / cluster_bytes;
+        let (base, mut chain) = Self::chain_from(&state, entry.cluster, start, needed, cursor.get());
+        while base + (chain.len() as u64) < needed {
             let Some(cluster) = state.allocate() else { break };
             match chain.last() {
                 Some(&last) => state.set(last, cluster),
@@ -1142,14 +1222,18 @@ impl FatVolume {
             }
             chain.push(cluster);
         }
-        let end = end.min(chain.len() as u64 * cluster_bytes);
+        if let Some(&last) = chain.last() {
+            let index = base + chain.len() as u64 - 1;
+            cursor.set(Some(Cursor { first: entry.cluster, index, cluster: last, version: state.version }));
+        }
+        let end = end.min((base + chain.len() as u64) * cluster_bytes);
         let written = end.saturating_sub(offset) as usize;
         let result = (|| {
             if offset > old_size && written > 0 {
                 let gap = vec![0u8; (offset - old_size) as usize];
-                self.write_chain(&state, &chain, old_size, &gap)?;
+                self.write_chain(&state, base, &chain, old_size, &gap)?;
             }
-            self.write_chain(&state, &chain, offset, &data[..written])?;
+            self.write_chain(&state, base, &chain, offset, &data[..written])?;
             let size = if written > 0 { old_size.max(end) } else { old_size } as u32;
             let params = state.params;
             self.update_entry(at, |raw| params.set_written(raw, entry.cluster, size))
@@ -1696,6 +1780,47 @@ mod tests {
         let reloaded = volume.reload(at).unwrap();
         assert_eq!(reloaded.size, 6003);
         assert_ne!(reloaded.attr & ATTR_ARCHIVE, 0);
+    }
+
+    #[test]
+    fn cursors_follow_the_chain_as_it_changes() {
+        let volume = floppy("cursor.img");
+        let at = volume.create(&["data.bin"], 0).unwrap().at.unwrap();
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i * 13 + i / 512) as u8).collect();
+        // Written in small pieces through one cursor, as through a handle.
+        let writer = Cell::new(None);
+        for (i, piece) in data.chunks(300).enumerate() {
+            assert_eq!(volume.write_from(at, i as u64 * 300, piece, &writer), Ok(piece.len()));
+        }
+        assert_eq!(contents(&volume, &["DATA.BIN"]), data);
+
+        // Read in pieces, forward, then from an earlier place, through
+        // another cursor.
+        let reader = Cell::new(None);
+        let read = |offset: u64, len: usize| {
+            let entry = volume.reload(at).unwrap();
+            let mut buf = vec![0u8; len];
+            let n = volume.read_from(&entry, offset, &mut buf, &reader).unwrap();
+            buf.truncate(n);
+            buf
+        };
+        let mut back = Vec::new();
+        while back.len() < data.len() {
+            back.extend(read(back.len() as u64, 700));
+        }
+        assert_eq!(back, data);
+        assert_eq!(read(1000, 600), data[1000..1600]);
+
+        // The file cut short and written again with another file's clusters
+        // in between: the cursors point into a chain that changed.
+        volume.truncate(at, 1000).unwrap();
+        let other = volume.create(&["other"], 0).unwrap().at.unwrap();
+        volume.write(other, 0, &[0xEE; 3000]).unwrap();
+        let tail = vec![0x55u8; 5000];
+        assert_eq!(volume.write_from(at, 1000, &tail, &writer), Ok(5000));
+        assert_eq!(read(1000, 5000), tail);
+        assert_eq!(read(0, 1000), data[..1000]);
+        assert_eq!(contents(&volume, &["OTHER"]), vec![0xEE; 3000]);
     }
 
     #[test]

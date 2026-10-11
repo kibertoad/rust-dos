@@ -653,8 +653,9 @@ enum OpenData {
     /// A file on a CD image, and the shared position.
     Image(Rc<CdImage>, Extent, Rc<Cell<u64>>),
     /// A file on a disk image: where its directory entry is, the shared
-    /// position, and whether it was opened for writing.
-    Fat { volume: Rc<FatVolume>, at: EntryRef, pos: Rc<Cell<u64>>, write: bool },
+    /// position, whether it was opened for writing, and where the last
+    /// read or write stopped in its cluster chain.
+    Fat { volume: Rc<FatVolume>, at: EntryRef, pos: Rc<Cell<u64>>, write: bool, cursor: Cell<Option<fat::Cursor>> },
     /// A character device opened by name (NUL, CON, PRN...).
     Device(CharDevice),
 }
@@ -2297,7 +2298,7 @@ impl DiskController {
                 return Err(0x05);
             }
             let at = entry.at.ok_or(0x05u8)?;
-            let data = OpenData::Fat { volume, at, pos: Rc::new(Cell::new(0)), write };
+            let data = OpenData::Fat { volume, at, pos: Rc::new(Cell::new(0)), write, cursor: Cell::new(None) };
             let key = self.file_key(filename);
             let file = self.opened(data, drive, owner, key, filename, mode);
             self.insert(handle, file);
@@ -2579,10 +2580,10 @@ impl DiskController {
                     pos.set(pos.get() + n as u64);
                     return Ok(buffer);
                 }
-                OpenData::Fat { volume, at, pos, .. } => {
+                OpenData::Fat { volume, at, pos, cursor, .. } => {
                     let entry = volume.reload(*at)?;
                     let mut buffer = vec![0u8; count];
-                    let n = volume.read(&entry, pos.get(), &mut buffer)?;
+                    let n = volume.read_from(&entry, pos.get(), &mut buffer, cursor)?;
                     buffer.truncate(n);
                     pos.set(pos.get() + n as u64);
                     return Ok(buffer);
@@ -2610,8 +2611,8 @@ impl DiskController {
                 OpenData::Host(file) => file,
                 OpenData::Memory(..) | OpenData::Image(..) => return Err(0x05),
                 OpenData::Fat { write: false, .. } => return Err(0x05),
-                OpenData::Fat { volume, at, pos, .. } => {
-                    let n = volume.write(*at, pos.get(), data)?;
+                OpenData::Fat { volume, at, pos, cursor, .. } => {
+                    let n = volume.write_from(*at, pos.get(), data, cursor)?;
                     pos.set(pos.get() + n as u64);
                     return Ok(n as u16);
                 }

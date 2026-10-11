@@ -92,6 +92,67 @@ pub fn open_close(cpu: &mut Cpu, path: &str) {
     assert!(!cf(cpu), "close {} failed with {:02X}h", path, cpu.ax());
 }
 
+/// Where `read_file` and `write_file` move data (5000:0000).
+const BUFFER_SEGMENT: u16 = 0x5000;
+
+/// Opens `path` with access `mode` (AH=3Dh, or creates it with AH=3Ch when
+/// `create`); panics if that fails.
+pub fn open_handle(cpu: &mut Cpu, path: &str, mode: u8, create: bool) -> u16 {
+    set_dsdx_string(cpu, path);
+    cpu.set_reg8(Register::AL, mode);
+    cpu.set_cx(0);
+    cpu.set_cpu_flag(CpuFlags::CF, false);
+    int21(cpu, if create { 0x3C } else { 0x3D });
+    assert!(!cf(cpu), "open {} failed with {:02X}h", path, cpu.ax());
+    cpu.ax()
+}
+
+/// Closes `handle` (AH=3Eh).
+pub fn close_handle(cpu: &mut Cpu, handle: u16) {
+    cpu.set_bx(handle);
+    int21(cpu, 0x3E);
+    assert!(!cf(cpu), "close failed with {:02X}h", cpu.ax());
+}
+
+/// Reads `path` from start to end in reads of `chunk` bytes (AH=3Fh), as
+/// a game loads a data file; returns the bytes read.
+pub fn read_file(cpu: &mut Cpu, path: &str, chunk: u16) -> usize {
+    let handle = open_handle(cpu, path, 0, false);
+    let mut total = 0;
+    loop {
+        cpu.set_bx(handle);
+        cpu.set_cx(chunk);
+        cpu.set_ds(BUFFER_SEGMENT);
+        cpu.set_dx(0);
+        int21(cpu, 0x3F);
+        assert!(!cf(cpu), "read failed with {:02X}h", cpu.ax());
+        total += cpu.ax() as usize;
+        if cpu.ax() < chunk {
+            break;
+        }
+    }
+    close_handle(cpu, handle);
+    total
+}
+
+/// Creates `path` (AH=3Ch) and writes `len` bytes to it in writes of
+/// `chunk` bytes (AH=40h), as a game saves.
+pub fn write_file(cpu: &mut Cpu, path: &str, len: usize, chunk: u16) {
+    let handle = open_handle(cpu, path, 2, true);
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(chunk as usize) as u16;
+        cpu.set_bx(handle);
+        cpu.set_cx(n);
+        cpu.set_ds(BUFFER_SEGMENT);
+        cpu.set_dx(0);
+        int21(cpu, 0x40);
+        assert!(!cf(cpu) && cpu.ax() == n, "write failed with {:02X}h", cpu.ax());
+        done += n as usize;
+    }
+    close_handle(cpu, handle);
+}
+
 /// Names like those of a DOS game's folder: `count` 8.3 data files
 /// ("RGN001.GFF", "SND012.VOC", ...) spread over a few extensions, plus a
 /// handful of long names as GOG's installers leave beside them ("Launch
