@@ -651,6 +651,31 @@ fn absolute_sector_reads_and_writes() {
     assert_eq!((cf(&cpu), cpu.ax()), (true, 0x8002));
 }
 
+#[test]
+fn absolute_reads_of_a_host_folder_drive_get_a_boot_sector() {
+    let dir = fatimage::scratch("int25_host");
+    let mut cpu = cpu(&dir);
+    cpu.bus.set_cycles_per_ms(1000);
+    // Whatever the buffer held before.
+    cpu.bus.load_bytes(BUFFER, &[0xEE; 2 * SECTOR]);
+    // MOV AX,5000h; MOV DS,AX; MOV AL,2; MOV CX,2; XOR DX,DX; XOR BX,BX;
+    // INT 25h; POP DX; HLT: C:'s first two sectors, as installers and
+    // disk tools read the boot sector for the BPB.
+    let code = [
+        0xB8, 0x00, 0x50, 0x8E, 0xD8, 0xB0, 0x02, 0xB9, 0x02, 0x00, 0x31, 0xD2, 0x31, 0xDB, 0xCD, 0x25, 0x5A, 0xF4,
+    ];
+    run(&mut cpu, &code);
+    assert!(!cf(&cpu));
+    let sectors = buffer(&cpu, 2 * SECTOR).to_vec();
+    let layout = cpu.bus.disk.layout(DRIVE_C).unwrap();
+    assert_eq!(&sectors[0x0B..0x24], &layout.bpb()[..0x19], "the drive's BPB");
+    assert_eq!(&sectors[0x1C..0x20], &[0x3F, 0, 0, 0], "hidden sectors, which MicroProse's installers read");
+    assert_eq!(sectors[0x26], 0x29, "an extended boot record");
+    assert_eq!(&sectors[0x36..0x3E], layout.fs_type());
+    assert_eq!(&sectors[0x1FE..0x200], &[0x55, 0xAA]);
+    assert!(sectors[SECTOR..].iter().all(|&b| b == 0), "the other sectors read as zeros");
+}
+
 fn tool(name: &str) -> bool {
     std::process::Command::new(name).arg("--help").output().is_ok()
 }

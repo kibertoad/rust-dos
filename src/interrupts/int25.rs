@@ -10,7 +10,8 @@
 //!
 //! Drives mounted from disk images read and write their sectors. The
 //! others follow DOSBox: floppies and CD-ROMs fail, as if unreadable, and
-//! hard disks pretend to succeed. From DOS 7.10 on, FAT32 drives take
+//! hard disks pretend to succeed, reading as a boot sector made from the
+//! drive's layout and zeros. From DOS 7.10 on, FAT32 drives take
 //! INT 21h AX=7305h instead, as MS-DOS 7.1 has it.
 
 use crate::cpu::{Cpu, CpuFlags};
@@ -41,6 +42,30 @@ pub fn handle(cpu: &mut Cpu, write: bool) {
 /// Read or write the sectors of `drive` (0 = A:) that CX, DX and DS:BX
 /// ask for, as INT 25h/26h do, or (`fat32`) as INT 21h AX=7305h does with
 /// its packet, which FAT32 drives take.
+/// The boot sector of a drive mounted from a host folder, as DOS 4 and
+/// later format one: its BPB, the extended boot record with the serial
+/// number, label and file system that AX=440Dh/0866h report, and the
+/// 55AAh signature.
+fn host_boot_sector(cpu: &Cpu, drive: u8) -> [u8; SECTOR_SIZE] {
+    let mut sector = [0u8; SECTOR_SIZE];
+    let Some(layout) = cpu.bus.disk.layout(drive) else { return sector };
+    sector[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+    sector[3..11].copy_from_slice(b"MSDOS5.0");
+    // The BPB up to the total sector count (25 bytes, 0Bh-23h).
+    sector[0x0B..0x24].copy_from_slice(&layout.bpb()[..0x19]);
+    sector[0x24] = 0x80;
+    sector[0x26] = 0x29;
+    let serial = cpu.bus.disk.volume_serial(drive).unwrap_or(crate::interrupts::int21::VOLUME_SERIAL + drive as u32);
+    sector[0x27..0x2B].copy_from_slice(&serial.to_le_bytes());
+    let label = cpu.bus.disk.volume_label(drive).filter(|l| !l.is_empty()).unwrap_or_else(|| "NO NAME".into());
+    for (slot, b) in sector[0x2B..0x36].iter_mut().zip(label.bytes().chain(std::iter::repeat(b' '))) {
+        *slot = b;
+    }
+    sector[0x36..0x3E].copy_from_slice(layout.fs_type());
+    sector[0x1FE..].copy_from_slice(&[0x55, 0xAA]);
+    sector
+}
+
 pub fn sector_access(cpu: &mut Cpu, drive: u8, write: bool, fat32: bool) -> Result<(), u16> {
     let packet = cpu.cx() == 0xFFFF;
     let (start, count, buffer) = if packet {
@@ -80,11 +105,18 @@ pub fn sector_access(cpu: &mut Cpu, drive: u8, write: bool, fat32: bool) -> Resu
             })
         }
         (None, Some(DriveKind::HardDisk | DriveKind::Virtual)) => {
-            // MicroProse installers read the boot sector of C: to find the
-            // hidden sectors of its BPB.
-            if !write && drive >= 2 && !packet && count == 1 && start == 0 {
-                let hidden = cpu.get_physical_addr(cpu.ds(), cpu.bx().wrapping_add(0x1C));
-                cpu.bus.guest_write_16(hidden as u32, 0x3F);
+            // A host folder has no sectors: writes go nowhere, and reads
+            // get a boot sector made from the drive's layout, with zeros
+            // for the rest. MicroProse installers read C:'s for the hidden
+            // sectors of its BPB.
+            if !write {
+                let mut data = vec![0u8; count as usize * SECTOR_SIZE];
+                if start == 0
+                    && let Some(sector) = data.get_mut(..SECTOR_SIZE)
+                {
+                    sector.copy_from_slice(&host_boot_sector(cpu, drive));
+                }
+                cpu.bus.guest_write_bytes(buffer as u32, &data);
             }
             Ok(())
         }
