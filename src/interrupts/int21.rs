@@ -1361,6 +1361,7 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     console.to_stderr = false;
                 }
                 cpu.set_ax(count as u16);
+                cpu.set_cpu_flag(CpuFlags::CF, false);
             } else {
                 match cpu.bus.disk.write_file(sft, &data) {
                     Ok(written) => {
