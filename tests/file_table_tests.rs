@@ -196,6 +196,26 @@ fn force_duplicate_points_standard_output_at_a_file() {
 }
 
 #[test]
+fn ioctl_status_says_whether_a_file_has_more_to_read() {
+    let mut cpu = machine("ioctl_status");
+    let h = open(&mut cpu, "DATA.TXT", 2).unwrap();
+    // AX=4406h: AL=FFh while there is more to read, 00h at the end.
+    assert_eq!(dos(&mut cpu, 0x4406, h, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    dos(&mut cpu, 0x4202, h, 0, 0).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4406, h, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // AX=4407h: a file is always ready for output.
+    assert_eq!(dos(&mut cpu, 0x4407, h, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    // Standard output is ready too; standard input has nothing typed.
+    assert_eq!(dos(&mut cpu, 0x4407, 1, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    assert_eq!(dos(&mut cpu, 0x4406, 0, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // AX=440Ah: a local file, so bit 15 of DX is clear, whatever DX held.
+    assert!(dos(&mut cpu, 0x440A, h, 0, 0xFFFF).is_ok());
+    let remote = cpu.dx();
+    dos(&mut cpu, 0x4400, h, 0, 0).unwrap();
+    assert_eq!(remote, cpu.dx(), "the attribute word, as AX=4400h has it");
+}
+
+#[test]
 fn a_child_psp_inherits_handles_but_not_those_opened_not_to_be() {
     let mut cpu = machine("child_psp");
     let parent = cpu.current_psp;

@@ -324,6 +324,43 @@ fn writes_console(cpu: &mut Cpu, ah: u8) -> bool {
     }
 }
 
+/// The device information word of AX=4400h for the open file `sft`.
+fn device_info(cpu: &mut Cpu, sft: u16, device: Option<CharDevice>) -> u16 {
+    if sft == crate::disk::SFT_AUX
+        || sft == crate::disk::SFT_PRN
+        || device.is_some_and(|d| d.com_port().is_some() || d == CharDevice::Prn)
+    {
+        // AUX and PRN: character devices, not EOF.
+        0x80C0
+    } else if device == Some(CharDevice::Nul) {
+        // Character device, NUL.
+        0x8084
+    } else if device == Some(CharDevice::Emm) {
+        // The expanded memory manager: a character device
+        // taking IOCTL.
+        0xC080
+    } else if device == Some(CharDevice::Con) {
+        // 1000 0000 1101 0011 = 80D3
+        // Bit 7: Char device
+        // Bit 6: EOF (0) - meaningful for files?
+        // Bit 5: Raw (Binary) mode? (0=Cooked, 1=Raw)
+        // Bit 4: Special?
+        // Bit 3: Clock?
+        // Bit 2: NUL?
+        // Bit 1: Stdout
+        // Bit 0: Stdin
+        0x80D3
+    } else {
+        // File: Bit 7=0 (Block Dev), Bits 0-5 = Drive # (0=A)
+        let drive = cpu
+            .bus
+            .disk
+            .handle_drive(sft)
+            .unwrap_or(cpu.bus.disk.get_current_drive());
+        drive as u16
+    }
+}
+
 fn dispatch(cpu: &mut Cpu, ah: u8) {
     match ah {
         // AH = 0Eh: Select Default Drive
@@ -1466,39 +1503,8 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     let Some(sft) = sft else {
                         return set_result(cpu, Err(0x06));
                     };
-                    if sft == crate::disk::SFT_AUX
-                        || sft == crate::disk::SFT_PRN
-                        || device.is_some_and(|d| d.com_port().is_some() || d == CharDevice::Prn)
-                    {
-                        // AUX and PRN: character devices, not EOF.
-                        cpu.set_dx(0x80C0);
-                    } else if device == Some(CharDevice::Nul) {
-                        // Character device, NUL.
-                        cpu.set_dx(0x8084);
-                    } else if device == Some(CharDevice::Emm) {
-                        // The expanded memory manager: a character device
-                        // taking IOCTL.
-                        cpu.set_dx(0xC080);
-                    } else if device == Some(CharDevice::Con) {
-                        // 1000 0000 1101 0011 = 80D3
-                        // Bit 7: Char device
-                        // Bit 6: EOF (0) - meaningful for files?
-                        // Bit 5: Raw (Binary) mode? (0=Cooked, 1=Raw)
-                        // Bit 4: Special?
-                        // Bit 3: Clock?
-                        // Bit 2: NUL?
-                        // Bit 1: Stdout
-                        // Bit 0: Stdin
-                        cpu.set_dx(0x80D3);
-                    } else {
-                        // File: Bit 7=0 (Block Dev), Bits 0-5 = Drive # (0=A)
-                        let drive = cpu
-                            .bus
-                            .disk
-                            .handle_drive(sft)
-                            .unwrap_or(cpu.bus.disk.get_current_drive());
-                        cpu.set_dx(drive as u16);
-                    }
+                    let info = device_info(cpu, sft, device);
+                    cpu.set_dx(info);
                     cpu.set_cpu_flag(CpuFlags::CF, false);
                     // cpu.bus.log_string(&format!("[DOS] IOCTL Get Device Info -> {:04X}", cpu.dx()));
                 }
@@ -1557,6 +1563,41 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     let (buffer, size) = (cpu.get_physical_addr(cpu.ds(), cpu.dx()), cpu.cx());
                     let result = crate::ems::ioctl_read(&mut cpu.bus, buffer, size);
                     set_result(cpu, result);
+                }
+                // Input status: for a file, FFh until its end; for the
+                // console, FFh while a key or the rest of a line waits.
+                0x06 if device.is_none() || device == Some(CharDevice::Con) => {
+                    let Some(sft) = sft else {
+                        return set_result(cpu, Err(0x06));
+                    };
+                    let ready = if device.is_some() {
+                        !cpu.con_pending.is_empty()
+                            || cpu.con_pending_scan.is_some()
+                            || crate::keyboard::peek_keystroke(&mut cpu.bus).is_some()
+                    } else {
+                        let size = cpu.bus.disk.sft_entry(sft).map_or(0, |e| e.size as u64);
+                        cpu.bus.disk.position(sft).is_some_and(|at| at < size)
+                    };
+                    cpu.set_reg8(Register::AL, if ready { 0xFF } else { 0x00 });
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // Output status: files and the console are always ready.
+                0x07 if device.is_none() || device == Some(CharDevice::Con) => {
+                    if sft.is_none() {
+                        return set_result(cpu, Err(0x06));
+                    }
+                    cpu.set_reg8(Register::AL, 0xFF);
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // Is the handle remote: DX is the attribute word, with bit
+                // 15 clear, as no handle here is on a network redirector.
+                0x0A => {
+                    let Some(sft) = sft else {
+                        return set_result(cpu, Err(0x06));
+                    };
+                    let info = device_info(cpu, sft, device) & 0x7FFF;
+                    cpu.set_dx(info);
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
                 }
                 _ => {
                     // Stub other subfunctions as success
