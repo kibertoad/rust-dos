@@ -247,14 +247,15 @@ fn save_restore_state(cpu: &mut Cpu) -> u16 {
 }
 
 /// Function 05h, and the window function: BH=0 sets window A (BL=0) to
-/// bank DX, for reads and writes; BH=1 returns it in DX.
+/// bank DX (DL alone, see `vbe::window_position`), for reads and writes;
+/// BH=1 returns it in DX.
 pub fn window(cpu: &mut Cpu) -> u16 {
     if cpu.get_reg8(Register::BL) != 0 {
         return FAILED;
     }
     match cpu.get_reg8(Register::BH) {
         0x00 => {
-            let bank = cpu.dx();
+            let bank = super::vbe::window_position(cpu.dx(), 16);
             if bank >= 16 {
                 return FAILED;
             }

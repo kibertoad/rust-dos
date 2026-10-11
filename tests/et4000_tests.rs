@@ -361,6 +361,10 @@ fn vbe_1_2_without_a_linear_frame_buffer() {
     assert_eq!(pixel(&mut cpu, x, y), [r, g, b]);
     assert_eq!(int10(&mut cpu, 0x4F05, 0, 0, 16), 0x014F);
     assert_eq!(int10(&mut cpu, 0x4F05, 1, 0, 0), 0x014F, "no window B");
+    // The bank comes from DL: junk in DH, as Down by the Laituri leaves.
+    assert_eq!(int10(&mut cpu, 0x4F05, 0, 0, 0x0402), 0x004F);
+    assert_eq!(cpu.bus.io_read(0x3CD), 0x22);
+    assert_eq!(int10(&mut cpu, 0x4F05, 0, 0, 0x0410), 0x014F, "DL past the 1 MB");
 
     // The display start: line 500, past 64K CRTC addresses.
     assert_eq!(int10(&mut cpu, 0x4F07, 0, 8, 500), 0x004F);

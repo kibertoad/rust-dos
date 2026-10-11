@@ -152,13 +152,46 @@ fn banked_and_linear_video_memory() {
     assert_eq!(cpu.bus.read_8(LFB_BASE + 11), 0x88);
 }
 
+/// Down by the Laituri sets banks with junk in DH (DX=0201h for bank 1,
+/// 0402h for bank 2). The card's 64 positions fit in DL, which is all a
+/// BIOS for such a card reads.
+#[test]
+fn function_05h_takes_the_bank_from_dl() {
+    let mut cpu = machine();
+    set_mode(&mut cpu, 0x101);
+    // Pixel (0, 200) is at 128000: bank 1, offset 62464.
+    assert_eq!(int10(&mut cpu, 0x4F05, 0x0000, 0, 0x0201), 0x004F);
+    assert_eq!(cpu.bus.vbe.bank, 1);
+    cpu.bus.write_8(0xA0000 + 62464, 0x0F);
+    assert_eq!(cpu.bus.vbe.vram[128_000], 0x0F);
+    assert_eq!(pixel(&mut cpu, 0, 200), cpu.bus.vga.get_rgb(0x0F));
+    assert_eq!(int10(&mut cpu, 0x4F05, 0x0000, 0, 0x0402), 0x004F);
+    assert_eq!(int10(&mut cpu, 0x4F05, 0x0100, 0, 0), 0x004F);
+    assert_eq!(cpu.dx(), 2);
+    assert_eq!(int10(&mut cpu, 0x4F05, 0x0000, 0, 0xFF40), 0x014F, "DL past the 4 MB");
+    assert_eq!(cpu.bus.vbe.bank, 2);
+}
+
+/// A card with more than 256 positions (4 KB granularity on 4 MB, say)
+/// needs DH as well, so it keeps all of DX.
+#[test]
+fn the_window_position_keeps_dh_past_256_positions() {
+    use rust_dos::interrupts::vbe::window_position;
+    assert_eq!(window_position(0x0201, 64), 0x01);
+    assert_eq!(window_position(0x0201, 16), 0x01);
+    assert_eq!(window_position(0xABFF, 256), 0xFF);
+    assert_eq!(window_position(0x0201, 257), 0x0201);
+    assert_eq!(window_position(0x03FF, 1024), 0x03FF);
+}
+
 #[test]
 fn the_window_function_switches_banks_with_a_far_call() {
     let mut cpu = machine();
     set_mode(&mut cpu, 0x103);
     assert_eq!(int10(&mut cpu, 0x4F01, 0, 0x103, 0), 0x004F);
     let window_function = cpu.bus.read_32(BUF + 12);
-    // CALL FAR [window function]; HLT, with BX=0 and DX=3.
+    // CALL FAR [window function]; HLT, with BX=0 and DX=0503h: bank 3,
+    // with junk in DH.
     let code = [0x9A, window_function as u8, (window_function >> 8) as u8, (window_function >> 16) as u8, (window_function >> 24) as u8, 0xF4];
     for (i, &b) in code.iter().enumerate() {
         cpu.bus.write_8(0x20000 + i, b);
@@ -168,7 +201,7 @@ fn the_window_function_switches_banks_with_a_far_call() {
     cpu.set_ss(0x4000);
     cpu.set_sp(0x1000);
     cpu.set_bx(0);
-    cpu.set_dx(3);
+    cpu.set_dx(0x0503);
     for _ in 0..10 {
         if cpu.cs() == 0x2000 && cpu.ip() == 5 {
             break;

@@ -366,15 +366,31 @@ fn save_restore_state(cpu: &mut Cpu) -> u16 {
     SUCCESS
 }
 
+/// The window position function 05h's BH=0 takes from DX, on a card whose
+/// memory holds `positions` windows. The VBE specification has the whole of
+/// DX, but a card with 256 positions or fewer has a bank register of 8 bits
+/// or less, and its BIOS writes DL to it. Programs rely on that and leave
+/// junk in DH: Down by the Laituri calls it with DX=0201h for bank 1.
+/// DOSBox masks DX to DL the same way, and DOSBox-X keeps all of DX only
+/// when there are more than 256 positions.
+pub fn window_position(dx: u16, positions: usize) -> u16 {
+    if positions <= 0x100 {
+        dx & 0xFF
+    } else {
+        dx
+    }
+}
+
 /// Function 05h, and the window function: BH=0 sets window BL (only
-/// window A, 0) to position DX, in 64 KB units; BH=1 returns it in DX.
+/// window A, 0) to position DX, in 64 KB units (DL alone, see
+/// `window_position`); BH=1 returns it in DX.
 fn window(cpu: &mut Cpu) -> u16 {
     if cpu.get_reg8(Register::BL) != 0 {
         return FAILED;
     }
     match cpu.get_reg8(Register::BH) {
         0x00 => {
-            let bank = cpu.dx() as usize;
+            let bank = window_position(cpu.dx(), VRAM_SIZE / WINDOW_SIZE) as usize;
             if bank >= VRAM_SIZE / WINDOW_SIZE {
                 return FAILED;
             }
