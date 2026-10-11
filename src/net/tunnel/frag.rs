@@ -9,7 +9,10 @@ use std::hash::Hash;
 /// How long the pieces of one frame may take to arrive.
 pub const TIMEOUT_MS: u64 = 1000;
 /// Frames being put together at once, per reassembler.
-const MAX_PENDING: usize = 64;
+const MAX_PENDING: usize = 1024;
+/// Frames of one sender being put together at once. A sender that starts
+/// more gives up its own oldest, so it can't push out everyone else's.
+const MAX_PER_SENDER: usize = 16;
 /// The most pieces a frame may have (4800 bytes, well above Ethernet's).
 pub const MAX_COUNT: u8 = 4;
 
@@ -24,19 +27,45 @@ struct Pending {
     started: u64,
 }
 
+/// The key of a frame: who sent it, and its number.
+pub trait FrameKey: Eq + Hash + Copy {
+    fn sender(&self) -> u64;
+}
+
+/// A relay's: the member's token and the frame number.
+impl FrameKey for (u64, u16) {
+    fn sender(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A client's: the member's place in the room and the frame number.
+impl FrameKey for (u8, u16) {
+    fn sender(&self) -> u64 {
+        self.0 as u64
+    }
+}
+
+/// A frame number alone: each frame its own sender.
+impl FrameKey for u16 {
+    fn sender(&self) -> u64 {
+        *self as u64
+    }
+}
+
 /// Puts frames back together, each known by a key of the caller's (a
 /// sender and its frame number).
 pub struct Reassembler<K> {
     pending: HashMap<K, Pending>,
 }
 
-impl<K: Eq + Hash + Copy> Default for Reassembler<K> {
+impl<K: FrameKey> Default for Reassembler<K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Eq + Hash + Copy> Reassembler<K> {
+impl<K: FrameKey> Reassembler<K> {
     pub fn new() -> Self {
         Self { pending: HashMap::new() }
     }
@@ -52,9 +81,17 @@ impl<K: Eq + Hash + Copy> Reassembler<K> {
         }
         if !self.pending.contains_key(&key) {
             self.expire(now);
-            if self.pending.len() >= MAX_PENDING {
-                // Make room by giving up on the oldest.
-                let oldest = self.pending.iter().min_by_key(|(_, p)| p.started).map(|(k, _)| *k)?;
+            let sender = key.sender();
+            let own = self.pending.keys().filter(|k| k.sender() == sender).count();
+            if own >= MAX_PER_SENDER || self.pending.len() >= MAX_PENDING {
+                // Make room by giving up on the oldest: the sender's own
+                // when it has its share.
+                let oldest = self
+                    .pending
+                    .iter()
+                    .filter(|(k, _)| own < MAX_PER_SENDER || k.sender() == sender)
+                    .min_by_key(|(_, p)| p.started)
+                    .map(|(k, _)| *k)?;
                 self.pending.remove(&oldest);
             }
         }
@@ -104,7 +141,7 @@ mod tests {
         let pieces = split(&long);
         assert_eq!(pieces.len(), 2);
         assert!(pieces.iter().all(|p| p.len() <= MAX_FRAGMENT));
-        let mut r = Reassembler::new();
+        let mut r: Reassembler<(u64, u16)> = Reassembler::new();
         assert_eq!(r.add(0, (1, 7), 1, 2, pieces[1]), None);
         assert_eq!(r.pending(), 1);
         assert_eq!(r.add(5, (1, 7), 1, 2, pieces[1]), None, "a repeated piece counts once");
@@ -117,7 +154,7 @@ mod tests {
     #[test]
     fn keeps_frames_of_different_senders_apart() {
         let (a, b) = (frame(2000), vec![9u8; 2000]);
-        let mut r = Reassembler::new();
+        let mut r: Reassembler<(u64, u16)> = Reassembler::new();
         assert_eq!(r.add(0, (1, 1), 0, 2, split(&a)[0]), None);
         assert_eq!(r.add(0, (2, 1), 0, 2, split(&b)[0]), None);
         assert_eq!(r.add(0, (2, 1), 1, 2, split(&b)[1]), Some(b));
@@ -137,12 +174,21 @@ mod tests {
         // Too many at once: the oldest is given up.
         let mut r = Reassembler::new();
         for key in 0..MAX_PENDING as u16 + 1 {
-            r.add(key as u64, key, 0, 2, pieces[0]);
+            // Frame 0 first, the others after it, all within the timeout.
+            r.add(if key == 0 { 0 } else { 1 + key as u64 / 2 }, key, 0, 2, pieces[0]);
         }
         assert_eq!(r.pending(), MAX_PENDING);
-        assert_eq!(r.add(100, 0, 1, 2, pieces[1]), None, "frame 0 was given up");
+        assert_eq!(r.add(600, 0, 1, 2, pieces[1]), None, "frame 0 was given up");
+        // One sender starting frames fast gives up its own, not others'.
+        let mut r = Reassembler::new();
+        assert_eq!(r.add(0, (2u64, 1u16), 0, 2, pieces[0]), None);
+        for seq in 0..10 * MAX_PER_SENDER as u16 {
+            r.add(1 + seq as u64, (1u64, seq), 0, 2, pieces[0]);
+        }
+        assert_eq!(r.pending(), MAX_PER_SENDER + 1);
+        assert_eq!(r.add(500, (2, 1), 1, 2, pieces[1]), Some(long.clone()), "the other sender's frame is whole");
         // Nonsense numbering.
-        assert_eq!(r.add(0, 500, 2, 2, pieces[0]), None);
-        assert_eq!(r.add(0, 500, 0, MAX_COUNT + 1, pieces[0]), None);
+        assert_eq!(r.add(0, (3, 500), 2, 2, pieces[0]), None);
+        assert_eq!(r.add(0, (3, 500), 0, MAX_COUNT + 1, pieces[0]), None);
     }
 }
