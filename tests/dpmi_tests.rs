@@ -1062,3 +1062,64 @@ fn a_16_bit_client_calls_the_video_bios_with_selectors() {
 fn a_32_bit_client_calls_the_video_bios_with_selectors() {
     check_video(true);
 }
+
+#[test]
+fn sizes_near_4_gb_are_refused() {
+    // A client's sizes come from its registers: a resize to FFFFF800h
+    // bytes (0503h), the attributes of FFFFFFFFh pages (0506h) and a DOS
+    // block of 0FFFFF01h paragraphs (AH=48h) fail with an error, and the
+    // host stays up. Two pages' attributes still come back.
+    let main = asm16(0x100, |a| {
+        let mut fail = a.create_label();
+        enter(a, true, fail)?;
+        step(a, 4)?;
+        a.mov(ax, 0x0501)?;
+        a.mov(bx, 1)?;
+        a.xor(cx, cx)?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        a.mov(word_ptr(R + 30), di)?;
+        a.mov(word_ptr(R + 32), si)?;
+        step(a, 5)?;
+        a.mov(ax, 0x0503)?;
+        a.mov(bx, 0xFFFF)?;
+        a.mov(cx, 0xF800)?;
+        a.int(0x31)?;
+        a.mov(word_ptr(R), ax)?;
+        a.setc(byte_ptr(R + 2))?;
+        step(a, 6)?;
+        a.push(ds)?;
+        a.pop(es)?;
+        a.mov(esi, dword_ptr(R + 30))?;
+        a.xor(ebx, ebx)?;
+        a.mov(ecx, 0xFFFF_FFFFu32)?;
+        a.mov(edx, (R + 40) as u32)?;
+        a.mov(ax, 0x0506)?;
+        a.int(0x31)?;
+        a.mov(word_ptr(R + 4), ax)?;
+        a.setc(byte_ptr(R + 6))?;
+        a.mov(esi, dword_ptr(R + 30))?;
+        a.xor(ebx, ebx)?;
+        a.mov(ecx, 2)?;
+        a.mov(edx, (R + 40) as u32)?;
+        a.mov(ax, 0x0506)?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        step(a, 7)?;
+        a.mov(ebx, 0x0FFF_FF01)?;
+        a.mov(ah, 0x48)?;
+        a.int(0x21)?;
+        a.setc(byte_ptr(R + 8))?;
+        exit(a, 0x2A)?;
+        a.set_label(&mut fail)?;
+        exit(a, 0xEE)
+    });
+    let (mut cpu, psp) = machine("huge", &[("T.COM", com(&[(0x100, main)]))], "T.COM");
+    assert!(run_to_exit(&mut cpu, 200), "the program didn't end (step {})", word(&cpu, psp, STEP));
+    assert_eq!(cpu.errorlevel, 0x2A, "failed at step {}", word(&cpu, psp, STEP));
+    let w = |offset: u16| word(&cpu, psp, offset);
+    assert_eq!((w(R), w(R + 2) & 0xFF), (0x8013, 1), "0503h");
+    assert_eq!((w(R + 4), w(R + 6) & 0xFF), (0x8025, 1), "0506h");
+    assert_eq!((w(R + 40), w(R + 42), w(R + 44)), (0x0009, 0x0009, 0), "0506h of two pages");
+    assert_eq!(w(R + 8) & 0xFF, 1, "AH=48h");
+}

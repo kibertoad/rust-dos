@@ -17,7 +17,7 @@
 
 use super::int31::{
     can_retile, dos_block, dos_free, dos_resize, offset, resize_memory, retile, segment_selector, set_offset, set_tiles,
-    tiles,
+    tiles, whole_pages,
 };
 use super::{
     BIG, Client, Context, DATA3, EAX, EBX, ECX, EDI, EDX, ESI, ESP, F_DOS, Frame, LDT_FIXED, RESULT_FLAGS, allocate,
@@ -550,7 +550,7 @@ fn block_size(paras: u32, bits32: bool) -> Option<u32> {
 fn allocate_block(cpu: &mut Cpu, paras: u32, bits32: bool) -> Result<u16, u16> {
     let bytes = block_size(paras, bits32).ok_or(NO_MEMORY)?;
     let end = cpu.bus.ram().len() as u32;
-    let len = bytes.div_ceil(0x1000) * 0x1000;
+    let len = whole_pages(bytes).ok_or(NO_MEMORY)?;
     let base = cpu.bus.xms.take_dpmi(len, end).ok_or(NO_MEMORY)?;
     let count = if bits32 { 1 } else { tiles(bytes) };
     let Some(first) = allocate(cpu, count, 0, LDT_FIXED) else {

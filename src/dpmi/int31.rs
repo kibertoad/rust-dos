@@ -409,12 +409,15 @@ fn service(cpu: &mut Cpu, ctx: &mut Context, function: u16) -> Result {
         // DPMI 1.0: the attributes of ECX pages at offset EBX of block ESI,
         // a word each into ES:EDX: committed and writable, all of them.
         0x0506 => {
-            let handle = ctx.gpr[ESI];
-            if !client(cpu).memory.iter().any(|&(h, _, _)| h == handle) {
-                return Err(INVALID_HANDLE);
+            let (handle, at, pages) = (ctx.gpr[ESI], ctx.gpr[EBX], ctx.gpr[ECX]);
+            let &(_, _, len) = client(cpu).memory.iter().find(|&&(h, _, _)| h == handle).ok_or(INVALID_HANDLE)?;
+            if at & 0xFFF != 0 || at as u64 + pages as u64 * 0x1000 > len as u64 {
+                return Err(INVALID_LINEAR_ADDRESS);
             }
-            let bytes: Vec<u8> = (0..ctx.gpr[ECX]).flat_map(|_| 0x0009u16.to_le_bytes()).collect();
-            write_buffer(cpu, offset(ctx, EDX, bits32), &bytes).map_err(|_| INVALID_VALUE)?;
+            let buffer = offset(ctx, EDX, bits32);
+            for page in 0..pages {
+                cpu.write_u16(Seg::ES, buffer.wrapping_add(page * 2), 0x0009).map_err(|_| INVALID_VALUE)?;
+            }
         }
         // DPMI 1.0: set page attributes: committing and write protection
         // change nothing without paging.
@@ -477,7 +480,7 @@ pub(super) fn segment_selector(cpu: &mut Cpu, segment: u16) -> Option<u16> {
 pub(super) fn resize_memory(cpu: &mut Cpu, i: usize, size: u32) -> std::result::Result<u32, u16> {
     let end = cpu.bus.ram().len() as u32;
     let (handle, base, old) = client(cpu).memory[i];
-    let len = size.div_ceil(0x1000) * 0x1000;
+    let len = whole_pages(size).ok_or(PHYSICAL_MEMORY_UNAVAILABLE)?;
     let base = if cpu.bus.xms.resize_dpmi(base, len, end) {
         if len > old {
             cpu.bus.fill_ram((base + old) as usize..(base + len) as usize, 0);
@@ -492,6 +495,11 @@ pub(super) fn resize_memory(cpu: &mut Cpu, i: usize, size: u32) -> std::result::
     };
     client(cpu).memory[i] = (handle, base, len);
     Ok(base)
+}
+
+/// `size` bytes rounded up to whole pages, if that is under 4 GB.
+pub(super) fn whole_pages(size: u32) -> Option<u32> {
+    size.checked_add(0xFFF).map(|n| n & !0xFFF)
 }
 
 /// Write `bytes` at ES:`at`, through the client's ES.
