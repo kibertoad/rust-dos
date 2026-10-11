@@ -19,6 +19,12 @@ pub const MANTISSA_BITS: u32 = 64;
 pub const SIGN_SHIFT: u32 = 79;
 pub const EXP_SHIFT: u32 = 64;
 pub const INT_BIT_SHIFT: u32 = 63;
+/// The bit that makes a NaN quiet.
+pub const QUIET_BIT: u128 = 1 << 62;
+/// The exceptions `F80::add` reports, as in the status word: IE, and OE
+/// with PE.
+pub const ADD_IE: u16 = 0x0001;
+pub const ADD_OE_PE: u16 = 0x0028;
 
 // f80 emulation
 // Source: https://github.com/sha0coder/mwemu
@@ -177,18 +183,24 @@ impl F80 {
 
     /// Add `b`, as 80-bit numbers: the smaller's significand shifted down
     /// to the larger's exponent (its low bits dropped), the significands
-    /// added or subtracted, and the result brought back to 64 bits.
-    pub fn add(&mut self, b: F80) {
-        self.add_signed(b, b.get_sign());
+    /// added or subtracted, and the result brought back to 64 bits. An
+    /// infinity or a NaN goes as the FPU takes them with its exceptions
+    /// masked (`add_special`), and a sum past the largest number is the
+    /// infinity. Returns the exceptions to set (`ADD_IE`, `ADD_OE_PE`).
+    pub fn add(&mut self, b: F80) -> u16 {
+        self.add_signed(b, b.get_sign())
     }
 
     /// Subtract `b`: add it with its sign turned.
-    pub fn sub(&mut self, b: F80) {
-        self.add_signed(b, !b.get_sign());
+    pub fn sub(&mut self, b: F80) -> u16 {
+        self.add_signed(b, !b.get_sign())
     }
 
     #[inline]
-    fn add_signed(&mut self, b: F80, b_sign: bool) {
+    fn add_signed(&mut self, b: F80, b_sign: bool) -> u16 {
+        if self.get_exponent() == 0x7FFF || b.get_exponent() == 0x7FFF {
+            return self.add_special(b, b_sign);
+        }
         let a_sign = self.get_sign();
         let (mut exp, b_exp) = (self.get_exponent(), b.get_exponent());
         let (mut a_man, mut b_man) = (self.st as u64, b.st as u64);
@@ -204,7 +216,12 @@ impl F80 {
             let (sum, carry) = a_man.overflowing_add(b_man);
             if carry {
                 man = sum >> 1 | INT_BIT_MASK64;
-                exp = exp.wrapping_add(1);
+                exp += 1;
+                if exp == 0x7FFF {
+                    // Overflow: the infinity, with OE and PE.
+                    self.st = (a_sign as u128) << SIGN_SHIFT | 0x7FFFu128 << EXP_SHIFT | INT_BIT_MASK;
+                    return ADD_OE_PE;
+                }
             } else {
                 man = sum;
             }
@@ -220,11 +237,51 @@ impl F80 {
                 sign = if a_man >= b_man { a_sign } else { b_sign };
             }
         }
-        // (An exponent that wrapped around reaches into the sign, as it
-        // always did.)
+        // (An exponent that wrapped around below 0 reaches into the sign,
+        // as it always did.)
         let st = (self.st & !SIGN_MASK) | (sign as u128) << SIGN_SHIFT;
         let st = (st & !EXP_MASK2) | (exp as u128) << EXP_SHIFT;
         self.st = (st & !MANTISSA_MASK) | man as u128;
+        0
+    }
+
+    /// `add_signed` where an operand has exponent 7FFFh, as the x87 does
+    /// it (Intel SDM vol. 1, "Operating on SNaNs and QNaNs" and "Invalid
+    /// Arithmetic Operand Exception"): a NaN comes out quiet with its own
+    /// sign (of two, the larger significand; an SNaN sets IE); infinities
+    /// of opposite signs, or an operand with the integer bit clear (a
+    /// pseudo-infinity or pseudo-NaN), make the real indefinite with IE; an
+    /// infinity otherwise stays, with its sign in the sum.
+    fn add_special(&mut self, b: F80, b_sign: bool) -> u16 {
+        let unsupported = |f: &F80| f.get_exponent() == 0x7FFF && f.st & INT_BIT_MASK == 0;
+        if unsupported(self) || unsupported(&b) {
+            self.st = REAL_INDEFINITE;
+            return ADD_IE;
+        }
+        let (a_nan, b_nan) = (self.is_nan(), b.is_nan());
+        if a_nan || b_nan {
+            let signaling = |f: &F80| f.is_nan() && f.st & QUIET_BIT == 0;
+            let ie = if signaling(self) || signaling(&b) { ADD_IE } else { 0 };
+            let (a_quiet, b_quiet) = (self.st & QUIET_BIT != 0, b.st & QUIET_BIT != 0);
+            let pick_b = if a_nan && b_nan {
+                if a_quiet != b_quiet { b_quiet } else { b.get_mantissa() > self.get_mantissa() }
+            } else {
+                b_nan
+            };
+            let nan = if pick_b { b.st } else { self.st };
+            self.st = (nan | QUIET_BIT) & FPU_80_BITS_MAX;
+            return ie;
+        }
+        let a_inf = self.is_infinite();
+        let b_inf = b.is_infinite();
+        if a_inf && b_inf && self.get_sign() != b_sign {
+            self.st = REAL_INDEFINITE;
+            return ADD_IE;
+        }
+        if !a_inf {
+            self.st = (b_sign as u128) << SIGN_SHIFT | 0x7FFFu128 << EXP_SHIFT | INT_BIT_MASK;
+        }
+        0
     }
 
     #[allow(dead_code)]
@@ -248,16 +305,16 @@ impl F80 {
         exponent == 0
     }
 
+    /// Exponent 7FFFh and a fraction of 0, whatever the integer bit (set in
+    /// a real infinity).
     pub fn is_infinite(&self) -> bool {
-        let exponent = (self.st >> 64) & 0x7FFF;
-        let mantissa = self.st & ((1u128 << 64) - 1);
-        exponent == 0x7FFF && mantissa == 0
+        self.get_exponent() == 0x7FFF && self.get_fraction() == 0
     }
 
+    /// Exponent 7FFFh and a fraction that isn't 0, whatever the integer
+    /// bit (set in a real NaN).
     pub fn is_nan(&self) -> bool {
-        let exponent = (self.st >> 64) & 0x7FFF;
-        let mantissa = self.st & MANTISSA_MASK;
-        exponent == 0x7FFF && mantissa != 0
+        self.get_exponent() == 0x7FFF && self.get_fraction() != 0
     }
 
     pub fn to_bcd_packed(&self) -> [u8; 10] {
@@ -350,10 +407,11 @@ impl F80 {
             (sign as u128) << 79
         } else if exp == 0x7FF {
             // Inf o NaN
+            // (With the integer bit, as the FPU has them.)
             let is_nan = mantissa != 0;
             let extended_exp = 0x7FFFu128;
-            let extended_mantissa = (mantissa as u128) << 11;
-            let nan_bit = if is_nan { 1u128 << 62 } else { 0 }; // QNaN bit (optional)
+            let extended_mantissa = (mantissa as u128) << 11 | INT_BIT_MASK;
+            let nan_bit = if is_nan { QUIET_BIT } else { 0 };
             ((sign as u128) << 79) | (extended_exp << 64) | extended_mantissa | nan_bit
         } else {
             // Normal number
@@ -377,9 +435,10 @@ impl F80 {
             // Zero or denormal extended → 0.0
             sign << 63
         } else if exp == 0x7FFF {
-            // Inf or NaN
-            let f64_mantissa = (mantissa >> 11) as u64;
-            let nan_mask = if f64_mantissa != 0 { 1 << 51 } else { 0 }; // set QNaN bit if needed
+            // Inf or NaN, by the fraction (the integer bit aside)
+            let fraction = mantissa & MANTISSA_MASK_NOINT;
+            let f64_mantissa = (fraction >> 11) as u64;
+            let nan_mask = if fraction != 0 { 1 << 51 } else { 0 }; // set QNaN bit if needed
             (sign << 63) | (0x7FF << 52) | f64_mantissa | nan_mask
         } else {
             let unbiased_exp = exp as i32 - F80_EXP_BIAS;
@@ -769,14 +828,22 @@ mod tests {
         for (i, &a) in values.iter().enumerate() {
             for &b in values.iter().skip(i % 7).step_by(7) {
                 for (a, b) in [(a, b), (b, a), (a, a), (a, F80 { st: a.st ^ SIGN_MASK }), (a, F80 { st: a.st ^ 1 })] {
+                    // (Infinities, NaNs and sums past the largest number
+                    // go as the FPU's now: `add_special`, and the
+                    // overflow, which report or have exponent 7FFFh.)
+                    if a.get_exponent() == 0x7FFF || b.get_exponent() == 0x7FFF {
+                        continue;
+                    }
                     let (mut sum, mut reference) = (a, a);
-                    sum.add(b);
-                    reference.add_reference(b);
-                    assert_eq!(sum.st, reference.st, "{:020X} + {:020X}", a.st, b.st);
+                    if sum.add(b) == 0 {
+                        reference.add_reference(b);
+                        assert_eq!(sum.st, reference.st, "{:020X} + {:020X}", a.st, b.st);
+                    }
                     let (mut difference, mut reference) = (a, a);
-                    difference.sub(b);
-                    reference.sub_reference(b);
-                    assert_eq!(difference.st, reference.st, "{:020X} - {:020X}", a.st, b.st);
+                    if difference.sub(b) == 0 {
+                        reference.sub_reference(b);
+                        assert_eq!(difference.st, reference.st, "{:020X} - {:020X}", a.st, b.st);
+                    }
                 }
             }
         }

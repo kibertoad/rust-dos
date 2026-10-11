@@ -125,9 +125,9 @@ pub fn trampoline() -> Trampoline {
 
 /// ST(dst) = a + b, or a - b, as `F80::add` and `F80::sub` add their 80
 /// bits (`fpu::arithmetic::addsub_st` and `addsub_value`): where both are
-/// registers that aren't empty or doubles, not an infinity or a NaN held as
-/// a double, and the sum comes to a double's range; a routine of the
-/// trampoline's that translated code calls with the physical registers a
+/// registers that aren't empty or doubles, not an infinity or a NaN (in 80
+/// bits or as a double), and the sum comes to a double's range; a routine
+/// of the trampoline's that translated code calls with the physical registers a
 /// and b in R8D and R9D (8 for the double in XMM15) and dst | sub << 8 in
 /// R10D, which returns EAX = 0, or 1 with nothing changed for the handler's
 /// code. RCX, RDX and R8-R10 are changed.
@@ -252,8 +252,8 @@ fn fpu_addsub(ops: &mut Asm) {
 /// Operand `fpu_addsub` has in R`man`D (a physical register, or 8 for the
 /// double in XMM15) into `hi` (sign << 15 | exponent, of RAX or RDX) and
 /// R`man` (R8 or R9), as `FpuRegs::get` and `F80::set_f64` make its 80
-/// bits; to `slow` for an empty register or a double that is an infinity
-/// or a NaN. RCX is changed.
+/// bits; to `slow` for an empty register, or an infinity or a NaN (80 bits
+/// or a double). RCX is changed.
 fn f80_operand(ops: &mut Asm, hi: u8, man: u8, slow: DynamicLabel) {
     let (value, stale, loaded, zero) =
         (ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label());
@@ -269,6 +269,11 @@ fn f80_operand(ops: &mut Asm, hi: u8, man: u8, slow: DynamicLabel) {
         ; shl Rd(hi), 4
         ; mov Rq(man), QWORD [rbx + Rq(hi) + FPU_X80]
         ; movzx Rd(hi), WORD [rbx + Rq(hi) + FPU_X80 + 8]
+        // (An infinity or a NaN: the handler's.)
+        ; mov ecx, Rd(hi)
+        ; and ecx, 0x7FFF
+        ; cmp ecx, 0x7FFF
+        ; je =>slow
         ; jmp =>loaded
         ; =>stale
         ; mov rcx, QWORD [rbx + Rq(man) * 8 + FPU_F64]

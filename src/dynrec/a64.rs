@@ -243,8 +243,8 @@ fn fpu_addsub(ops: &mut Asm) {
 
 /// Operand W`idx` of `fpu_addsub` (a physical register, or 8 for D16) into
 /// W`hi` (sign << 15 | exponent) and X`man`, as `FpuRegs::get` and
-/// `F80::set_f64` make its 80 bits; to `slow` for an empty register or a
-/// double that is an infinity or a NaN. X6 and X7 are changed.
+/// `F80::set_f64` make its 80 bits; to `slow` for an empty register, or an
+/// infinity or a NaN (80 bits or a double). X6 and X7 are changed.
 fn f80_operand(ops: &mut Asm, idx: u8, hi: u8, man: u8, slow: DynamicLabel) {
     let (value, stale, loaded, zero) =
         (ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label());
@@ -260,6 +260,10 @@ fn f80_operand(ops: &mut Asm, idx: u8, hi: u8, man: u8, slow: DynamicLabel) {
         ; add x6, x11, X(idx), lsl 4
         ; ldr X(man), [x6]
         ; ldrh W(hi), [x6, 8]
+        // (An infinity or a NaN: the handler's.)
+        ; and w6, W(hi), 0x7FFF
+        ; add w6, w6, 1
+        ; tbnz w6, 15, =>slow
         ; b =>loaded
         ; =>stale
         ; ldr x7, [x12, X(idx), lsl 3]
