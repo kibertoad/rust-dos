@@ -81,9 +81,10 @@ impl Descriptor {
         self.is_code() && self.typ() & 0x4 != 0
     }
 
-    /// Readable code, or any data segment.
+    /// Readable code, or any data segment. (A system descriptor is
+    /// neither, whatever its type bit 1.)
     pub fn readable(&self) -> bool {
-        self.is_data() || self.typ() & 0x2 != 0
+        self.is_data() || self.is_code() && self.typ() & 0x2 != 0
     }
 
     pub fn writable_data(&self) -> bool {

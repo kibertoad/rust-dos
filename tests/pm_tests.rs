@@ -114,6 +114,54 @@ fn segment_loads_check_type_and_presence() {
 }
 
 #[test]
+fn system_descriptors_refuse_data_segment_loads() {
+    // An LDT (type 2), a busy TSS (type Bh) and an interrupt gate (type
+    // Eh) have type bit 1 set, as readable code has; they are no segments,
+    // and loading one into a data segment register is #GP(selector) with
+    // the descriptor left as it was (no accessed bit).
+    for typ in [0x2u8, 0xB, 0xE] {
+        let mut rig = Rig::new();
+        rig.record(GP);
+        let desc = sys_desc(DATA, 0xFFF, typ, 0);
+        rig.set_gdt(FREE, desc);
+        rig.run(|a| {
+            a.mov(ax, FREE as u32)?;
+            a.mov(ds, ax)?;
+            a.hlt()
+        });
+        assert_eq!(rig.recorded().0, GP as u32, "type {:X}", typ);
+        assert_eq!(rig.recorded().1[0], FREE as u32, "type {:X}", typ);
+        assert_eq!(rig.gdt(FREE), desc, "type {:X}", typ);
+    }
+}
+
+#[test]
+fn a_task_switch_to_a_system_descriptor_in_ds_raises_ts() {
+    // A TSS whose DS names an LDT descriptor: #TS(selector) when the new
+    // task's segments load, the LDT descriptor unchanged.
+    const TS: u8 = 10;
+    let mut rig = Rig::new();
+    rig.record(TS);
+    let ldt = sys_desc(DATA, 0xFFF, 0x2, 0);
+    let ldt_sel = FREE + 8;
+    rig.set_gdt(ldt_sel, ldt);
+    rig.set_gdt(FREE, sys_desc(TSS2, 0x67, TSS32, 0));
+    rig.write32(TSS2 + 0x20, HANDLERS); // EIP
+    rig.write32(TSS2 + 0x24, 0x0002); // EFLAGS
+    rig.write32(TSS2 + 0x38, STACK0_TOP - 0x1000); // ESP
+    for (i, sel) in [DATA32, CODE32, DATA32, ldt_sel, DATA32, DATA32].iter().enumerate() {
+        rig.write32(TSS2 + 0x48 + 4 * i as u32, *sel as u32);
+    }
+    rig.run(|a| {
+        a.call_far(FREE, 0)?;
+        a.hlt()
+    });
+    assert_eq!(rig.recorded().0, TS as u32);
+    assert_eq!(rig.recorded().1[0], ldt_sel as u32);
+    assert_eq!(rig.gdt(ldt_sel), ldt);
+}
+
+#[test]
 fn read_only_segments_and_code_segments_refuse_writes() {
     let mut rig = Rig::new();
     rig.record(GP);

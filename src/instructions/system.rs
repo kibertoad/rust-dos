@@ -446,7 +446,7 @@ pub fn verify(cpu: &mut Cpu, instr: &Instruction, write: bool) -> CpuResult {
     require_pm(cpu)?;
     let selector = read_op(cpu, instr, 0, 2)? as u16;
     let ok = visible_descriptor(cpu, selector)?
-        .is_some_and(|d| if write { d.writable_data() } else { d.is_segment() && d.readable() });
+        .is_some_and(|d| if write { d.writable_data() } else { d.readable() });
     cpu.set_cpu_flag(CpuFlags::ZF, ok);
     Ok(())
 }
