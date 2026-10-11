@@ -37,6 +37,12 @@ macro_rules! load_all {
 impl Bus {
     /// Write the bus's sections.
     pub(crate) fn save_state(&self, w: &mut Writer) {
+        // `after_reload` sets the Sound Blaster's edge record from the
+        // loaded card instead of saving it. That is right only if every
+        // change to the card's line was followed by `sync_sb_irq` before
+        // the save: a record that lagged would hold an edge the state
+        // loses.
+        debug_assert_eq!(self.sb_irq, self.sb_irq_now(), "the Sound Blaster's IRQ edge record lags the card");
         let Bus {
             ram,
             boot,

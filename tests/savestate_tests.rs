@@ -622,3 +622,106 @@ fn a_load_keeps_the_time_stamps_of_the_devices_open_files() {
     rust_dos::dos_files::flush(&mut cpu.bus);
     assert_eq!(entries(&cpu), saved_entries);
 }
+
+/// A machine whose Sound Blaster is on IRQ 5, with every other line
+/// masked, so `pic_pending_irq` tells only the card's request.
+fn sb_irq5_machine() -> Cpu {
+    let mut cpu = Cpu::new(PathBuf::from("."));
+    cpu.bus.set_cycles_per_ms(1000);
+    cpu.bus.configure_sound(Some(rust_dos::sb::SbConfig { irq: 5, ..Default::default() }), true);
+    cpu.load_shell();
+    cpu.bus.io_write(0x21, 0xDF);
+    cpu.bus.io_write(0xA1, 0xFF);
+    cpu
+}
+
+/// Let `ms` milliseconds of emulated time pass on the bus alone, running
+/// due timer events: the CPU takes no interrupt meanwhile.
+fn bus_wait_ms(cpu: &mut Cpu, ms: u64) {
+    let bus = &mut cpu.bus;
+    let target = bus.clock.icount + ms * 1000;
+    while bus.clock.icount < target {
+        bus.clock.icount += (target - bus.clock.icount).min(10);
+        if bus.clock.icount >= bus.clock.deadline {
+            bus.service_timers();
+        }
+    }
+}
+
+/// Start an auto-init 8-bit transfer of 100-byte blocks at 10 kHz on DMA
+/// channel 1: a block end every 10 ms.
+fn sb_start_blocks(cpu: &mut Cpu) {
+    let bus = &mut cpu.bus;
+    bus.io_write(0x226, 1);
+    bus.io_write(0x226, 0);
+    assert_eq!((bus.io_read(0x22E) & 0x80, bus.io_read(0x22A)), (0x80, 0xAA));
+    bus.load_bytes(0x20000, &[0x80; 100]);
+    // Channel 1 masked, flip-flop cleared, single auto-init read, address
+    // 20000h, 100 bytes, unmasked.
+    for (port, value) in [(0x0A, 0x05), (0x0C, 0), (0x0B, 0x59), (0x02, 0), (0x02, 0), (0x83, 2), (0x03, 99), (0x03, 0), (0x0A, 0x01)] {
+        bus.io_write(port, value);
+    }
+    // 10 kHz, blocks of 100, auto-init 8-bit output.
+    for value in [0x40, 156, 0x48, 99, 0, 0x1C] {
+        bus.io_write(0x22C, value);
+    }
+}
+
+/// The CPU takes the card's interrupt and its handler ends it at the PIC
+/// without acknowledging it at the card; then the bus looks at the card
+/// again (a read of its write status). No new edge came, so no new request.
+fn take_irq5_without_acknowledging(cpu: &mut Cpu) {
+    assert_eq!(cpu.bus.pic_pending_irq(), Some(5));
+    cpu.bus.pic_acknowledge(5);
+    cpu.bus.io_write(0x20, 0x20);
+    cpu.bus.io_read(0x22C);
+}
+
+/// The bus raises the Sound Blaster's IRQ on a rising edge of the card's
+/// line, as it last saw it. A load sets that record from the loaded card,
+/// whatever the machine's own card had, so IRQ 5 comes once for each block
+/// end after a load, as it does in the machine that saved the state.
+#[test]
+fn a_loaded_sound_blaster_raises_its_irq_once_per_block_end() {
+    fix_time();
+    let mut a = sb_irq5_machine();
+    sb_start_blocks(&mut a);
+    bus_wait_ms(&mut a, 15);
+    // The first block ended at 10 ms: the card's line is up, IRQ 5 asked.
+    assert_eq!(a.bus.pic_pending_irq(), Some(5));
+    let line_up = machine::save(&a);
+    // The driver acknowledges at the card before the CPU takes it.
+    a.bus.io_read(0x22E);
+    assert_eq!(a.bus.pic_pending_irq(), None);
+    let line_down = machine::save(&a);
+
+    // Loaded into a machine whose card's line is down: the request comes
+    // with the state, and no second one follows.
+    let mut b = sb_irq5_machine();
+    assert_eq!(b.bus.pic_pending_irq(), None);
+    machine::load(&mut b, &line_up).unwrap();
+    take_irq5_without_acknowledging(&mut b);
+    assert_eq!(b.bus.pic_pending_irq(), None, "no second IRQ 5 for the same block end");
+    // Acknowledged, the next block end at 20 ms asks once more.
+    b.bus.io_read(0x22E);
+    bus_wait_ms(&mut b, 10);
+    take_irq5_without_acknowledging(&mut b);
+    assert_eq!(b.bus.pic_pending_irq(), None);
+
+    // Loaded into a machine whose card's line is up: the next block end
+    // at 20 ms still asks.
+    let mut c = sb_irq5_machine();
+    c.bus.io_write(0x22C, 0xF2);
+    assert_eq!(c.bus.pic_pending_irq(), Some(5));
+    machine::load(&mut c, &line_down).unwrap();
+    assert_eq!(c.bus.pic_pending_irq(), None);
+    bus_wait_ms(&mut c, 10);
+    assert_eq!(c.bus.pic_pending_irq(), Some(5), "the block end after the load raises IRQ 5");
+    take_irq5_without_acknowledging(&mut c);
+    assert_eq!(c.bus.pic_pending_irq(), None);
+
+    // The machine that saved does the same.
+    bus_wait_ms(&mut a, 10);
+    take_irq5_without_acknowledging(&mut a);
+    assert_eq!(a.bus.pic_pending_irq(), None);
+}

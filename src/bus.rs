@@ -304,7 +304,9 @@ pub struct Bus {
     /// The host's volumes for each source (`[mixer]`) and the mute.
     pub mixer: crate::mixer::Mixer,
     /// The Sound Blaster's IRQ and whether its 8-bit and 16-bit interrupts
-    /// wait for the driver, as `sync_sb_irq` last saw them.
+    /// wait for the driver, as `sync_sb_irq` last saw them. Not saved: a
+    /// load sets it from the loaded card (`after_reload`), and the PICs'
+    /// requests come with the state.
     sb_irq: (Option<u8>, bool, bool),
     /// `interrupt_requested` as of the last change to the interrupt lines,
     /// the PICs or the mouse event handler, so the CPU tests one flag
@@ -473,7 +475,8 @@ impl Bus {
             sb_frame: (0, 0),
             beep_frames: 0,
             mixer: crate::mixer::Mixer::default(),
-            sb_irq: (None, false, false),
+            // The card's, with its interrupts not waiting.
+            sb_irq: (Some(crate::sb::SbConfig::default().irq), false, false),
             irq_ready: false,
             audio_peak: 0,
             audio_underruns: 0,
