@@ -490,12 +490,15 @@ fn resize(cpu: &mut Cpu, handle: u16, size_kb: u32) -> Result<(), u8> {
     if block.locks > 0 {
         return Err(ERR_LOCKED);
     }
+    // 8Fh takes a 32-bit size: 400000h KB and up is 4 GB or more, which
+    // no memory holds (and which 32 bits of bytes would wrap to little).
+    let Some(bytes) = size_kb.checked_mul(KB) else { return Err(ERR_OUT_OF_MEMORY) };
     // Take the block out, then find room for the new size as if it were
     // free: in place if the free space around it is big enough, otherwise
     // in the first gap that fits.
     cpu.bus.xms.blocks[handle as usize - 1] = None;
     let gaps = cpu.bus.xms.gaps(end);
-    let new_end = block.base as u64 + (size_kb * KB) as u64;
+    let new_end = block.base as u64 + bytes as u64;
     let in_place = gaps.iter().any(|&(base, kb)| {
         base <= block.base && (base + kb * KB) as u64 >= new_end
     });
