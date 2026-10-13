@@ -3076,7 +3076,7 @@ fn fpu_integer_operands_run_as_their_handlers() {
 }
 
 /// 80-bit values for the sums: (sign << 15 | exponent, mantissa).
-const EXTENDED: [(u16, u64); 14] = [
+const EXTENDED: [(u16, u64); 17] = [
     (0x3FFF, 0x8000_0000_0000_0001), // 1 and a bit a double hasn't
     (0x3FFF, 0xFFFF_FFFF_FFFF_FFFF), // just under 2
     (0xBFFF, 0x8000_0000_0000_0000), // -1
@@ -3091,6 +3091,9 @@ const EXTENDED: [(u16, u64); 14] = [
     (0x7FFF, 0x8000_0000_0000_0000), // infinity
     (0x3FFF, 0x4000_0000_0000_0000), // an unnormal
     (0xC005, 0xA5A5_A5A5_A5A5_A5A5), // -41.29...
+    (0xFFFF, 0x8000_0000_0000_0000), // -infinity
+    (0x7FFF, 0xC000_0000_0000_1234), // a quiet NaN
+    (0xFFFF, 0x8000_0000_0000_5678), // a signalling NaN
 ];
 
 #[test]

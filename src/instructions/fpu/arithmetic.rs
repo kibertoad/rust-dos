@@ -24,11 +24,8 @@ pub fn addsub_st(cpu: &mut Cpu, dst: usize, a: usize, b: usize, sub: bool) {
     }
     let mut x = cpu.fpu_get(a);
     let y = cpu.fpu_get(b);
-    if sub {
-        x.sub(y);
-    } else {
-        x.add(y);
-    }
+    let exceptions = if sub { x.sub(y) } else { x.add(y) };
+    raise(cpu, exceptions);
     cpu.fpu_set(dst, x);
 }
 
@@ -53,15 +50,24 @@ pub fn addsub_value(cpu: &mut Cpu, kind: u32, value: f64) {
     let mut val = F80::new();
     val.set_f64(value);
     let mut st0 = cpu.fpu_get(0);
-    match kind {
+    let exceptions = match kind {
         ADD_VALUE => st0.add(val),
         SUB_VALUE => st0.sub(val),
         _ => {
-            val.sub(st0);
+            let exceptions = val.sub(st0);
             st0 = val;
+            exceptions
         }
-    }
+    };
+    raise(cpu, exceptions);
     cpu.fpu_set(0, st0);
+}
+
+/// Set the exception flags `F80::add` reported.
+fn raise(cpu: &mut Cpu, exceptions: u16) {
+    if exceptions != 0 {
+        cpu.set_fpu_flag(FpuFlags::from_bits_truncate(exceptions), true);
+    }
 }
 
 /// A real memory operand as a double.
@@ -110,7 +116,8 @@ pub fn fiadd(cpu: &mut Cpu, instr: &Instruction) {
     }
     let val = cpu.load_int_to_f80(addr, instr.memory_size());
     let mut st0 = cpu.fpu_get(0);
-    st0.add(val);
+    let exceptions = st0.add(val);
+    raise(cpu, exceptions);
     cpu.fpu_set(0, st0);
 }
 
@@ -125,7 +132,8 @@ pub fn fisub(cpu: &mut Cpu, instr: &Instruction) {
     }
     let val = cpu.load_int_to_f80(addr, instr.memory_size());
     let mut st0 = cpu.fpu_get(0);
-    st0.sub(val);
+    let exceptions = st0.sub(val);
+    raise(cpu, exceptions);
     cpu.fpu_set(0, st0);
 }
 
@@ -140,7 +148,8 @@ pub fn fisubr(cpu: &mut Cpu, instr: &Instruction) {
     }
     let mut val = cpu.load_int_to_f80(addr, instr.memory_size());
     let st0 = cpu.fpu_get(0);
-    val.sub(st0);
+    let exceptions = val.sub(st0);
+    raise(cpu, exceptions);
     cpu.fpu_set(0, val);
 }
 

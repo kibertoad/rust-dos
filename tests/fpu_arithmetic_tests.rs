@@ -334,3 +334,82 @@ fn test_trigonometry() {
     assert!((cpu.fpu_get(0).get_f64() - 1.0).abs() < 0.0001); // The pushed 1.0
     assert!((cpu.fpu_get(1).get_f64() - 1.0).abs() < 0.0001); // The result tan(pi/4)
 }
+
+/// An infinity has the integer bit set in 80 bits (Intel SDM vol. 1, "Real
+/// Number and NaN Encodings"): one loaded as 80 bits is an infinity to
+/// FMUL and FXAM, and one a division by 0 made stores as 80 bits with it.
+#[test]
+fn test_80_bit_infinities_have_the_integer_bit() {
+    let mut cpu = Cpu::new(std::path::PathBuf::from("."));
+    cpu.bus.write_64(0x1000, 0x8000_0000_0000_0000);
+    cpu.bus.write_16(0x1008, 0x7FFF);
+    // DB 2E 00 10: FLD TBYTE PTR [1000]; D9 E5: FXAM
+    testrunners::run_cpu_code(&mut cpu, &[0xDB, 0x2E, 0x00, 0x10]);
+    testrunners::run_cpu_code(&mut cpu, &[0xD9, 0xE5]);
+    let cc = cpu.get_fpu_flags() & (FpuFlags::C3 | FpuFlags::C2 | FpuFlags::C0);
+    assert_eq!(cc, FpuFlags::C2 | FpuFlags::C0, "FXAM: infinity");
+    // D9 E8: FLD1; DE C9: FMULP; DD 1E 10 10: FSTP QWORD PTR [1010]
+    testrunners::run_cpu_code(&mut cpu, &[0xD9, 0xE8]);
+    testrunners::run_cpu_code(&mut cpu, &[0xDE, 0xC9]);
+    testrunners::run_cpu_code(&mut cpu, &[0xDD, 0x1E, 0x10, 0x10]);
+    assert_eq!(cpu.bus.read_64(0x1010), f64::INFINITY.to_bits(), "inf * 1");
+
+    // D9 E8: FLD1; D9 EE: FLDZ; DE F9: FDIVP (1/0); DB 3E 20 10: FSTP TBYTE PTR [1020]
+    for code in [&[0xD9, 0xE8][..], &[0xD9, 0xEE], &[0xDE, 0xF9], &[0xDB, 0x3E, 0x20, 0x10]] {
+        testrunners::run_cpu_code(&mut cpu, code);
+    }
+    assert_eq!((cpu.bus.read_16(0x1028), cpu.bus.read_64(0x1020)), (0x7FFF, 0x8000_0000_0000_0000), "1/0");
+}
+
+/// FADD and FSUB of 80-bit infinities, NaNs and sums past the largest
+/// number, as an x87 with its exceptions masked does them: the expected
+/// results and exception bits (IE 01h, OE and PE 28h) are what FLD TBYTE,
+/// FLD TBYTE, FADDP or FSUBRP, FSTP TBYTE gave on an x87.
+#[test]
+fn test_fadd_fsub_of_infinities_nans_and_overflow() {
+    let inf = (0x7FFF, 0x8000_0000_0000_0000);
+    let ninf = (0xFFFF, 0x8000_0000_0000_0000);
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let qnan = (0x7FFF, 0xC000_0000_0000_1234);
+    let qnan2 = (0xFFFF, 0xC000_0000_0000_5678);
+    let snan = (0x7FFF, 0x8000_0000_0000_1234);
+    let big = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+    let nbig = (0xFFFE, 0xFFFF_FFFF_FFFF_FFFF);
+    let indefinite = (0xFFFF, 0xC000_0000_0000_0000);
+    // (a, b, a - b rather than a + b, result, exceptions)
+    let cases: [((u16, u64), (u16, u64), bool, (u16, u64), u16); 14] = [
+        (inf, inf, false, inf, 0),
+        (inf, inf, true, indefinite, 0x01),
+        (inf, ninf, false, indefinite, 0x01),
+        (one, inf, true, ninf, 0),
+        (inf, one, true, inf, 0),
+        (ninf, one, false, ninf, 0),
+        (qnan, one, false, qnan, 0),
+        (one, qnan, true, qnan, 0),
+        (one, snan, false, (0x7FFF, 0xC000_0000_0000_1234), 0x01),
+        (qnan, qnan2, false, qnan2, 0),
+        (qnan2, qnan, true, qnan2, 0),
+        (qnan, inf, true, qnan, 0),
+        (big, big, false, inf, 0x28),
+        (nbig, big, true, ninf, 0x28),
+    ];
+    for (a, b, sub, want, flags) in cases {
+        let mut cpu = Cpu::new(std::path::PathBuf::from("."));
+        for (at, (se, man)) in [(0x1000, a), (0x1010, b)] {
+            cpu.bus.write_64(at, man);
+            cpu.bus.write_16(at + 8, se);
+        }
+        // DB 2E 10 10: FLD TBYTE PTR [1010]; DB 2E 00 10: FLD TBYTE PTR [1000]
+        testrunners::run_cpu_code(&mut cpu, &[0xDB, 0x2E, 0x10, 0x10]);
+        testrunners::run_cpu_code(&mut cpu, &[0xDB, 0x2E, 0x00, 0x10]);
+        // DE E1: FSUBRP ST(1), ST(0) (ST(1) = ST(0) - ST(1) = a - b); DE C1: FADDP
+        testrunners::run_cpu_code(&mut cpu, if sub { &[0xDE, 0xE1] } else { &[0xDE, 0xC1] });
+        // DB 3E 20 10: FSTP TBYTE PTR [1020]
+        testrunners::run_cpu_code(&mut cpu, &[0xDB, 0x3E, 0x20, 0x10]);
+        let got = (cpu.bus.read_16(0x1028), cpu.bus.read_64(0x1020));
+        let case = format!("{:04X}:{:016X} {} {:04X}:{:016X}", a.0, a.1, if sub { '-' } else { '+' }, b.0, b.1);
+        assert_eq!(got, want, "{}", case);
+        let exceptions = cpu.get_fpu_flags().bits() & 0x3F;
+        assert_eq!(exceptions, flags, "exceptions of {}", case);
+    }
+}
