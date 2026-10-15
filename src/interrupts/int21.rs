@@ -331,7 +331,11 @@ fn device_info(cpu: &Cpu, sft: u16, device: Option<CharDevice>) -> u16 {
     match device {
         Some(device) => crate::dos_files::device_info(device, sft),
         // File: Bit 7=0 (Block Dev), Bits 0-5 = Drive # (0=A)
-        None => cpu.bus.disk.handle_drive(sft).unwrap_or(cpu.bus.disk.get_current_drive()) as u16,
+        None => cpu
+            .bus
+            .disk
+            .handle_drive(sft)
+            .unwrap_or(cpu.bus.disk.get_current_drive()) as u16,
     }
 }
 
@@ -1547,7 +1551,8 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     cpu.set_reg8(Register::AL, if ready { 0xFF } else { 0x00 });
                     cpu.set_cpu_flag(CpuFlags::CF, false);
                 }
-                // Output status: files, the console and NUL are always ready.
+                // Output status: files, the console and NUL are always
+                // ready.
                 0x07 if matches!(device, None | Some(CharDevice::Con | CharDevice::Nul)) => {
                     if sft.is_none() {
                         return set_result(cpu, Err(0x06));

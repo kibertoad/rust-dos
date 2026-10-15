@@ -366,7 +366,10 @@ fn write_entry(bus: &mut Bus, sft: u16) {
     // The device information word (as IOCTL 4400h has it), and the
     // device's driver or the drive's parameter block.
     let (info, driver) = match entry.device {
-        Some(device) => (device_info(device, sft), crate::dos_data::char_device(device, sft)),
+        Some(device) => (
+            device_info(device, sft),
+            crate::dos_data::char_device(device, sft),
+        ),
         None => (0x0040 | entry.drive as u16 & 0x3F, crate::dos_data::far(crate::dos_data::dpb(entry.drive))),
     };
     bus.write_16(at, entry.refs);
