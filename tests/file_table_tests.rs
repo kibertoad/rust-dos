@@ -206,6 +206,10 @@ fn a_console_write_clears_a_carry_the_caller_had_set() {
     assert_eq!(dos(&mut cpu, 0x4000, 1, 2, 0x300), Ok(2));
     cpu.set_cpu_flag(CpuFlags::CF, true);
     assert_eq!(dos(&mut cpu, 0x4000, 2, 2, 0x300), Ok(2));
+    let con = open(&mut cpu, "CON", 1).unwrap();
+    cpu.bus.load_bytes(at, b"hi");
+    cpu.set_cpu_flag(CpuFlags::CF, true);
+    assert_eq!(dos(&mut cpu, 0x4000, con, 2, 0x300), Ok(2));
 }
 
 #[test]
