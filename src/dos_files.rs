@@ -327,6 +327,21 @@ pub fn flush(bus: &mut Bus) {
     }
 }
 
+/// The device information word of the character device `device` open at
+/// `sft`, as IOCTL 4400h has it: the device's flags in the low byte, its
+/// driver's attribute byte in the high one.
+pub fn device_info(device: CharDevice, sft: u16) -> u16 {
+    match device {
+        CharDevice::Con => 0x80D3,
+        CharDevice::Emm => 0xC080,
+        // AUX and PRN: character devices, not EOF.
+        CharDevice::Nul if sft == SFT_AUX || sft == SFT_PRN => 0x80C0,
+        CharDevice::Prn => 0x80C0,
+        CharDevice::Nul => 0x8084,
+        CharDevice::Com1 | CharDevice::Com2 | CharDevice::Com3 | CharDevice::Com4 => 0x80C0,
+    }
+}
+
 /// Write the entry `sft` into memory as DOS 4 and later have them; a
 /// free one is all zeros, with no handle referring to it.
 fn write_entry(bus: &mut Bus, sft: u16) {
@@ -351,17 +366,7 @@ fn write_entry(bus: &mut Bus, sft: u16) {
     // The device information word (as IOCTL 4400h has it), and the
     // device's driver or the drive's parameter block.
     let (info, driver) = match entry.device {
-        Some(device) => {
-            let info = match device {
-                CharDevice::Con => 0x80D3,
-                CharDevice::Emm => 0xC080,
-                CharDevice::Nul if sft == SFT_AUX || sft == SFT_PRN => 0x80C0,
-                CharDevice::Prn => 0x80C0,
-                CharDevice::Nul => 0x8084,
-                CharDevice::Com1 | CharDevice::Com2 | CharDevice::Com3 | CharDevice::Com4 => 0x80C0,
-            };
-            (info, crate::dos_data::char_device(device, sft))
-        }
+        Some(device) => (device_info(device, sft), crate::dos_data::char_device(device, sft)),
         None => (0x0040 | entry.drive as u16 & 0x3F, crate::dos_data::far(crate::dos_data::dpb(entry.drive))),
     };
     bus.write_16(at, entry.refs);

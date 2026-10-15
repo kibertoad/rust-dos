@@ -213,6 +213,39 @@ fn ioctl_status_says_whether_a_file_has_more_to_read() {
     let remote = cpu.dx();
     dos(&mut cpu, 0x4400, h, 0, 0).unwrap();
     assert_eq!(remote, cpu.dx(), "the attribute word, as AX=4400h has it");
+    // The console: AX=4400h has its driver's attribute byte in DX's high
+    // byte (bit 15 set), AX=440Ah only the flags the SFT keeps.
+    dos(&mut cpu, 0x4400, 1, 0, 0).unwrap();
+    assert_eq!(cpu.dx(), 0x80D3);
+    dos(&mut cpu, 0x440A, 1, 0, 0xFFFF).unwrap();
+    assert_eq!(cpu.dx(), 0x00D3);
+    // A key typed makes standard input ready.
+    rust_dos::keyboard::queue_keystroke(&mut cpu.bus, 0x1E61);
+    assert_eq!(dos(&mut cpu, 0x4406, 0, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+}
+
+#[test]
+fn ioctl_status_of_nul_and_a_serial_port() {
+    use rust_dos::serial::{PortType, SerialSettings};
+    let mut cpu = machine("ioctl_status_devices");
+    // NUL and the standard AUX are ready both ways.
+    let nul = open(&mut cpu, "NUL", 2).unwrap();
+    for handle in [nul, 3] {
+        assert_eq!(dos(&mut cpu, 0x4406, handle, 0, 0), Ok(0x44FF));
+        assert_eq!(dos(&mut cpu, 0x4407, handle, 0, 0), Ok(0x44FF));
+    }
+    // A modem on COM1, which raises DSR once the program raises DTR:
+    // ready for output, nothing to read yet.
+    let modem = [PortType::Modem, PortType::Empty, PortType::Off, PortType::Off];
+    cpu.bus.configure_serial(&SerialSettings { ports: modem, ..Default::default() });
+    cpu.bus.io_write(0x3FC, 0x03);
+    let com1 = open(&mut cpu, "COM1", 2).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4407, com1, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    assert_eq!(dos(&mut cpu, 0x4406, com1, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // Nothing on COM2, so no DSR: busy both ways.
+    let com2 = open(&mut cpu, "COM2", 2).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4407, com2, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    assert_eq!(dos(&mut cpu, 0x4406, com2, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
 }
 
 #[test]

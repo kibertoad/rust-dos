@@ -1809,13 +1809,7 @@ impl DiskController {
     /// there, but its position (`position`).
     pub fn sft_entry(&self, sft: u16) -> Option<SftEntry> {
         let open = self.open_files.get(&sft)?;
-        let size = match &open.data {
-            OpenData::Host(file) => file.len().unwrap_or(0),
-            OpenData::Memory(data, _) => data.len() as u64,
-            OpenData::Image(_, extent, _) => extent.size as u64,
-            OpenData::Fat { volume, at, .. } => volume.reload(*at).map_or(0, |entry| entry.size as u64),
-            OpenData::Device(_) => 0,
-        };
+        let size = self.file_size(sft)?;
         let (time, date) = self.file_time(sft).unwrap_or((0, 0));
         let leaf = open.path.rsplit(['\\', '/', ':']).next().unwrap_or("");
         let (stem, ext) = match open.data {
@@ -1839,6 +1833,17 @@ impl DiskController {
             size: size.min(u32::MAX as u64) as u32,
             time,
             date,
+        })
+    }
+
+    /// How many bytes the open file `sft` holds (0 for a device).
+    pub fn file_size(&self, sft: u16) -> Option<u64> {
+        Some(match &self.open_files.get(&sft)?.data {
+            OpenData::Host(file) => file.len().unwrap_or(0),
+            OpenData::Memory(data, _) => data.len() as u64,
+            OpenData::Image(_, extent, _) => extent.size as u64,
+            OpenData::Fat { volume, at, .. } => volume.reload(*at).map_or(0, |entry| entry.size as u64),
+            OpenData::Device(_) => 0,
         })
     }
 
