@@ -177,6 +177,7 @@ impl Voodoo {
             // Stippling in rotate mode goes on from pixel to pixel across
             // the triangle, and pixels right of the rows land in the next
             // row, which another worker draws: drawn here, whole.
+            let _zone = crate::profile::zone(crate::profile::Zone::VoodooInline);
             self.flush();
             let mut stipple = self.reg[STIPPLE];
             let mut stats = self.stats;
@@ -249,6 +250,7 @@ impl Voodoo {
         let job = Job::Fastfill { st, dither, x0: sx, x1: ex, y0: sy, y1: ey };
         if spills {
             // Into the next rows' memory, which other workers draw.
+            let _zone = crate::profile::zone(crate::profile::Zone::VoodooInline);
             self.flush();
             let mut stats = self.stats;
             job.run_all(&mut 0, &mut stats);

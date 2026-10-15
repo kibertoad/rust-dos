@@ -58,6 +58,8 @@ impl Job {
             Job::Triangle { st, p, verts, texcount } => {
                 let flip = st.fbz_mode & (1 << 17) != 0;
                 let variant = raster::variant(st, *texcount);
+                let before = stats.pixels_in;
+                let t0 = std::time::Instant::now();
                 let mut row = |y: i32, x0: i32, x1: i32| {
                     if !owns(raster::screen_y(st, y, flip)) {
                         return;
@@ -65,6 +67,12 @@ impl Job {
                     raster::scanline_as(variant, *texcount, st, p, y, x0, x1, stipple, stats);
                 };
                 render_triangle(*verts, &mut row);
+                let tex = |i: usize| st.tmu[i].as_ref().map_or(0, |t| t.mode);
+                let key = [variant.map_or(u32::MAX, |v| v as u32), *texcount as u32, st.fbz_mode, st.fbz_color_path, st.alpha_mode, st.fog_mode, tex(0), tex(1)];
+                let mut m = RASTER_STATS.lock().unwrap();
+                let e = m.get_or_insert_with(Default::default).entry(key).or_default();
+                e.0 += stats.pixels_in.wrapping_sub(before) as i64 as u64;
+                e.1 += t0.elapsed().as_nanos() as u64;
             }
             Job::Fastfill { st, dither, x0, x1, y0, y1 } => {
                 let flip = st.fbz_mode & (1 << 17) != 0;
@@ -311,3 +319,7 @@ mod tests {
         assert!(!pool.busy());
     }
 }
+
+/// Investigation only: pixels and worker time by raster state.
+#[allow(clippy::type_complexity)]
+pub static RASTER_STATS: Mutex<Option<std::collections::HashMap<[u32; 8], (u64, u64)>>> = Mutex::new(None);

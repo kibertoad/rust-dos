@@ -168,6 +168,8 @@ zones! {
     Gus = "gus.advance",
     // The 3D cards' work on the emulation thread.
     Voodoo = "voodoo",
+    VoodooInline = "voodoo.inline",
+    VoodooFlush = "voodoo.flush",
     PowerVr = "powervr",
     // The emulator's BIOS, DOS and other services.
     HleInt08 = "hle.int08",

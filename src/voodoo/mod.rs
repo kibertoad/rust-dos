@@ -812,19 +812,27 @@ impl Voodoo {
     }
 
     /// Wait until the workers drew everything given to them.
+    #[track_caller]
     pub fn flush(&mut self) {
         self.catch_up();
         self.drawn_to.clear();
     }
 
     /// Draw everything queued, and wait for it.
+    #[track_caller]
     pub(crate) fn catch_up(&self) {
+        let caller = std::panic::Location::caller();
         if !self.backlog.borrow().is_empty() {
             self.catch_ups.set(self.catch_ups.get() + 1);
         }
         self.submit_words();
         self.release_backlog();
-        self.pool.flush();
+        {
+            let _zone = crate::profile::zone(crate::profile::Zone::VoodooFlush);
+            let t = std::time::Instant::now();
+            self.pool.flush();
+            flush_stats::note(caller, t.elapsed());
+        }
         self.outstanding.set(false);
         self.tmu_in_use.set(0);
     }
@@ -927,6 +935,7 @@ impl Voodoo {
     }
 
     /// The pixel counters, the workers' included.
+    #[track_caller]
     fn counted(&self) -> Stats {
         self.catch_up();
         let mut stats = self.stats;
@@ -1619,5 +1628,49 @@ impl State for Voodoo {
         }
         self.after_load();
         Ok(())
+    }
+}
+
+/// Investigation only: time the emulation thread waits in `pool.flush`, by
+/// caller, printed to stderr every 5 s.
+mod flush_stats {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::panic::Location;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static STATS: RefCell<(Option<Instant>, HashMap<&'static Location<'static>, (u64, Duration)>)> =
+            RefCell::new((None, HashMap::new()));
+    }
+
+    pub fn note(caller: &'static Location<'static>, waited: Duration) {
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            let e = s.1.entry(caller).or_default();
+            e.0 += 1;
+            e.1 += waited;
+            let start = *s.0.get_or_insert_with(Instant::now);
+            if start.elapsed() >= Duration::from_secs(5) {
+                let mut v: Vec<_> = s.1.drain().collect();
+                v.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+                eprintln!("[flush] 5 s:");
+                for (loc, (n, d)) in v.iter().take(12) {
+                    eprintln!("[flush] {:>8} calls {:>9.1} ms  {}:{}", n, d.as_secs_f64() * 1000.0, loc.file(), loc.line());
+                }
+                if let Some(m) = super::workers::RASTER_STATS.lock().unwrap().take() {
+                    let mut v: Vec<_> = m.into_iter().collect();
+                    v.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+                    for (k, (px, ns)) in v.iter().take(10) {
+                        let var = if k[0] == u32::MAX { "generic".to_string() } else { format!("variant {}", k[0]) };
+                        eprintln!(
+                            "[raster] {:>10} px {:>8.1} ms {:>6.1} ns/px  {} tmus={} fbz={:08X} color={:08X} alpha={:08X} fog={:08X} tex0={:08X} tex1={:08X}",
+                            px, *ns as f64 / 1e6, *ns as f64 / (*px).max(1) as f64, var, k[1], k[2], k[3], k[4], k[5], k[6], k[7]
+                        );
+                    }
+                }
+                s.0 = Some(Instant::now());
+            }
+        });
     }
 }
