@@ -1321,22 +1321,22 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 return;
             }
 
-            if let Some(n) = cpu.bus.disk.handle_device(sft).and_then(|d| d.com_port())
+            // Every write but a failed one to a file returns the byte count
+            // with CF clear, whatever CF the caller came in with.
+            let result = if let Some(n) = cpu.bus.disk.handle_device(sft).and_then(|d| d.com_port())
                 && cpu.bus.serial.ports[n].is_some()
             {
                 // A serial port: out through its UART.
                 for &byte in &data {
                     cpu.bus.serial_send(n, byte);
                 }
-                cpu.set_ax(count as u16);
-                cpu.set_cpu_flag(CpuFlags::CF, false);
+                Ok(count as u16)
             } else if cpu.bus.disk.handle_device(sft) == Some(CharDevice::Prn) {
                 // The printer, or nowhere without one.
                 for &byte in &data {
                     cpu.bus.printer_put(byte);
                 }
-                cpu.set_ax(count as u16);
-                cpu.set_cpu_flag(CpuFlags::CF, false);
+                Ok(count as u16)
             } else if console {
                 // STDOUT/STDERR, or CON opened by name
                 for &byte in &data {
@@ -1354,13 +1354,12 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 if let Some(console) = cpu.host_console.as_mut() {
                     console.to_stderr = false;
                 }
-                cpu.set_ax(count as u16);
+                Ok(count as u16)
             } else {
                 match cpu.bus.disk.write_file(sft, &data) {
                     Ok(written) => {
                         file_io(cpu, sft, written as u32, Some(true));
-                        cpu.set_ax(written);
-                        cpu.set_cpu_flag(CpuFlags::CF, false);
+                        Ok(written)
                     }
                     Err(code) => {
                         // e.g. 05h on a file opened read-only (CD-ROM)
@@ -1368,11 +1367,11 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                             "[DOS] Write Handle {:04X} Failed, Error={:02X}",
                             handle, code
                         ));
-                        cpu.set_ax(code as u16);
-                        cpu.set_cpu_flag(CpuFlags::CF, true);
+                        Err(code)
                     }
                 }
-            }
+            };
+            set_result(cpu, result);
         }
 
         // AH = 42h: Move File Pointer

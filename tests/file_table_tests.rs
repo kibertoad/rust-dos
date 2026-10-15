@@ -196,6 +196,23 @@ fn force_duplicate_points_standard_output_at_a_file() {
 }
 
 #[test]
+fn a_console_write_clears_a_carry_the_caller_had_set() {
+    let mut cpu = machine("console_cf");
+    let at = cpu.current_psp as usize * 16 + 0x300;
+    cpu.bus.load_bytes(at, b"hi");
+    // Programs often reach INT 21h with CF set by an earlier compare, then
+    // test it with JC after the call.
+    cpu.set_cpu_flag(CpuFlags::CF, true);
+    assert_eq!(dos(&mut cpu, 0x4000, 1, 2, 0x300), Ok(2));
+    cpu.set_cpu_flag(CpuFlags::CF, true);
+    assert_eq!(dos(&mut cpu, 0x4000, 2, 2, 0x300), Ok(2));
+    let con = open(&mut cpu, "CON", 1).unwrap();
+    cpu.bus.load_bytes(at, b"hi");
+    cpu.set_cpu_flag(CpuFlags::CF, true);
+    assert_eq!(dos(&mut cpu, 0x4000, con, 2, 0x300), Ok(2));
+}
+
+#[test]
 fn a_child_psp_inherits_handles_but_not_those_opened_not_to_be() {
     let mut cpu = machine("child_psp");
     let parent = cpu.current_psp;
