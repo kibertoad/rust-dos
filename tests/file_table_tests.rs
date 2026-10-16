@@ -196,6 +196,59 @@ fn force_duplicate_points_standard_output_at_a_file() {
 }
 
 #[test]
+fn ioctl_status_says_whether_a_file_has_more_to_read() {
+    let mut cpu = machine("ioctl_status");
+    let h = open(&mut cpu, "DATA.TXT", 2).unwrap();
+    // AX=4406h: AL=FFh while there is more to read, 00h at the end.
+    assert_eq!(dos(&mut cpu, 0x4406, h, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    dos(&mut cpu, 0x4202, h, 0, 0).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4406, h, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // AX=4407h: a file is always ready for output.
+    assert_eq!(dos(&mut cpu, 0x4407, h, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    // Standard output is ready too; standard input has nothing typed.
+    assert_eq!(dos(&mut cpu, 0x4407, 1, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    assert_eq!(dos(&mut cpu, 0x4406, 0, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // AX=440Ah: a local file, so bit 15 of DX is clear, whatever DX held.
+    assert!(dos(&mut cpu, 0x440A, h, 0, 0xFFFF).is_ok());
+    let remote = cpu.dx();
+    dos(&mut cpu, 0x4400, h, 0, 0).unwrap();
+    assert_eq!(remote, cpu.dx(), "the attribute word, as AX=4400h has it");
+    // The console: AX=4400h has its driver's attribute byte in DX's high
+    // byte (bit 15 set), AX=440Ah only the flags the SFT keeps.
+    dos(&mut cpu, 0x4400, 1, 0, 0).unwrap();
+    assert_eq!(cpu.dx(), 0x80D3);
+    dos(&mut cpu, 0x440A, 1, 0, 0xFFFF).unwrap();
+    assert_eq!(cpu.dx(), 0x00D3);
+    // A key typed makes standard input ready.
+    rust_dos::keyboard::queue_keystroke(&mut cpu.bus, 0x1E61);
+    assert_eq!(dos(&mut cpu, 0x4406, 0, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+}
+
+#[test]
+fn ioctl_status_of_nul_and_a_serial_port() {
+    use rust_dos::serial::{PortType, SerialSettings};
+    let mut cpu = machine("ioctl_status_devices");
+    // NUL and the standard AUX are ready both ways.
+    let nul = open(&mut cpu, "NUL", 2).unwrap();
+    for handle in [nul, 3] {
+        assert_eq!(dos(&mut cpu, 0x4406, handle, 0, 0), Ok(0x44FF));
+        assert_eq!(dos(&mut cpu, 0x4407, handle, 0, 0), Ok(0x44FF));
+    }
+    // A modem on COM1, which raises DSR once the program raises DTR:
+    // ready for output, nothing to read yet.
+    let modem = [PortType::Modem, PortType::Empty, PortType::Off, PortType::Off];
+    cpu.bus.configure_serial(&SerialSettings { ports: modem, ..Default::default() });
+    cpu.bus.io_write(0x3FC, 0x03);
+    let com1 = open(&mut cpu, "COM1", 2).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4407, com1, 0, 0).map(|ax| ax & 0xFF), Ok(0xFF));
+    assert_eq!(dos(&mut cpu, 0x4406, com1, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    // Nothing on COM2, so no DSR: busy both ways.
+    let com2 = open(&mut cpu, "COM2", 2).unwrap();
+    assert_eq!(dos(&mut cpu, 0x4407, com2, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+    assert_eq!(dos(&mut cpu, 0x4406, com2, 0, 0).map(|ax| ax & 0xFF), Ok(0x00));
+}
+
+#[test]
 fn a_child_psp_inherits_handles_but_not_those_opened_not_to_be() {
     let mut cpu = machine("child_psp");
     let parent = cpu.current_psp;

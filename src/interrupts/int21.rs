@@ -205,6 +205,11 @@ fn con_read(cpu: &mut Cpu) -> Option<u8> {
     Some(ascii)
 }
 
+/// Whether `con_read` has a character to hand out without waiting.
+fn con_key_waits(cpu: &mut Cpu) -> bool {
+    cpu.con_pending_scan.is_some() || crate::keyboard::peek_keystroke(&mut cpu.bus).is_some()
+}
+
 /// Write a character to standard output (handle 1) as DOS's character
 /// functions do: to the screen (a bell beeps), or to where the command
 /// line redirected it.
@@ -318,6 +323,19 @@ fn writes_console(cpu: &mut Cpu, ah: u8) -> bool {
             file_of(cpu, handle).is_some_and(|sft| cpu.bus.disk.handle_device(sft) == Some(CharDevice::Con))
         }
         _ => false,
+    }
+}
+
+/// The device information word of AX=4400h for the open file `sft`.
+fn device_info(cpu: &Cpu, sft: u16, device: Option<CharDevice>) -> u16 {
+    match device {
+        Some(device) => crate::dos_files::device_info(device, sft),
+        // File: Bit 7=0 (Block Dev), Bits 0-5 = Drive # (0=A)
+        None => cpu
+            .bus
+            .disk
+            .handle_drive(sft)
+            .unwrap_or(cpu.bus.disk.get_current_drive()) as u16,
     }
 }
 
@@ -482,11 +500,8 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
         // AH = 0Bh: Check Standard Input Status
         // Returns AL = 0xFF if a character is ready, 0x00 if not.
         0x0B => {
-            if crate::keyboard::peek_keystroke(&mut cpu.bus).is_none() && cpu.con_pending_scan.is_none() {
-                cpu.set_reg8(Register::AL, 0x00);
-            } else {
-                cpu.set_reg8(Register::AL, 0xFF);
-            }
+            let ready = con_key_waits(cpu);
+            cpu.set_reg8(Register::AL, if ready { 0xFF } else { 0x00 });
         }
 
         // AH = 09h: Print String (Ends in '$')
@@ -1460,39 +1475,8 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     let Some(sft) = sft else {
                         return set_result(cpu, Err(0x06));
                     };
-                    if sft == crate::disk::SFT_AUX
-                        || sft == crate::disk::SFT_PRN
-                        || device.is_some_and(|d| d.com_port().is_some() || d == CharDevice::Prn)
-                    {
-                        // AUX and PRN: character devices, not EOF.
-                        cpu.set_dx(0x80C0);
-                    } else if device == Some(CharDevice::Nul) {
-                        // Character device, NUL.
-                        cpu.set_dx(0x8084);
-                    } else if device == Some(CharDevice::Emm) {
-                        // The expanded memory manager: a character device
-                        // taking IOCTL.
-                        cpu.set_dx(0xC080);
-                    } else if device == Some(CharDevice::Con) {
-                        // 1000 0000 1101 0011 = 80D3
-                        // Bit 7: Char device
-                        // Bit 6: EOF (0) - meaningful for files?
-                        // Bit 5: Raw (Binary) mode? (0=Cooked, 1=Raw)
-                        // Bit 4: Special?
-                        // Bit 3: Clock?
-                        // Bit 2: NUL?
-                        // Bit 1: Stdout
-                        // Bit 0: Stdin
-                        cpu.set_dx(0x80D3);
-                    } else {
-                        // File: Bit 7=0 (Block Dev), Bits 0-5 = Drive # (0=A)
-                        let drive = cpu
-                            .bus
-                            .disk
-                            .handle_drive(sft)
-                            .unwrap_or(cpu.bus.disk.get_current_drive());
-                        cpu.set_dx(drive as u16);
-                    }
+                    let info = device_info(cpu, sft, device);
+                    cpu.set_dx(info);
                     cpu.set_cpu_flag(CpuFlags::CF, false);
                     // cpu.bus.log_string(&format!("[DOS] IOCTL Get Device Info -> {:04X}", cpu.dx()));
                 }
@@ -1551,6 +1535,65 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     let (buffer, size) = (cpu.get_physical_addr(cpu.ds(), cpu.dx()), cpu.cx());
                     let result = crate::ems::ioctl_read(&mut cpu.bus, buffer, size);
                     set_result(cpu, result);
+                }
+                // Input status: for a file, FFh until its end; for the
+                // console, FFh while a key or the rest of a line waits.
+                0x06 if device.is_none() || device == Some(CharDevice::Con) => {
+                    let Some(sft) = sft else {
+                        return set_result(cpu, Err(0x06));
+                    };
+                    let ready = if device.is_some() {
+                        !cpu.con_pending.is_empty() || con_key_waits(cpu)
+                    } else {
+                        let size = cpu.bus.disk.file_size(sft).unwrap_or(0);
+                        cpu.bus.disk.position(sft).is_some_and(|at| at < size)
+                    };
+                    cpu.set_reg8(Register::AL, if ready { 0xFF } else { 0x00 });
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // Output status: files, the console and NUL are always
+                // ready.
+                0x07 if matches!(device, None | Some(CharDevice::Con | CharDevice::Nul)) => {
+                    if sft.is_none() {
+                        return set_result(cpu, Err(0x06));
+                    }
+                    cpu.set_reg8(Register::AL, 0xFF);
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // NUL (and the standard AUX, which goes nowhere here) has
+                // nothing to read but never keeps a reader waiting: its
+                // driver answers every request done and not busy.
+                0x06 if device == Some(CharDevice::Nul) => {
+                    cpu.set_reg8(Register::AL, 0xFF);
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // A serial port, as the AUX driver in IO.SYS answers from
+                // INT 14h AH=03h: input is ready with data received and DSR
+                // up, output with the transmit register empty and DSR up.
+                0x06 | 0x07
+                    if device
+                        .and_then(|d| d.com_port())
+                        .is_some_and(|n| cpu.bus.serial.ports[n].is_some()) =>
+                {
+                    let n = device.and_then(|d| d.com_port()).unwrap_or(0);
+                    let (lsr, msr) = cpu.bus.serial_status(n).unwrap_or((0, 0));
+                    let line = if al == 0x06 { 0x01 } else { 0x20 };
+                    let ready = lsr & line != 0 && msr & 0x20 != 0;
+                    cpu.set_reg8(Register::AL, if ready { 0xFF } else { 0x00 });
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
+                }
+                // Is the handle remote: DX is the attribute word as the SFT
+                // keeps it, with bit 15 clear, as no handle here is on a
+                // network redirector. AX=4400h puts a device driver's
+                // attribute byte in the high byte (bit 14 there is IOCTL
+                // support, here "keep the date on close"), so it goes.
+                0x0A => {
+                    let Some(sft) = sft else {
+                        return set_result(cpu, Err(0x06));
+                    };
+                    let info = device_info(cpu, sft, device) & 0x00FF;
+                    cpu.set_dx(info);
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
                 }
                 _ => {
                     // Stub other subfunctions as success
