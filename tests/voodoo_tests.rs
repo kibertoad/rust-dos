@@ -972,6 +972,56 @@ fn frame_buffer_reads_see_what_was_just_drawn() {
     assert_eq!(bus.read_32(BASE + 0x40_0000 + 10 * 2048 + 4 * 2), 0xF800_F800);
 }
 
+#[test]
+fn the_display_shows_the_whole_frame_swapped_while_the_next_one_draws() {
+    // The display waits for the jobs that draw into the buffer it shows,
+    // and those of the frame after, into the back buffer, go on drawing.
+    let shown: Vec<(Vec<u8>, Vec<u8>)> = [0, 4]
+        .into_iter()
+        .map(|workers| {
+            let mut bus = bus(Board::Max);
+            bus.voodoo = Some(rust_dos::voodoo::Voodoo::with_workers(Board::Max, workers));
+            init(&mut bus);
+            frames(&mut bus, 2);
+            // Half of the next frame, not swapped yet.
+            w(&mut bus, FBZ_MODE, RGB_WRITE | DRAW_BACK);
+            for i in 0..400u32 {
+                flat(&mut bus, 255, i % 256, 0, 255);
+                let (x, y) = ((i * 13 % 500) as f32, (i * 7 % 380) as f32);
+                triangle(&mut bus, [(x, y), (x + 140.0, y + 20.0), (x + 30.0, y + 100.0)]);
+            }
+            let v = bus.voodoo.as_mut().unwrap();
+            v.prepare_display();
+            let mut rgb = vec![0u8; 640 * 480 * 3];
+            v.render(&mut rgb, 640);
+            (rgb, v.frame_buffer().to_bytes())
+        })
+        .collect();
+    assert!(shown[1].0 == shown[0].0, "the picture shown differs with workers");
+    assert!(shown[1].1 == shown[0].1, "the frame buffer differs with workers");
+}
+
+#[test]
+fn texture_writes_wait_for_the_triangles_that_read_the_unit() {
+    let pictures: Vec<Vec<u8>> = [0, 4]
+        .into_iter()
+        .map(|workers| {
+            let mut bus = bus(Board::Max);
+            bus.voodoo = Some(rust_dos::voodoo::Voodoo::with_workers(Board::Max, workers));
+            init(&mut bus);
+            for frame in 0..6u32 {
+                textured_square(&mut bus, 10, false, |x, y| (x * 9 + y * 5 + frame * 3) << 11 | frame);
+                for i in 0..60u32 {
+                    let (x, y) = ((i * 29 % 560) as f32, (i * 17 % 400) as f32);
+                    triangle(&mut bus, [(x, y), (x + 70.0, y + 9.0), (x + 12.0, y + 60.0)]);
+                }
+            }
+            bus.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+        })
+        .collect();
+    assert!(pictures[1] == pictures[0], "frame buffer differs with workers");
+}
+
 /// Rasterizer speed: 2000 textured, bilinear, fogged triangles a frame.
 /// `cargo test --release --test voodoo_tests benchmark -- --ignored
 /// --nocapture`.

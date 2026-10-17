@@ -10,8 +10,11 @@
 //! they land in their turn without waiting. The emulator waits for the
 //! workers (`flush`) before anything that reads what they draw: frame
 //! buffer reads, texture writes the queued triangles may read, the pixel
-//! counters, and a save state. With no workers (the browser, a single
-//! core) jobs run at once.
+//! counters, and a save state. The display and texture writes wait for
+//! less (`mark`, `wait_for`): the jobs up to the last one that drew into
+//! the buffer shown, or read the texture unit written, while the jobs
+//! after it, such as the next frame's, go on drawing. With no workers
+//! (the browser, a single core) jobs run at once.
 
 use super::mem::Vram;
 use super::raster::{self, RasterState, Stats, TriParams};
@@ -33,6 +36,9 @@ pub enum Job {
     /// A job that fails, for the tests.
     #[cfg(test)]
     Panic,
+    /// A job that waits until the gate opens, for the tests.
+    #[cfg(test)]
+    Gate(Arc<(Mutex<bool>, Condvar)>),
 }
 
 /// A word of the frame buffer written: the buffer row it is on (the
@@ -83,6 +89,13 @@ impl Job {
             }
             #[cfg(test)]
             Job::Panic => panic!("a worker failed"),
+            #[cfg(test)]
+            Job::Gate(gate) => {
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            }
         }
     }
 }
@@ -212,10 +225,34 @@ impl Pool {
         if self.workers == 0 {
             return;
         }
-        let batch = std::mem::take(&mut *self.pending.lock().unwrap());
-        self.publish(batch);
+        self.give_out();
+        let last = self.shared.queue.lock().unwrap().last;
+        self.wait_until(last);
+    }
+
+    /// Where the jobs submitted so far end: the number of the batch the
+    /// last of them is in, given out or not, for `wait_for`.
+    pub fn mark(&self) -> u64 {
+        let pending = !self.pending.lock().unwrap().is_empty();
+        self.shared.queue.lock().unwrap().last + pending as u64
+    }
+
+    /// Wait until the jobs up to `mark` are drawn, giving out what is
+    /// pending if they include it. Later batches go on drawing. A
+    /// worker's panic comes back here.
+    pub fn wait_for(&self, mark: u64) {
+        if self.workers == 0 {
+            return;
+        }
+        if mark > self.shared.queue.lock().unwrap().last {
+            self.give_out();
+        }
+        self.wait_until(mark);
+    }
+
+    fn wait_until(&self, mark: u64) {
         let mut queue = self.shared.queue.lock().unwrap();
-        while queue.done.iter().any(|&d| d < queue.last) {
+        while queue.done.iter().any(|&d| d < mark) {
             queue = self.shared.idle.wait(queue).unwrap();
         }
         if let Some(panic) = queue.panic.take() {
@@ -317,6 +354,31 @@ mod tests {
         assert!(result.is_err(), "the panic reaches flush");
         // The workers go on, and the pool shuts down.
         pool.flush();
+        assert!(!pool.busy());
+    }
+
+    #[test]
+    fn waiting_for_a_mark_leaves_later_jobs_drawing() {
+        let pool = Pool::new(2);
+        let fb = Vram::new(64);
+        let word = |at: u32, value: u16| Word { row: at as u16, at, value };
+        pool.submit(Job::Pixels { fb: fb.clone(), words: vec![word(0, 1), word(1, 2)] });
+        let mark = pool.mark();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        pool.submit(Job::Gate(gate.clone()));
+        pool.submit(Job::Pixels { fb: fb.clone(), words: vec![word(2, 3)] });
+        // Returns while the gate holds the workers.
+        pool.wait_for(mark);
+        assert_eq!((fb.get(0), fb.get(1)), (1, 2));
+        assert!(pool.busy(), "the later jobs are still drawing");
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        // A job not yet given out goes out for the mark that covers it.
+        pool.submit(Job::Gate(gate.clone()));
+        let pending = pool.mark();
+        assert_eq!(pending, mark + 2);
+        pool.wait_for(pending);
+        assert_eq!(fb.get(2), 3);
         assert!(!pool.busy());
     }
 }

@@ -547,13 +547,17 @@ pub struct Voodoo {
     palette: Vec<[u8; 3]>,
     palette_dirty: bool,
     /// The workers that draw, and the colour buffers drawn into since
-    /// they last finished.
+    /// they last finished, each with the workers' mark of the last job
+    /// that drew into it (`Pool::mark`): None while that job still waits
+    /// in `words` or `backlog`.
     pool: workers::Pool,
-    drawn_to: Vec<usize>,
-    /// Jobs were given to the workers since they last finished, and the
-    /// texture units queued triangles read.
+    drawn_to: Vec<(usize, Option<u64>)>,
+    /// Jobs were given to the workers since they last finished, the
+    /// texture units queued triangles read, and the mark of the last
+    /// triangle that reads each.
     outstanding: Cell<bool>,
     tmu_in_use: Cell<u8>,
+    tmu_marks: [Cell<Option<u64>>; 2],
     /// Frame buffer writes behind queued jobs, not yet a job themselves.
     words: RefCell<Vec<Word>>,
     /// While the OpenGL renderer draws the picture: the jobs held back
@@ -638,6 +642,7 @@ impl Voodoo {
             drawn_to: Vec::new(),
             outstanding: Cell::new(false),
             tmu_in_use: Cell::new(0),
+            tmu_marks: Default::default(),
             words: RefCell::new(Vec::new()),
             backlog: RefCell::new(Backlog::default()),
             prune: std::env::var("RUST_DOS_VOODOO_PRUNE").map_or(true, |v| v != "0"),
@@ -906,6 +911,24 @@ impl Voodoo {
         self.tmu_in_use.set(0);
     }
 
+    /// Wait until the jobs up to `mark` (`queued_mark`) are drawn, or all
+    /// of them for None. Those after it go on drawing.
+    fn wait_for(&mut self, mark: Option<u64>) {
+        let Some(mark) = mark else {
+            self.flush();
+            return;
+        };
+        self.pool.wait_for(mark);
+        self.drawn_to.retain(|&(_, drawn)| drawn.is_none_or(|drawn| drawn > mark));
+    }
+
+    /// The workers' mark of the jobs queued so far, or None while some of
+    /// them are not with the workers yet.
+    pub(crate) fn queued_mark(&self) -> Option<u64> {
+        let held = !self.words.borrow().is_empty() || !self.backlog.borrow().is_empty();
+        (!held).then(|| self.pool.mark())
+    }
+
     /// Whether the workers are still drawing, with everything queued
     /// given to them first but without waiting for them: a Banshee's busy
     /// bits, which a program polls until they clear.
@@ -940,15 +963,23 @@ impl Voodoo {
     /// with its `access`, or given to the workers.
     pub(crate) fn submit(&self, job: Job, access: Option<Access>) {
         self.submit_words();
-        if let Job::Triangle { texcount, .. } = &job {
-            self.tmu_in_use.set(self.tmu_in_use.get() | ((1u8 << texcount) - 1));
-        }
+        let texcount = match &job {
+            Job::Triangle { texcount, .. } => *texcount,
+            _ => 0,
+        };
+        self.tmu_in_use.set(self.tmu_in_use.get() | ((1u8 << texcount) - 1));
         match access {
             Some(access) if self.deferring() => {
                 let out = self.backlog.borrow_mut().push(job, access);
                 self.hand_over(out);
             }
             _ => self.hand_over([job]),
+        }
+        if texcount > 0 {
+            let mark = self.queued_mark();
+            for unit in self.tmu_marks.iter().take(texcount) {
+                unit.set(mark);
+            }
         }
     }
 
@@ -1034,9 +1065,11 @@ impl Voodoo {
         if self.chipmask & (2 << unit) == 0 || unit >= self.tmu.len() {
             return;
         }
-        // Queued triangles read the texture memory as they draw.
+        // Queued triangles read the texture memory as they draw: wait for
+        // those that read this unit's.
         if self.tmu_in_use.get() & (1 << unit) != 0 {
-            self.flush();
+            self.wait_for(self.tmu_marks[unit].get());
+            self.tmu_in_use.set(self.tmu_in_use.get() & !(1 << unit));
         }
         if self.reg[self.tmu[unit].base + T_LOD] & (1 << 27) != 0 {
             self.log_once(LOG_DIRECT, "[3DFX] Direct texture writes are ignored");
@@ -1216,10 +1249,14 @@ impl Voodoo {
             self.display_dirty |= changed;
             return switched;
         }
-        // Jobs may still be drawing into the buffer shown.
+        // Jobs may still be drawing into the buffer shown. Those after
+        // them, into the next frame, go on beside the program.
         let front = self.fbi.rgboffs[self.fbi.frontbuf as usize];
-        if front != NONE && self.drawn_to.contains(&(front as usize / 2)) {
-            self.flush();
+        let drawn = self.drawn_to.iter().find(|&&(dest, _)| dest == front as usize / 2);
+        if front != NONE
+            && let Some(&(_, mark)) = drawn
+        {
+            self.wait_for(mark);
         }
         if self.palette_dirty {
             self.build_palette();

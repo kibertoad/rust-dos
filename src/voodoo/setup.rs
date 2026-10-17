@@ -209,8 +209,10 @@ impl Voodoo {
         if shown {
             self.display_dirty = true;
         }
-        if !self.drawn_to.contains(&dest) {
-            self.drawn_to.push(dest);
+        let mark = self.queued_mark();
+        match self.drawn_to.iter_mut().find(|(drawn, _)| *drawn == dest) {
+            Some(entry) => entry.1 = mark,
+            None => self.drawn_to.push((dest, mark)),
         }
     }
 
