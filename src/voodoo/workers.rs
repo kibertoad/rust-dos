@@ -20,6 +20,7 @@ use super::mem::Vram;
 use super::raster::{self, RasterState, Stats, TriParams};
 use super::setup::render_triangle;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Something drawn. Not boxed: a job is made for every triangle.
@@ -125,8 +126,11 @@ struct Shared {
 /// The workers, or none.
 pub struct Pool {
     shared: Arc<Shared>,
-    /// Jobs not yet given out.
+    /// Jobs not yet given out, and the number of the last batch given
+    /// out (`Queue::last`, which only the emulator changes), read without
+    /// the queue's lock.
     pending: Mutex<Vec<Job>>,
+    published: AtomicU64,
     workers: usize,
     #[cfg(not(target_arch = "wasm32"))]
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -168,6 +172,7 @@ impl Pool {
         Self {
             shared,
             pending: Mutex::new(Vec::new()),
+            published: AtomicU64::new(0),
             workers,
             #[cfg(not(target_arch = "wasm32"))]
             threads,
@@ -215,6 +220,7 @@ impl Pool {
         let mut queue = self.shared.queue.lock().unwrap();
         queue.last += 1;
         let number = queue.last;
+        self.published.store(number, Relaxed);
         queue.batches.push_back((number, Arc::new(batch)));
         self.shared.work.notify_all();
     }
@@ -226,15 +232,14 @@ impl Pool {
             return;
         }
         self.give_out();
-        let last = self.shared.queue.lock().unwrap().last;
-        self.wait_until(last);
+        self.wait_until(self.published.load(Relaxed));
     }
 
     /// Where the jobs submitted so far end: the number of the batch the
     /// last of them is in, given out or not, for `wait_for`.
     pub fn mark(&self) -> u64 {
         let pending = !self.pending.lock().unwrap().is_empty();
-        self.shared.queue.lock().unwrap().last + pending as u64
+        self.published.load(Relaxed) + pending as u64
     }
 
     /// Wait until the jobs up to `mark` are drawn, giving out what is
@@ -244,7 +249,7 @@ impl Pool {
         if self.workers == 0 {
             return;
         }
-        if mark > self.shared.queue.lock().unwrap().last {
+        if mark > self.published.load(Relaxed) {
             self.give_out();
         }
         self.wait_until(mark);
