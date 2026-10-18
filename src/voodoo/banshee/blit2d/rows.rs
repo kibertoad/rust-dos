@@ -22,7 +22,7 @@ fn bytes(e: &Engine) -> Option<usize> {
 }
 
 fn destination(e: &Engine, mask: u32, bytes: usize, y: i32, dx: i32) -> Option<Range<usize>> {
-    if e.dst_size_x <= 0 || y < 0 {
+    if e.dst_size_x <= 0 || y < 0 || !mask.checked_add(1)?.is_power_of_two() {
         return None;
     }
     let last = e.dst_x.checked_add((e.dst_size_x - 1).checked_mul(dx)?)?;
@@ -281,6 +281,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn noncontiguous_address_masks_keep_pixel_masking() {
+        let mut e = engine(COL_16BPP);
+        e.dst_x = 8;
+        let actual = memory();
+        let expected = memory();
+        let before = actual.to_bytes();
+        assert!(!copy(&mut e, &actual, 499, Source::Vram(128), 8, 1, false));
+        assert_eq!(actual.to_bytes(), before);
+        let mut reference = scalar(&e);
+        e.copy_line(&actual, 499, Source::Vram(128), true, 8, false);
+        reference.copy_line(&expected, 499, Source::Vram(128), true, 8, false);
+        assert_eq!(actual.to_bytes(), expected.to_bytes());
+        e.rectfill(&actual, 499);
+        reference.rectfill(&expected, 499);
+        assert_eq!(actual.to_bytes(), expected.to_bytes());
     }
 
     #[test]
