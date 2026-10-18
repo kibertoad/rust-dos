@@ -8,6 +8,13 @@ use rust_dos::voodoo::{Board, Now, Voodoo};
 use std::hint::black_box;
 use std::sync::Arc;
 
+/// The colour and depth buffers' starting pattern.
+fn fill(fb: &Vram) {
+    for i in 0..fb.len() {
+        fb.set(i, (i as u16).wrapping_mul(25173));
+    }
+}
+
 fn two_unit_state(regs: [u32; 6]) -> RasterState {
     let lookup: Arc<[u32]> = (0..0x10000u32)
         .map(|i| i.wrapping_mul(0x9E37_79B9))
@@ -39,9 +46,7 @@ fn two_unit_state(regs: [u32; 6]) -> RasterState {
         }
     };
     let fb = Vram::new(4 << 20);
-    for i in 0..fb.len() {
-        fb.set(i, (i as u16).wrapping_mul(25173));
-    }
+    fill(&fb);
     RasterState {
         fb,
         fbz_mode: regs[0],
@@ -127,9 +132,7 @@ pub fn pipelines(c: &mut Criterion) {
     let mut generic = Stats::default();
     draw(None, &mut generic);
     let expected: Vec<_> = (0..st.fb.len()).map(|i| st.fb.get(i)).collect();
-    for i in 0..st.fb.len() {
-        st.fb.set(i, (i as u16).wrapping_mul(25173));
-    }
+    fill(&st.fb);
     let mut specialised = Stats::default();
     draw(Some(variant), &mut specialised);
     assert!(generic.pixels_out > 0);
@@ -160,6 +163,10 @@ fn card(workers: usize, mirror: bool) -> Voodoo {
     write(&mut v, FBI_INIT1, 10 << 4);
     write(&mut v, FBI_INIT2, 150 << 11);
     write(&mut v, FBI_INIT3, 0);
+    // The size only takes with the sync registers set.
+    write(&mut v, BACK_PORCH, 2 << 16 | 40);
+    write(&mut v, H_SYNC, ((800 - 96 - 2) << 16) | (96 - 1));
+    write(&mut v, V_SYNC, (525 - 2) << 16 | 2);
     write(&mut v, VIDEO_DIMENSIONS, 479 << 16 | 639);
     v.config_write(0xC0, 0);
     write(&mut v, FBI_INIT0, 1);
@@ -178,7 +185,7 @@ fn card(workers: usize, mirror: bool) -> Voodoo {
     v
 }
 
-fn frame(v: &mut Voodoo, mirror: bool) {
+fn frame(v: &mut Voodoo) {
     // Full-screen opaque clears let the backlog discard older frames.
     write(v, COLOR1, 0);
     write(v, FASTFILL_CMD, 0);
@@ -198,7 +205,7 @@ fn frame(v: &mut Voodoo, mirror: bool) {
         write(v, TRIANGLE_CMD, 0);
     }
     v.prepare_display();
-    if mirror {
+    if v.mirror_attached() {
         black_box(v.take_mirror().expect("mirror attached"));
     } else {
         v.flush();
@@ -215,14 +222,18 @@ pub fn frames(c: &mut Criterion) {
     for workers in [0, 4] {
         for (name, mirror) in [("software", false), ("gl_backlog", true)] {
             let mut v = card(workers, mirror);
-            frame(&mut v, mirror);
+            // Two frames, so the second's clear prunes the first.
+            frame(&mut v);
+            frame(&mut v);
             if mirror {
-                assert!(v.describe(Now::default())["held_jobs"].as_u64().unwrap() > 0);
+                let state = v.describe(Now::default());
+                assert!(state["held_jobs"].as_u64().unwrap() > 0);
+                assert!(state["pruned_jobs"].as_u64().unwrap() > 0);
             } else {
                 assert_ne!(v.frame_buffer().get(0), 0);
             }
-            group.bench_with_input(BenchmarkId::new(name, workers), &workers, |b, _| {
-                b.iter(|| frame(&mut v, mirror));
+            group.bench_function(BenchmarkId::new(name, workers), |b| {
+                b.iter(|| frame(&mut v));
             });
             v.flush();
         }
