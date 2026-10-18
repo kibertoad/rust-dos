@@ -8,7 +8,10 @@
 //! Ported from DOSBox-X's XGA emulation (vga_xga.cpp), which Windows 95's
 //! S3 driver was installed and run against.
 
+#[path = "engine/mix.rs"]
+mod mix;
 mod rows;
+use mix::Mix;
 
 /// Video memory as the engine draws in it: the screen's width in pixels
 /// and the bytes each takes.
@@ -108,29 +111,6 @@ pub struct Engine {
     transfer: Transfer,
 }
 
-/// The result of a mix (a raster operation) of source `src` and
-/// destination `dst`.
-fn mix(mode: u16, src: u32, dst: u32) -> u32 {
-    match mode & 0x0F {
-        0x00 => !dst,
-        0x01 => 0,
-        0x02 => 0xFFFF_FFFF,
-        0x03 => dst,
-        0x04 => !src,
-        0x05 => src ^ dst,
-        0x06 => !(src ^ dst),
-        0x07 => src,
-        0x08 => !(src & dst),
-        0x09 => !src | dst,
-        0x0A => src | !dst,
-        0x0B => src | dst,
-        0x0C => src & dst,
-        0x0D => src & !dst,
-        0x0E => !src & dst,
-        _ => !(src | dst),
-    }
-}
-
 impl Engine {
     pub fn new() -> Self {
         Self { clip: [0, 0, 0xFFF, 0xFFF], ..Default::default() }
@@ -168,9 +148,9 @@ impl Engine {
     }
 
     /// Mix `src` into the pixel at (x, y) with mode `mode`.
-    fn mix_point(&self, s: &mut Surface, x: u32, y: u32, mode: u16, src: u32) {
+    fn mix_point(&self, s: &mut Surface, x: u32, y: u32, mode: Mix, src: u32) {
         let dst = s.get(x, y);
-        self.draw(s, x, y, mix(mode, src, dst));
+        self.draw(s, x, y, mode.apply(src, dst));
     }
 
     /// A port or memory-mapped register written, `len` bytes of `value`.
@@ -476,9 +456,9 @@ impl Engine {
     }
 
     /// The source of a line's or rectangle's pixels: the foreground mix's.
-    fn solid_source(&self) -> (u16, u32) {
+    fn solid_source(&self) -> (Mix, u32) {
         let mode = self.fore_mix;
-        (mode, self.source(mode, 0))
+        (Mix::new(mode), self.source(mode, 0))
     }
 
     /// Short-stroke style lines in one of eight directions (bits 5-7), the
@@ -563,7 +543,7 @@ impl Engine {
         }
         let solid = (self.pix_cntl >> 6) & 3 == 0;
         let (mode, src) = self.solid_source();
-        let row_fill = solid && mode & 0x0F == 7 && self.can_write_rows(s);
+        let row_fill = solid && mode.mode & 0x0F == 7 && self.can_write_rows(s);
         let count = run as u32 + 1;
         let mut y = self.cur_y as i32;
         let mut x = self.cur_x as i32;
@@ -589,8 +569,12 @@ impl Engine {
     /// The mix for a pixel whose mask bit comes from the screen (PIX_CNTL
     /// bits 6-7 = 11b): the foreground mix where all the read-enabled bits
     /// of `pixel` are set.
-    fn screen_mix(&self, pixel: u32) -> u16 {
-        if pixel & self.read_mask == self.read_mask { self.fore_mix } else { self.back_mix }
+    fn screen_mix(&self, pixel: u32, fore: Mix, back: Mix) -> Mix {
+        if pixel & self.read_mask == self.read_mask {
+            fore
+        } else {
+            back
+        }
     }
 
     /// Copy a rectangle from the current position to the destination, in
@@ -600,6 +584,9 @@ impl Engine {
         let dy: i32 = if value & 0x80 != 0 { 1 } else { -1 };
         let compare = self.color_compare & s.mask();
         let select = (self.pix_cntl >> 6) & 3;
+        let fore = Mix::new(self.fore_mix);
+        let back = Mix::new(self.back_mix);
+        let copy = Mix::new(0x67);
         let row_copy = select == 0
             && self.fore_mix & 0x0F == 7
             && self.fore_mix & 0x60 >= 0x40
@@ -616,11 +603,11 @@ impl Engine {
             for _ in 0..=self.major {
                 let pixel = s.get(sx as u32, sy as u32);
                 let mode = match select {
-                    0 => self.fore_mix,
-                    3 => self.screen_mix(pixel),
-                    _ => 0x67,
+                    0 => fore,
+                    3 => self.screen_mix(pixel, fore, back),
+                    _ => copy,
                 };
-                let src = self.source(mode, pixel);
+                let src = self.source(mode.mode, pixel);
                 // MULT_MISC bit 8: compare colours, leaving pixels equal
                 // to it (or with bit 7, unequal) alone.
                 let write = self.misc & 0x100 == 0 || ((src != compare) as u16 ^ (self.misc >> 7 & 1)) != 0;
@@ -641,6 +628,9 @@ impl Engine {
         let dx: i32 = if value & 0x20 != 0 { 1 } else { -1 };
         let dy: i32 = if value & 0x80 != 0 { 1 } else { -1 };
         let select = (self.pix_cntl >> 6) & 3;
+        let fore = Mix::new(self.fore_mix);
+        let back = Mix::new(self.back_mix);
+        let copy = Mix::new(0x67);
         let (px, py) = (self.cur_x as i32, self.cur_y as i32);
         let mut ty = self.dest_y as i32;
         for _ in 0..=self.minor {
@@ -648,11 +638,11 @@ impl Engine {
             for _ in 0..=self.major {
                 let pixel = s.get((px + (tx & 7)) as u32, (py + (ty & 7)) as u32);
                 let mode = match select {
-                    0 => self.fore_mix,
-                    3 => self.screen_mix(pixel),
-                    _ => 0x67,
+                    0 => fore,
+                    3 => self.screen_mix(pixel, fore, back),
+                    _ => copy,
                 };
-                let src = self.source(mode, pixel);
+                let src = self.source(mode.mode, pixel);
                 self.mix_point(s, tx as u32, ty as u32, mode, src);
                 tx += dx;
             }
@@ -686,7 +676,7 @@ impl Engine {
     }
 
     /// Mix one pixel of an image transfer at its position and move on.
-    fn transfer_pixel(&mut self, s: &mut Surface, mode: u16, src: u32) {
+    fn transfer_pixel(&mut self, s: &mut Surface, mode: Mix, src: u32) {
         let (x, y) = (self.transfer.x as u32, self.transfer.y as u32);
         self.mix_point(s, x, y, mode, src);
         self.transfer.x = self.transfer.x.wrapping_add(self.transfer.dx) & 0x0FFF;
@@ -700,14 +690,16 @@ impl Engine {
         if !self.transfer.active {
             return false;
         }
+        let fore = Mix::new(self.fore_mix);
+        let back = Mix::new(self.back_mix);
         let mut value = value;
         if self.transfer.swap && len >= 2 {
             value = ((value & 0xFF00_FF00) >> 8) | ((value & 0x00FF_00FF) << 8);
         }
         match (self.pix_cntl >> 6) & 3 {
             0 => {
-                let mode = self.fore_mix;
-                if mode >> 5 & 3 != 2 {
+                let mode = fore;
+                if mode.mode >> 5 & 3 != 2 {
                     return false;
                 }
                 match (s.bytes, self.transfer.bus) {
@@ -759,8 +751,8 @@ impl Engine {
                     for n in 0..chunk {
                         // Each byte's pixels from its top bit down.
                         let bit = (n & 0xF8) + (7 - (n & 7)) + chunk * k;
-                        let mode = if value >> bit & 1 != 0 { self.fore_mix } else { self.back_mix };
-                        let src = match mode >> 5 & 3 {
+                        let mode = if value >> bit & 1 != 0 { fore } else { back };
+                        let src = match mode.mode >> 5 & 3 {
                             0 => self.back,
                             1 => self.fore,
                             _ => 0,
@@ -857,6 +849,54 @@ mod tests {
         e.minor = 0;
         e.write(0x9AE8, 0xC093, 2, &mut s); // blit, -X +Y
         assert_eq!(&vram[0..6], &[0, 0, 1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn host_data_chunks_use_the_current_mix_register() {
+        let mut vram = vec![0; 256];
+        let mut s = surface(&mut vram);
+        let mut e = engine();
+        e.fore_mix = 0x47;
+        e.major = 1;
+        e.write(0x9AE8, 0x41B3, 2, &mut s);
+        e.write(0xE2E8, 0x12, 1, &mut s);
+        assert!(e.busy());
+        e.write(0xBAE8, 0x44, 2, &mut s);
+        e.write(0xE2E8, 0x12, 1, &mut s);
+        assert_eq!((e.transfer.x, e.transfer.y), (0, 1));
+        assert_eq!(&vram[..2], &[0x12, 0xED]);
+    }
+
+    #[test]
+    fn split_host_pixel_and_loaded_registers_use_current_mix() {
+        use crate::savestate::{Reader, State, Writer};
+        let mut vram = vec![0; 8];
+        let mut s = Surface {
+            vram: &mut vram,
+            width: 2,
+            bytes: 4,
+        };
+        let mut e = engine();
+        e.write_mask = u32::MAX;
+        e.fore_mix = 0x47;
+        e.write(0x9AE8, 0x53B3, 2, &mut s);
+        e.write(0xE2E8, 0x1234, 2, &mut s);
+        assert!(e.transfer.half);
+        e.write(0xBAE8, 0x44, 2, &mut s);
+        let mut writer = Writer::new();
+        e.save(&mut writer);
+        e.write(0xE2E8, 0xABCD, 2, &mut s);
+        assert_eq!(&s.vram[..4], &(!0xABCD_1234u32).to_le_bytes());
+        let mut loaded = Engine::new();
+        let mut reader = Reader::new(&writer.buf);
+        loaded.load(&mut reader).unwrap();
+        assert!(reader.is_empty());
+        // The existing state format discards the active host transfer.
+        assert!(!loaded.busy());
+        loaded.write(0x9AE8, 0x53B3, 2, &mut s);
+        loaded.write(0xE2E8, 0x5678, 2, &mut s);
+        loaded.write(0xE2E8, 0x90AB, 2, &mut s);
+        assert_eq!(&vram[..4], &(!0x90AB_5678u32).to_le_bytes());
     }
 
     #[test]

@@ -104,6 +104,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Mix;
     use super::*;
 
     fn memory(bytes: u32) -> Vec<u8> {
@@ -234,11 +235,15 @@ mod tests {
                                                         (sy as i32 + dy * row) as u32,
                                                     );
                                                     let mode = if select == 3 {
-                                                        engine.screen_mix(pixel)
+                                                        engine.screen_mix(
+                                                            pixel,
+                                                            Mix::new(engine.fore_mix),
+                                                            Mix::new(engine.back_mix),
+                                                        )
                                                     } else {
-                                                        engine.fore_mix
+                                                        Mix::new(engine.fore_mix)
                                                     };
-                                                    let src = engine.source(mode, pixel);
+                                                    let src = engine.source(mode.mode, pixel);
                                                     let write = misc & 0x100 == 0
                                                         || ((src != compare) as u16
                                                             ^ (misc >> 7 & 1))
