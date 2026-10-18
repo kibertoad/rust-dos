@@ -15,10 +15,16 @@ pub(super) struct Uniform<T: Copy> {
 }
 
 impl<T: Value> Uniform<T> {
-    pub fn set(&self, gl: &glow::Context, value: T) {
+    /// Send `value` unless it is the one last sent.
+    ///
+    /// # Safety
+    ///
+    /// This uniform's program must be current on the renderer's context.
+    /// Sent to another program, the value would also be taken as sent to
+    /// this one, which would then never get it.
+    pub unsafe fn set(&self, gl: &glow::Context, value: T) {
         if self.sent.get() != Some(value) {
-            // SAFETY: the caller has made this uniform's program current
-            // on the renderer's context, as for every VoodooGl call.
+            // SAFETY: the caller has made this uniform's program current.
             unsafe { value.upload(gl, self.location.as_ref()) };
             self.sent.set(Some(value));
         }
@@ -55,11 +61,19 @@ vector!([f32; 3], uniform_3_f32, [0, 1, 2]);
 vector!([f32; 4], uniform_4_f32, [0, 1, 2, 3]);
 vector!([i32; 3], uniform_3_i32, [0, 1, 2]);
 
-impl Value for [i32; 64] {
-    unsafe fn upload(self, gl: &glow::Context, location: Option<&glow::UniformLocation>) {
-        unsafe { gl.uniform_1_i32_slice(location, &self) };
-    }
+// The fog tables are kept as the draw state has them, so a draw compares
+// them without converting; they become ints only when they are sent.
+macro_rules! table {
+    ($ty:ty) => {
+        impl Value for [$ty; 64] {
+            unsafe fn upload(self, gl: &glow::Context, location: Option<&glow::UniformLocation>) {
+                unsafe { gl.uniform_1_i32_slice(location, &self.map(i32::from)) };
+            }
+        }
+    };
 }
+table!(u8);
+table!(i16);
 
 macro_rules! locations {
     ($name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
@@ -99,8 +113,8 @@ locations!(Triangle {
     u_fogcolor: i32,
     u_stipple: i32,
     u_yorigin: i32,
-    u_fogblend: [i32; 64],
-    u_fogdelta: [i32; 64],
+    u_fogblend: [u8; 64],
+    u_fogdelta: [i16; 64],
     u_scale: f32,
     u_units: i32,
     u_config: i32,

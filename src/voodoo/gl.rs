@@ -492,9 +492,7 @@ impl VoodooGl {
 
     fn upload(&mut self, gl: &glow::Context, texture: &Texture) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.textures.entry(texture.id) {
-            let Ok(t) = self::texture(gl, glow::NEAREST) else {
-                return;
-            };
+            let Ok(t) = self::texture(gl, glow::NEAREST) else { return };
             e.insert(GlTexture {
                 texture: t,
                 levels: Vec::new(),
@@ -504,9 +502,7 @@ impl VoodooGl {
                 anisotropy: None,
             });
         }
-        let Some(entry) = self.textures.get_mut(&texture.id) else {
-            return;
-        };
+        let Some(entry) = self.textures.get_mut(&texture.id) else { return };
         // SAFETY: see `VoodooGl`.
         unsafe {
             gl.active_texture(glow::TEXTURE0);
@@ -625,8 +621,8 @@ impl VoodooGl {
             ] {
                 uniform.set(gl, value as i32);
             }
-            p.uniforms.u_fogblend.set(gl, s.fogblend.map(|v| v as i32));
-            p.uniforms.u_fogdelta.set(gl, s.fogdelta.map(|v| v as i32));
+            p.uniforms.u_fogblend.set(gl, s.fogblend);
+            p.uniforms.u_fogdelta.set(gl, s.fogdelta);
             p.uniforms.u_scale.set(gl, scale);
             let mut units = 0;
             for (unit, t) in s.tmu.iter().enumerate() {
@@ -658,21 +654,11 @@ impl VoodooGl {
                     gl.tex_parameter_f32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LOD, lod[1]);
                     texture.lod = Some(lod);
                 }
-                let (mode, size, lods, detail) = if unit == 0 {
-                    (
-                        &p.uniforms.u_tmode0,
-                        &p.uniforms.u_tsize0,
-                        &p.uniforms.u_tlod0,
-                        &p.uniforms.u_tdetail0,
-                    )
-                } else {
-                    (
-                        &p.uniforms.u_tmode1,
-                        &p.uniforms.u_tsize1,
-                        &p.uniforms.u_tlod1,
-                        &p.uniforms.u_tdetail1,
-                    )
-                };
+                let u = &p.uniforms;
+                let (mode, size, lods, detail) = [
+                    (&u.u_tmode0, &u.u_tsize0, &u.u_tlod0, &u.u_tdetail0),
+                    (&u.u_tmode1, &u.u_tsize1, &u.u_tlod1, &u.u_tdetail1),
+                ][unit];
                 mode.set(gl, t.mode as i32);
                 size.set(gl, [t.width as f32, t.height as f32, t.lodbias as f32 / 256.0]);
                 lods.set(gl, [t.lodmin, t.lodmax, t.lodbias]);
@@ -1181,10 +1167,10 @@ mod tests {
         let settings = slots::machine_settings(&header.machine, &Default::default());
         let mut cpu = Cpu::with_memory(PathBuf::from("."), header.memsize);
         crate::hardware::configure(&mut cpu, &settings, crate::keylayout::Layout::us());
-        // A booted system's state wants its disk as it was: a copy beside it.
         if let Some(image) = std::env::var_os("RUST_DOS_VOODOO_DRIVE_C") {
             cpu.bus.disk.folders_from_state.push((crate::disk::DRIVE_C, image.into()));
         }
+        // A booted system's state wants its disk as it was: a copy beside it.
         crate::savestate::disks::offer_copies(&mut cpu, std::path::Path::new(&path));
         machine::load(&mut cpu, &state).unwrap();
         cpu.bus.voodoo.as_mut().unwrap().set_mirror(true);
