@@ -168,7 +168,12 @@ impl Screen {
             self.drop_voodoo();
             return false;
         };
-        if settings.renderer != Renderer::OpenGl || self.voodoo_failed.is_some() {
+        // As in the desktop frontend, the Banshee's desktop, video
+        // overlay and hardware cursor need software scanout.
+        if settings.renderer != Renderer::OpenGl
+            || card.banshee.is_some()
+            || self.voodoo_failed.is_some()
+        {
             card.set_mirror(false);
             self.drop_voodoo();
             return false;
