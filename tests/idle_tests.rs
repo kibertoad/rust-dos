@@ -368,10 +368,17 @@ fn limiter(a: &mut CodeAssembler, count: u16, ticks: u32) -> Result<(), IcedErro
     a.ret()
 }
 
+/// Instructions a frame limiter's tests skip at the least. A detector
+/// that only arms where two events in a row find the same registers, with
+/// one backoff for all loops (as before #160), skips under 150,000 in each
+/// of them, as it arms the loop only where an event lands between two
+/// ticks; it now skips millions.
+const LIMITER_SKIPS: u64 = 1_000_000;
+
 #[test]
 fn a_frame_limiter_that_calls_for_the_time_is_skipped() {
     let stats = compare("tick_call", frame_limiter);
-    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+    assert!(stats.skipped > LIMITER_SKIPS, "{:?}", stats);
 }
 
 #[test]
@@ -380,8 +387,7 @@ fn a_frame_limiter_on_a_fast_timer_is_skipped() {
     // loop is seldom at an instruction with the registers it had at the
     // event before.
     let stats = compare("tick_call_fast", |a| limiter(a, 239, 2000));
-    println!("tick_call_fast: proofs {} skipped {}", stats.proofs, stats.skipped);
-    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+    assert!(stats.skipped > LIMITER_SKIPS, "{:?}", stats);
 }
 
 #[test]
@@ -406,7 +412,34 @@ fn a_loop_that_failed_before_does_not_keep_another_from_being_skipped() {
         frame_limiter(a)
     });
     assert!(stats.failures > 4, "{:?}", stats);
-    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+    assert!(stats.skipped > LIMITER_SKIPS, "{:?}", stats);
+}
+
+#[test]
+fn a_loop_whose_proofs_fail_does_not_keep_another_from_being_skipped() {
+    // A keyboard poll that writes a port every pass, for 20 ticks of the
+    // timer at 1 kHz, then the frame limiter. The poll is armed every few
+    // calls and each proof of it fails, so a backoff shared by all loops
+    // would grow to let the limiter's chances pass.
+    let stats = compare("port_poll_then_tick_call", |a| {
+        let mut busy = a.create_label();
+        pit(a, 1193)?;
+        a.xor(ax, ax)?;
+        a.mov(es, ax)?;
+        a.mov(ax, word_ptr(0x46C).es())?;
+        a.mov(word_ptr(DATA + 4), ax)?;
+        a.set_label(&mut busy)?;
+        a.out(0x80, al)?;
+        a.mov(ah, 1)?;
+        a.int(0x16)?;
+        a.mov(ax, word_ptr(0x46C).es())?;
+        a.sub(ax, word_ptr(DATA + 4))?;
+        a.cmp(ax, 20)?;
+        a.jb(busy)?;
+        frame_limiter(a)
+    });
+    assert!(stats.failures >= 8, "{:?}", stats);
+    assert!(stats.skipped > LIMITER_SKIPS, "{:?}", stats);
 }
 
 /// Program the PIT's channel 0 to count `count` (0: 65536).
