@@ -8,6 +8,8 @@
 //! Ported from DOSBox-X's XGA emulation (vga_xga.cpp), which Windows 95's
 //! S3 driver was installed and run against.
 
+mod rows;
+
 /// Video memory as the engine draws in it: the screen's width in pixels
 /// and the bytes each takes.
 pub struct Surface<'a> {
@@ -561,10 +563,17 @@ impl Engine {
         }
         let solid = (self.pix_cntl >> 6) & 3 == 0;
         let (mode, src) = self.solid_source();
+        let row_fill = solid && mode & 0x0F == 7 && self.can_write_rows(s);
+        let count = run as u32 + 1;
         let mut y = self.cur_y as i32;
         let mut x = self.cur_x as i32;
         for _ in 0..=self.minor {
             x = self.cur_x as i32;
+            if row_fill && self.fill_row(s, x, y, count, dx, src) {
+                x += dx * count as i32;
+                y += dy;
+                continue;
+            }
             for _ in 0..=run {
                 if solid {
                     self.mix_point(s, x as u32, y as u32, mode, src);
@@ -591,9 +600,19 @@ impl Engine {
         let dy: i32 = if value & 0x80 != 0 { 1 } else { -1 };
         let compare = self.color_compare & s.mask();
         let select = (self.pix_cntl >> 6) & 3;
+        let row_copy = select == 0
+            && self.fore_mix & 0x0F == 7
+            && self.fore_mix & 0x60 >= 0x40
+            && self.misc & 0x100 == 0
+            && self.can_write_rows(s);
         let (mut sy, mut ty) = (self.cur_y as i32, self.dest_y as i32);
         for _ in 0..=self.minor {
             let (mut sx, mut tx) = (self.cur_x as i32, self.dest_x as i32);
+            if row_copy && self.copy_row(s, (sx, sy), (tx, ty), self.major as u32 + 1, dx) {
+                sy += dy;
+                ty += dy;
+                continue;
+            }
             for _ in 0..=self.major {
                 let pixel = s.get(sx as u32, sy as u32);
                 let mode = match select {
