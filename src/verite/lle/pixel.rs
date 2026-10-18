@@ -903,10 +903,13 @@ impl Core {
         let params = &params[..count as usize];
         let align = count.next_power_of_two().max(2);
         let (d, s2, s1) = (d & !(align - 1), s2 & !(align - 1), s1 & !(align - 1));
+        // All the values before the deltas: a group at the FIFO pops it.
         let mut values = [0u32; 10];
         let mut deltas = [0u32; 10];
         for k in 0..count {
             values[k as usize] = self.draw_reg(s2, k);
+        }
+        for k in 0..count {
             deltas[k as usize] = self.draw_reg(s1, k);
         }
         let values = &mut values[..count as usize];

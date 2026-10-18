@@ -295,6 +295,7 @@ pub struct Backlog {
     pub layout: TileLayout,
     jobs: Vec<(Job, Access)>,
     words: usize,
+    /// Which jobs pruning keeps, held on to between prunings.
     keep: Vec<bool>,
     /// Jobs pushed since the last pruning.
     since_prune: usize,
