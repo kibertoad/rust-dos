@@ -28,6 +28,8 @@ use crate::host::{self, Machine};
 use crate::keys;
 use crate::memmap::Published;
 use crate::options::{self, Values};
+use crate::present::{self, Pixels};
+use rust_dos::video::mono::Monochrome;
 use crate::{Callbacks, KeyEvent};
 
 /// The frames the core hands over a second.
@@ -96,7 +98,10 @@ pub struct Core {
     /// cursors and the settings window on top, as handed over.
     picture: Frame,
     screen: Frame,
-    xrgb: Vec<u32>,
+    filtered: Frame,
+    composition: Option<(u64, Monochrome)>,
+    xrgb: Pixels<u32>,
+    can_dupe: bool,
     /// The size of the picture handed over: the 3dfx card's OpenGL
     /// picture's while it is shown, else `screen`'s.
     shown: Option<(u32, u32)>,
@@ -219,6 +224,14 @@ impl Core {
 
         let saved_drives = host::mounted_drives(&cpu);
         let blank = Frame::new(video::SCREEN_WIDTH, video::SCREEN_HEIGHT);
+        let mut can_dupe = false;
+        // SAFETY: GET_CAN_DUPE takes a writable bool.
+        can_dupe = unsafe {
+            cb.env(
+                RETRO_ENVIRONMENT_GET_CAN_DUPE,
+                &mut can_dupe as *mut _ as *mut _,
+            )
+        } && can_dupe;
         let mut core = Box::new(Core {
             ui: ConfigUi::for_frontend(LIBRETRO),
             m: Machine {
@@ -247,8 +260,11 @@ impl Core {
             last_frame: None,
             frontend: std::time::Duration::ZERO,
             picture: blank.clone(),
+            filtered: blank.clone(),
             screen: blank,
-            xrgb: Vec::new(),
+            composition: None,
+            xrgb: Pixels::default(),
+            can_dupe,
             shown: None,
             voodoo_gl_shown: false,
             geometry: None,
@@ -523,13 +539,22 @@ impl Core {
         if self.picture.resize(width, height) {
             bus.vga.mark_dirty_full();
         }
-        if bus.vga.dirty {
+        let rendered = bus.vga.dirty;
+        if rendered {
             video::render_screen(&mut self.picture, bus);
             bus.vga.clear_dirty();
         }
-        self.screen.clone_from(&self.picture);
-        video::overlay::draw_cursors(&mut self.screen, bus, self.cursor_visible);
-        video::mono::apply(&mut self.screen, self.m.settings.monochrome);
+        let composition = (
+            video::overlay::cursors_key(bus, self.cursor_visible),
+            self.m.settings.monochrome,
+        );
+        if rendered || self.composition != Some(composition) {
+            self.filtered.clone_from(&self.picture);
+            video::overlay::draw_cursors(&mut self.filtered, bus, self.cursor_visible);
+            video::mono::apply(&mut self.filtered, composition.1);
+            self.composition = Some(composition);
+        }
+        present::restore(&mut self.screen, &self.filtered);
         if self.ui.is_open() {
             self.ui.set_mixer_status(bus.mixer.muted, bus.mixer.take_peaks());
         }
@@ -550,26 +575,37 @@ impl Core {
         // framebuffer; before it made a context, the last one stays.
         if crate::gl::granted() {
             let voodoo = voodoo_gl.then_some(&self.picture);
-            let Some((w, h)) = crate::gl::with_screen(|s| s.present(&self.screen, voodoo)) else {
-                cb.video_dupe();
+            let Some((w, h, refresh)) =
+                crate::gl::with_screen(|s| s.present(&self.screen, voodoo, self.can_dupe))
+            else {
+                let (w, h) = self.shown.unwrap_or((self.screen.width, self.screen.height));
+                cb.video_dupe(w, h);
                 return;
             };
             self.shown = Some((w, h));
             self.set_geometry(cb);
             let video_start = Instant::now();
-            cb.video_hw(w, h);
+            if refresh {
+                cb.video_hw(w, h);
+            } else {
+                cb.video_dupe(w, h);
+            }
             self.frontend += video_start.elapsed();
             return;
         }
-        self.xrgb.clear();
-        self.xrgb.extend(
-            self.screen.rgb.as_chunks::<3>().0.iter().map(|&[r, g, b]| u32::from_be_bytes([0, r, g, b])),
-        );
+        let changed = self
+            .xrgb
+            .update(&self.screen, |[r, g, b]| u32::from_be_bytes([0, r, g, b]));
+        let duplicate = changed.is_none() && self.shown.is_none() && self.can_dupe;
         self.shown = None;
         self.set_geometry(cb);
         let (w, h) = (self.screen.width, self.screen.height);
         let video_start = Instant::now();
-        cb.video(&self.xrgb, w, h);
+        if duplicate {
+            cb.video_dupe(w, h);
+        } else {
+            cb.video(&self.xrgb.data, w, h);
+        }
         self.frontend += video_start.elapsed();
     }
 

@@ -12,6 +12,7 @@ use std::ffi::{CString, c_void};
 use std::num::NonZeroU32;
 
 use glow::HasContext;
+use crate::present::Pixels;
 use rust_dos::bus::Bus;
 use rust_dos::video::Frame;
 use rust_dos::video::shader::{self, Glsl, Shader};
@@ -111,6 +112,9 @@ pub struct Screen {
     vao: glow::VertexArray,
     /// The machine's picture when the card's isn't shown.
     texture: glow::Texture,
+    texture_size: (u32, u32),
+    upload: Pixels<[u8; 4]>,
+    last_composite: bool,
     voodoo: Option<VoodooGl>,
     /// The scale, samples and anisotropy `voodoo` draws with.
     voodoo_key: Option<(u32, u32, u32)>,
@@ -138,7 +142,20 @@ impl Screen {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
-            Ok(Screen { gl, glsl, framebuffer, program, vao, texture, voodoo: None, voodoo_key: None, voodoo_failed: None })
+            Ok(Screen {
+                gl,
+                glsl,
+                framebuffer,
+                program,
+                vao,
+                texture,
+                texture_size: (0, 0),
+                upload: Pixels::default(),
+                last_composite: false,
+                voodoo: None,
+                voodoo_key: None,
+                voodoo_failed: None,
+            })
         }
     }
 
@@ -207,22 +224,69 @@ impl Screen {
     /// Draw the picture into the frontend's framebuffer: with `voodoo`,
     /// the machine's picture without what is drawn over it, the 3dfx
     /// card's picture `run_voodoo` drew with what `screen` has over it;
-    /// else `screen`. Returns the size drawn.
-    pub fn present(&mut self, screen: &Frame, voodoo: Option<&Frame>) -> (u32, u32) {
-        let Screen { gl, framebuffer, program, vao, texture: own, voodoo: card, .. } = self;
+    /// else `screen`. Returns the size and whether a new frame was drawn.
+    pub fn present(
+        &mut self,
+        screen: &Frame,
+        voodoo: Option<&Frame>,
+        can_dupe: bool,
+    ) -> (u32, u32, bool) {
+        let Screen {
+            gl,
+            framebuffer,
+            program,
+            vao,
+            texture: own,
+            texture_size,
+            upload,
+            last_composite,
+            voodoo: card,
+            ..
+        } = self;
         let composite = voodoo.and_then(|base| card.as_mut()?.composite(gl, screen, base));
+        let was_composite = std::mem::replace(last_composite, composite.is_some());
         // SAFETY: the frontend's context is current while the core runs.
         unsafe {
             let (texture, (w, h)) = match composite {
                 Some(picture) => picture,
                 None => {
+                    let rows = upload.update(screen, |[r, g, b]| [r, g, b, 255]);
+                    if rows.is_none() && !was_composite && can_dupe {
+                        return (screen.width, screen.height, false);
+                    }
+                    gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(*own));
-                    // Frame rows are packed, three bytes a pixel.
-                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-                    let pixels = glow::PixelUnpackData::Slice(Some(&screen.rgb));
-                    let (w, h) = (screen.width as i32, screen.height as i32);
-                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGB8 as i32, w, h, 0, glow::RGB, glow::UNSIGNED_BYTE, pixels);
                     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+                    let (w, h) = (screen.width as i32, screen.height as i32);
+                    if *texture_size != (screen.width, screen.height) {
+                        gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA8 as i32,
+                            w,
+                            h,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(None),
+                        );
+                        *texture_size = (screen.width, screen.height);
+                    }
+                    if let Some(rows) = rows {
+                        let pixels = &upload.data[rows.start * w as usize..rows.end * w as usize];
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            0,
+                            rows.start as i32,
+                            w,
+                            rows.len() as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(pixels.as_flattened())),
+                        );
+                    }
                     (*own, (screen.width, screen.height))
                 }
             };
@@ -242,7 +306,7 @@ impl Screen {
             gl.bind_vertex_array(None);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.use_program(None);
-            (w, h)
+            (w, h, true)
         }
     }
 }
@@ -288,5 +352,75 @@ fn compile(gl: &glow::Context, glsl: Glsl) -> Result<glow::Program, String> {
         gl.uniform_1_i32(frame.as_ref(), 0);
         gl.use_program(None);
         Ok(program)
+    }
+}
+
+#[cfg(all(test, feature = "gl-tests"))]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn default_framebuffer() -> usize {
+        0
+    }
+
+    #[test]
+    #[ignore = "requires a desktop OpenGL context"]
+    fn partial_uploads_and_geometry_changes_preserve_the_picture() {
+        let sdl = sdl2::init().unwrap();
+        let video = sdl.video().unwrap();
+        video
+            .gl_attr()
+            .set_context_profile(sdl2::video::GLProfile::Core);
+        video.gl_attr().set_context_version(3, 3);
+        let window = video
+            .window("Libretro upload regression", 8, 8)
+            .opengl()
+            .hidden()
+            .build()
+            .unwrap();
+        let _context = window.gl_create_context().unwrap();
+        // SAFETY: this thread owns the current SDL OpenGL context.
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| video.gl_get_proc_address(name).cast())
+        };
+        let mut screen = Screen::new(gl, default_framebuffer).unwrap();
+        let mut frame = Frame::from_rgb(3, 2, vec![17; 18]);
+        assert_eq!(screen.present(&frame, None, true), (3, 2, true));
+        assert_eq!(screen.present(&frame, None, true), (3, 2, false));
+        frame.rgb[9..].fill(37);
+        assert_eq!(screen.present(&frame, None, true), (3, 2, true));
+        assert_eq!(screen.present(&frame, None, false), (3, 2, true));
+        let read = |screen: &Screen, frame: &Frame| {
+            let mut pixels = vec![0; (frame.width * frame.height * 4) as usize];
+            // SAFETY: the texture and context belong to this thread.
+            unsafe {
+                screen
+                    .gl
+                    .bind_texture(glow::TEXTURE_2D, Some(screen.texture));
+                screen.gl.get_tex_image(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+                assert_eq!(screen.gl.get_error(), glow::NO_ERROR);
+            }
+            let expected: Vec<_> = frame
+                .rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[r, g, b]| [r, g, b, 255])
+                .collect();
+            assert_eq!(pixels, expected);
+        };
+        read(&screen, &frame);
+        // Same pixel count, different geometry: storage must be resized.
+        frame = Frame::from_rgb(2, 3, vec![73; 18]);
+        assert_eq!(screen.present(&frame, None, true), (2, 3, true));
+        read(&screen, &frame);
+        assert_eq!(screen.present(&frame, None, true), (2, 3, false));
+        screen.destroy();
     }
 }

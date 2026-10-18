@@ -170,3 +170,17 @@ the core.
 * The program's CRT shaders (the frontend has shaders of its own).
 * MIDI out of the host's MIDI ports (`midisynth=host`).
 * The debug server.
+
+## Presentation regression tests
+
+The regular `cargo test` suite checks pixel conversion, duplicate-frame
+callbacks and headless frontend behavior without SDL. With SDL2 and a
+local desktop OpenGL context, the opt-in upload regression reads back
+changed rows and a resized texture:
+
+```sh
+cargo test --features gl-tests --lib gl::tests -- --ignored --test-threads=1
+```
+
+The SDL window is hidden. The `gl-tests` feature is only for this check;
+normal core builds keep using the frontend's context and do not link SDL.

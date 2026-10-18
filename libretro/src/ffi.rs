@@ -19,6 +19,7 @@ pub type retro_keyboard_event_t = unsafe extern "C" fn(down: bool, keycode: u32,
 
 // Environment calls.
 pub const RETRO_ENVIRONMENT_EXPERIMENTAL: u32 = 0x10000;
+pub const RETRO_ENVIRONMENT_GET_CAN_DUPE: u32 = 3;
 pub const RETRO_ENVIRONMENT_SET_MESSAGE: u32 = 6;
 pub const RETRO_ENVIRONMENT_SHUTDOWN: u32 = 7;
 pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;

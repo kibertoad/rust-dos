@@ -32,6 +32,9 @@ struct Frontend {
     height: u32,
     pixels: Vec<u32>,
     audio_frames: usize,
+    can_dupe: bool,
+    duplicates: usize,
+    video_frames: usize,
     input: HashMap<(u32, u32, u32, u32), i16>,
     /// The folder `test://` paths are in, for a frontend with a VFS, and
     /// the calls made to it.
@@ -52,6 +55,10 @@ fn with<R>(f: impl FnOnce(&mut Frontend) -> R) -> R {
 unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
     unsafe {
         match cmd {
+            RETRO_ENVIRONMENT_GET_CAN_DUPE => {
+                *(data as *mut bool) = with(|fe| fe.can_dupe);
+                true
+            }
             RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
                 *(data as *mut *const c_char) = with(|fe| fe.system.as_ptr());
                 true
@@ -139,12 +146,22 @@ unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn video(data: *const c_void, width: u32, height: u32, pitch: usize) {
+    if data.is_null() {
+        with(|fe| {
+            assert!(fe.can_dupe, "frontend did not allow duplicate frames");
+            assert!(!fe.pixels.is_empty(), "first frame cannot be duplicated");
+            assert_eq!((width, height), (fe.width, fe.height));
+            fe.duplicates += 1;
+        });
+        return;
+    }
     assert_eq!(pitch, width as usize * 4);
     let pixels = unsafe { std::slice::from_raw_parts(data as *const u32, (width * height) as usize) };
     with(|fe| {
         fe.width = width;
         fe.height = height;
         fe.pixels = pixels.to_vec();
+        fe.video_frames += 1;
     });
 }
 
@@ -434,6 +451,32 @@ fn map_word(address: usize) -> Option<u16> {
 /// A program that puts BEEFh at offset 200h of its segment, then waits
 /// there for ever.
 const MARKER: &[u8] = &[0xC7, 0x06, 0x00, 0x02, 0xEF, 0xBE, 0xEB, 0xFE];
+
+#[test]
+fn unchanged_frames_are_duplicated_only_when_the_frontend_allows_it() {
+    for can_dupe in [false, true] {
+        with(|fe| *fe = Frontend::default());
+        let dir = scratch(if can_dupe { "dupe" } else { "no_dupe" });
+        start(&dir, &[]);
+        with(|fe| fe.can_dupe = can_dupe);
+        assert!(load(None));
+        run(90);
+        with(|fe| {
+            assert!(fe.video_frames > 0);
+            assert_eq!(fe.video_frames + fe.duplicates, 90);
+            assert_eq!(fe.duplicates > 0, can_dupe);
+        });
+        let before = picture_hash();
+        type_text("VER\r");
+        run(30);
+        assert_ne!(
+            picture_hash(),
+            before,
+            "changed frames still reach the frontend"
+        );
+        stop();
+    }
+}
 
 #[test]
 fn without_content_it_starts_at_the_prompt() {
