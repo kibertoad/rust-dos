@@ -213,6 +213,14 @@ pub struct IdleStats {
     pub skipped: u64,
     /// Why the last proof failed.
     pub failure: &'static str,
+    /// Heads armed, proofs started at one, and proofs a timer event or an
+    /// interrupt ended before they came to anything.
+    pub arms: u64,
+    pub starts: u64,
+    pub cut: u64,
+    /// The failures by why, in the order the reasons first came up (an
+    /// empty one is a free slot).
+    pub failed_by: [(&'static str, u64); 16],
 }
 
 /// The prover's state. It is the bus's, whose memory and port accesses
@@ -398,6 +406,7 @@ impl Observe {
             self.backoff -= 1;
             return;
         }
+        self.stats.arms += 1;
         self.phase = Phase::Armed { head, until: now + ARM_LIMIT };
     }
 
@@ -430,6 +439,9 @@ impl Observe {
         self.stop();
         self.stats.failures += 1;
         self.stats.failure = why;
+        if let Some(slot) = self.stats.failed_by.iter_mut().find(|(w, _)| *w == why || w.is_empty()) {
+            *slot = (why, slot.1 + 1);
+        }
         // (A loop that changes something every pass, as DOS 7's keyboard
         // poll counts down, is looked at about once in 64K arms.)
         self.failures_in_row = (self.failures_in_row + 1).min(16);
@@ -505,6 +517,7 @@ pub fn at_event(cpu: &mut Cpu) {
         return;
     }
     if cpu.bus.observe.on {
+        cpu.bus.observe.stats.cut += 1;
         cpu.bus.observe.stop();
     }
     let regs = cpu.snapshot();
@@ -522,6 +535,7 @@ pub fn at_event(cpu: &mut Cpu) {
 #[cold]
 pub fn interrupted(cpu: &mut Cpu) {
     if cpu.bus.observe.on {
+        cpu.bus.observe.stats.cut += 1;
         cpu.bus.observe.stop();
     }
 }
@@ -590,6 +604,7 @@ fn visit(cpu: &mut Cpu, now: u64) {
     };
     match step {
         Step::Start => {
+            o.stats.starts += 1;
             o.on = true;
             o.failed.set(None);
             o.chunks.clear();

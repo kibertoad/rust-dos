@@ -331,12 +331,18 @@ impl DebugHub {
                 "calls": dynrec_calls(cpu.dynrec.calls()),
             },
             // Busy-wait loops proven to change nothing, proofs that failed,
-            // and the instructions skipped (`idle`).
+            // and the instructions skipped (`idle`); heads armed, proofs
+            // started and those a timer event or interrupt cut short, and
+            // the failures by why.
             "idle_skip": {
                 "proofs": cpu.bus.observe.stats.proofs,
                 "failures": cpu.bus.observe.stats.failures,
                 "skipped": cpu.bus.observe.stats.skipped,
                 "failure": cpu.bus.observe.stats.failure,
+                "arms": cpu.bus.observe.stats.arms,
+                "starts": cpu.bus.observe.stats.starts,
+                "cut": cpu.bus.observe.stats.cut,
+                "failed_by": cpu.bus.observe.stats.failed_by.iter().filter(|(why, _)| !why.is_empty()).copied().collect::<std::collections::BTreeMap<_, _>>(),
             },
             // Host speed while executing guest code, excluding idle skips,
             // rendering and frame pacing.
