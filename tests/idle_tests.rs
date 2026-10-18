@@ -337,26 +337,32 @@ fn an_interrupt_in_a_retrace_wait_sees_the_status_it_would_have() {
 }
 
 /// Wait for 200 ticks of the timer at 1 kHz as a Windows 98 game paces its
-/// frames (#160): a loop around a call that reads the tick count, until the
-/// time since the start reaches the frame's. The count moves at every
-/// timer interrupt, and with it AX at the loop's head. Then end.
+/// frames (#160), then end.
 fn frame_limiter(a: &mut CodeAssembler) -> Result<(), IcedError> {
-    let (mut wait, mut ticks) = (a.create_label(), a.create_label());
-    pit(a, 1193)?;
+    limiter(a, 1193, 200)
+}
+
+/// Wait for `ticks` ticks of the timer counting `count`: a loop around a
+/// call that reads the tick count, until the time since the start reaches
+/// the frame's. The count moves at every timer interrupt, and with it AX
+/// at the loop's head. Then end.
+fn limiter(a: &mut CodeAssembler, count: u16, ticks: u32) -> Result<(), IcedError> {
+    let (mut wait, mut read) = (a.create_label(), a.create_label());
+    pit(a, count)?;
     a.xor(ax, ax)?;
     a.mov(es, ax)?;
     a.mov(ax, word_ptr(0x46C).es())?;
     a.mov(word_ptr(DATA), ax)?;
     a.set_label(&mut wait)?;
-    a.call(ticks)?;
+    a.call(read)?;
     a.sub(ax, word_ptr(DATA))?;
-    a.cmp(ax, 200)?;
+    a.cmp(ax, ticks)?;
     a.jb(wait)?;
     pit(a, 0)?;
     a.mov(ax, 0x4C00)?;
     a.int(0x21)?;
     // GetTickCount.
-    a.set_label(&mut ticks)?;
+    a.set_label(&mut read)?;
     a.mov(ax, word_ptr(0x46C).es())?;
     a.xor(dx, dx)?;
     a.ret()
@@ -365,6 +371,16 @@ fn frame_limiter(a: &mut CodeAssembler) -> Result<(), IcedError> {
 #[test]
 fn a_frame_limiter_that_calls_for_the_time_is_skipped() {
     let stats = compare("tick_call", frame_limiter);
+    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+}
+
+#[test]
+fn a_frame_limiter_on_a_fast_timer_is_skipped() {
+    // The timer at 5 kHz: nearly every event comes after a tick, so the
+    // loop is seldom at an instruction with the registers it had at the
+    // event before.
+    let stats = compare("tick_call_fast", |a| limiter(a, 239, 2000));
+    println!("tick_call_fast: proofs {} skipped {}", stats.proofs, stats.skipped);
     assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
 }
 
