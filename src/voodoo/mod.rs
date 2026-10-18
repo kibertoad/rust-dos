@@ -1201,6 +1201,11 @@ impl Voodoo {
         if !output {
             return switched;
         }
+        if !self.picture_wanted() {
+            // The OpenGL renderer draws it: nothing needs the memory.
+            self.display_dirty |= changed;
+            return switched;
+        }
         if let Some(b) = &mut self.banshee {
             let dirty = std::mem::take(&mut b.dirty);
             let draw = changed || switched || dirty;
@@ -1210,11 +1215,6 @@ impl Voodoo {
                 self.flush();
             }
             return draw;
-        }
-        if !self.picture_wanted() {
-            // The OpenGL renderer draws it: nothing needs the memory.
-            self.display_dirty |= changed;
-            return switched;
         }
         // Jobs may still be drawing into the buffer shown.
         let front = self.fbi.rgboffs[self.fbi.frontbuf as usize];
