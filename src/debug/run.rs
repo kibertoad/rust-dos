@@ -343,7 +343,15 @@ impl DebugHub {
                 "backed_off": cpu.bus.observe.stats.backed_off,
                 "starts": cpu.bus.observe.stats.starts,
                 "cut": cpu.bus.observe.stats.cut,
-                "failed_by": cpu.bus.observe.stats.failed_by.iter().filter(|(why, _)| !why.is_empty()).copied().collect::<std::collections::BTreeMap<_, _>>(),
+                "failed_by": cpu
+                    .bus
+                    .observe
+                    .stats
+                    .failed_by
+                    .iter()
+                    .filter(|(why, _)| !why.is_empty())
+                    .copied()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
                 "heads": cpu.bus.observe.stats.heads.iter().filter(|h| h.arms > 0).map(|h| json!({
                     "at": format!("{:04X}:{:08X}", h.cs, h.eip),
                     "pe": h.pe,
