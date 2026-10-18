@@ -137,8 +137,10 @@ pub struct Renderer {
     scratch: Scratch,
     #[cfg(not(target_arch = "wasm32"))]
     threads: usize,
+    /// Built by the first scene of several tiles; `Some(None)` when the
+    /// pool could not be built and scenes render on this thread.
     #[cfg(not(target_arch = "wasm32"))]
-    pool: std::sync::OnceLock<Option<rayon::ThreadPool>>,
+    pool: Option<Option<rayon::ThreadPool>>,
 }
 
 impl Default for Renderer {
@@ -161,7 +163,7 @@ impl Renderer {
             #[cfg(not(target_arch = "wasm32"))]
             threads: threads.max(1),
             #[cfg(not(target_arch = "wasm32"))]
-            pool: std::sync::OnceLock::new(),
+            pool: None,
         }
     }
 
@@ -289,7 +291,7 @@ fn render_scene(
         .sum();
     #[cfg(not(target_arch = "wasm32"))]
     if renderer.threads > 1 && tiles.len() > 1 {
-        let pool = renderer.pool.get_or_init(|| {
+        let pool = renderer.pool.get_or_insert_with(|| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(renderer.threads)
                 .thread_name(|i| format!("PowerVR-{i}"))
@@ -536,15 +538,15 @@ struct Cells {
 
 impl Cells {
     fn reset(&mut self, n: usize) {
-        reset(&mut self.i_depth, n, 0.0);
-        reset(&mut self.u_depth, n, 0.0);
-        reset(&mut self.i_id, n, 0);
-        reset(&mut self.u_id, n, 0);
-        reset(&mut self.i_visible, n, false);
-        reset(&mut self.i_forward, n, false);
-        reset(&mut self.shad_temp, n, false);
-        reset(&mut self.u_visible, n, false);
-        reset(&mut self.u_shadow, n, false);
+        refill(&mut self.i_depth, n, 0.0);
+        refill(&mut self.u_depth, n, 0.0);
+        refill(&mut self.i_id, n, 0);
+        refill(&mut self.u_id, n, 0);
+        refill(&mut self.i_visible, n, false);
+        refill(&mut self.i_forward, n, false);
+        refill(&mut self.shad_temp, n, false);
+        refill(&mut self.u_visible, n, false);
+        refill(&mut self.u_shadow, n, false);
     }
 
     /// `SurfProcess` for every cell: the plane with depth `depth(i)` at
@@ -645,10 +647,26 @@ impl Cells {
     }
 }
 
-/// Clear active elements while retaining the allocation.
-fn reset<T: Clone>(buffer: &mut Vec<T>, n: usize, value: T) {
-    buffer.clear();
+/// The most elements a tile buffer keeps between tiles: a 1024-pixel
+/// wide tile 64 lines tall. A taller tile still renders, but its memory
+/// is given back once a tile that fits this size follows it, so a
+/// garbage header doesn't pin tens of megabytes on every worker.
+const RETAINED: usize = 1024 * 64;
+
+/// Clear the buffer and fill it with `n` copies of `value`, keeping the
+/// allocation within [`RETAINED`].
+fn refill<T: Clone>(buffer: &mut Vec<T>, n: usize, value: T) {
+    trim(buffer, n);
     buffer.resize(n, value);
+}
+
+/// Clear the buffer, giving back memory beyond [`RETAINED`] when `n`
+/// elements fit in that.
+fn trim<T>(buffer: &mut Vec<T>, n: usize) {
+    buffer.clear();
+    if n <= RETAINED && buffer.capacity() > RETAINED {
+        buffer.shrink_to(RETAINED);
+    }
 }
 
 /// A tile: its planes through the cells, and what they find shaded,
@@ -667,12 +685,12 @@ fn render_tile(
     let y0 = header >> 20 & 0x3FF;
     let (w, h) = (width as usize, height as usize);
     (tile.x, tile.y, tile.width, tile.height) = (x0, y0, width, height);
-    reset(&mut tile.pixels, w * h, 0);
+    refill(&mut tile.pixels, w * h, 0);
     let pixels = &mut tile.pixels;
     let Scratch { cells, xs, ys } = scratch;
     cells.reset(w * h);
-    xs.clear();
-    ys.clear();
+    trim(xs, w * h);
+    trim(ys, w * h);
     xs.extend((0..w * h).map(|i| (x0 as usize + i % w) as f32));
     ys.extend((0..w * h).map(|i| (y0 as usize + i / w) as f32));
     let mut objects = 0;
@@ -840,6 +858,20 @@ mod tests {
                 serial.recycle(b);
             }
         }
+    }
+
+    #[test]
+    fn oversized_tile_buffers_are_given_back() {
+        let mut buffer = Vec::new();
+        refill(&mut buffer, 1024 * 1024, 0u32);
+        refill(&mut buffer, 32 * 32, 7);
+        assert_eq!(buffer, vec![7; 32 * 32]);
+        assert!(buffer.capacity() <= RETAINED);
+        // Within the limit the allocation is kept for the next tile.
+        refill(&mut buffer, RETAINED, 1);
+        let kept = buffer.as_ptr();
+        refill(&mut buffer, 32, 2);
+        assert_eq!(buffer.as_ptr(), kept);
     }
 
     #[test]
