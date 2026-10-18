@@ -193,13 +193,6 @@ pub enum Effect {
     Lfb,
 }
 
-/// ROP3: bit (P*4 + S*2 + D) of `rop` is the result for those pattern,
-/// source and destination bits.
-#[cfg(test)]
-fn mix(src: u32, pat: u32, dst: u32, rop: u8) -> u32 {
-    crate::rasterop::ternary(rop)(dst, src, pat)
-}
-
 impl Virge {
     /// Set status bits (VSY at each retrace, S3D DONE, command DMA done).
     /// The interrupt line isn't raised: software polls these.
@@ -506,7 +499,7 @@ impl Virge {
             tr.buffer = val;
             tr.count = valbytes;
         }
-        let g = self.groups[BITBLT].clone();
+        let g = &self.groups[BITBLT];
         let cmd = g.command_set;
         let (mut x, mut y) = (g.rect_dst_x, g.rect_dst_y);
         let rop = crate::rasterop::ternary(g.rop());
@@ -523,9 +516,9 @@ impl Virge {
                         let set = byte & msk != 0;
                         if set || !transparent {
                             let src = if set { g.src_fg } else { g.src_bg };
-                            let dst = read_dst(&g, vram, x, y);
+                            let dst = read_dst(g, vram, x, y);
                             let pat = if mono_pattern { self.pat_pixel_mono(x, y) } else { self.pat_pixel(x, y) };
-                            draw_clipped(&g, vram, x, y, rop(dst, src, pat));
+                            draw_clipped(g, vram, x, y, rop(dst, src, pat));
                         }
                         self.transfer.src_drem -= 1;
                     }
@@ -561,9 +554,9 @@ impl Virge {
                 if self.transfer.src_drem > 0 {
                     let src = self.transfer.buffer as u32 & bmask;
                     if !transparent || src != g.src_fg & bmask {
-                        let dst = read_dst(&g, vram, x, y);
+                        let dst = read_dst(g, vram, x, y);
                         let pat = if mono_pattern { self.pat_pixel_mono(x, y) } else { self.pat_pixel(x, y) };
-                        draw_clipped(&g, vram, x, y, rop(dst, src, pat));
+                        draw_clipped(g, vram, x, y, rop(dst, src, pat));
                     }
                     self.transfer.src_drem -= 1;
                 }
@@ -1016,9 +1009,13 @@ mod tests {
 
     #[test]
     fn rop3_combines_pattern_source_and_destination() {
-        // DPSxx: all three XORed (96h), and PSa (C0h).
-        assert_eq!(mix(0b1100, 0b1010, 0b0110, 0x96), 0b1100 ^ 0b1010 ^ 0b0110);
-        assert_eq!(mix(0b1100, 0b1010, 0b0110, 0xC0), 0b1000);
-        assert_eq!(mix(1, 2, 3, 0x88), 1);
+        // DPSxx: all three XORed (96h), and PSa (C0h). Bit (P*4 + S*2 +
+        // D) of the ROP is the result for those pattern, source and
+        // destination bits.
+        use crate::rasterop::ternary;
+        let (src, pat, dst) = (0b1100, 0b1010, 0b0110);
+        assert_eq!(ternary(0x96)(dst, src, pat), src ^ pat ^ dst);
+        assert_eq!(ternary(0xC0)(dst, src, pat), 0b1000);
+        assert_eq!(ternary(0x88)(3, 1, 2), 1);
     }
 }

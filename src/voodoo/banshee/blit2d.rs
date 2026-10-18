@@ -109,7 +109,8 @@ pub struct Engine {
     bres_error_0: i32,
     pub rop: u32,
     rops: [u8; 4],
-    /// Host dispatch derived from `rops`, rebuilt after a state load.
+    /// Host dispatch derived from `rops`: refreshed wherever `rops` is
+    /// written and rebuilt after a state load, which doesn't keep it.
     rop_functions: [crate::rasterop::Ternary; 4],
     pub command_extra: u32,
     pub line_stipple: u32,
@@ -1342,6 +1343,7 @@ impl Engine {
 /// A ternary raster operation: each of the eight bits of `rop` says
 /// whether a combination of pattern, source and destination bits makes
 /// a 1.
+#[cfg(test)]
 pub fn rop3(rop: u8, dest: u32, src: u32, pattern: u32) -> u32 {
     crate::rasterop::ternary(rop)(dest, src, pattern)
 }
