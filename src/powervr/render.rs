@@ -17,6 +17,8 @@
 use super::Chip;
 use super::regs;
 use super::tsp::{Shader, Tsp};
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 
 /// The tile width: the ISP's cells.
 pub const CELLS: usize = 32;
@@ -107,6 +109,7 @@ pub struct Plane {
 }
 
 /// A tile of the picture.
+#[derive(Default)]
 pub struct Tile {
     pub x: u32,
     pub y: u32,
@@ -125,8 +128,89 @@ pub struct Rendered {
     pub tsp_clocks: u64,
 }
 
-/// Render the scene the registers describe.
+/// Host buffers and workers kept between renders. None of this is
+/// emulated state: every scene rebuilds its planes and clears its cells.
+pub struct Renderer {
+    tiles: Vec<(u32, std::ops::Range<usize>)>,
+    planes: Vec<Plane>,
+    spare: Rendered,
+    scratch: Scratch,
+    #[cfg(not(target_arch = "wasm32"))]
+    threads: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    pool: std::sync::OnceLock<Option<rayon::ThreadPool>>,
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::with_threads(threads())
+    }
+}
+
+impl Renderer {
+    /// Use at most `threads` host threads (one in a browser). Workers
+    /// start only when a scene has multiple tiles, and stop on drop.
+    pub fn with_threads(threads: usize) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let _ = threads;
+        Self {
+            tiles: Vec::new(),
+            planes: Vec::new(),
+            spare: Rendered::default(),
+            scratch: Scratch::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            threads: threads.max(1),
+            #[cfg(not(target_arch = "wasm32"))]
+            pool: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Render a borrowed scene, completing every tile before returning.
+    pub fn render(
+        &mut self,
+        chip: Chip,
+        registers: &[u32],
+        textures: &[u8],
+        mem: Memory,
+        shader: &Shader,
+    ) -> Rendered {
+        render_scene(self, chip, registers, textures, mem, shader)
+    }
+
+    /// Return a consumed frame so its tile pixel buffers can be reused.
+    pub fn recycle(&mut self, rendered: Rendered) {
+        self.spare = rendered;
+    }
+}
+
+#[derive(Default)]
+struct Scratch {
+    cells: Cells,
+    xs: Vec<f32>,
+    ys: Vec<f32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    // Rendering a tile does not yield or start nested parallel work, so
+    // a worker holds this borrow only for its current tile.
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+}
+
+/// Render one scene with temporary host resources. For repeated renders,
+/// keep a [`Renderer`] and return consumed frames with [`Renderer::recycle`].
 pub fn render(
+    chip: Chip,
+    registers: &[u32],
+    textures: &[u8],
+    mem: Memory,
+    shader: &Shader,
+) -> Rendered {
+    Renderer::default().render(chip, registers, textures, mem, shader)
+}
+
+fn render_scene(
+    renderer: &mut Renderer,
     chip: Chip,
     registers: &[u32],
     textures: &[u8],
@@ -146,8 +230,10 @@ pub fn render(
     let tsp = Tsp::new(chip, registers, textures, shader);
     // The tiles and their planes first, then the tiles rendered, each by
     // itself, so on as many threads as there are.
-    let mut tiles: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
-    let mut planes = Vec::new();
+    let tiles = &mut renderer.tiles;
+    let planes = &mut renderer.planes;
+    tiles.clear();
+    planes.clear();
     // The list: a tile header, then pointers to the tile's objects; links
     // continue it elsewhere.
     let mut at = registers[regs::OBJECT_OFFSET] & !3;
@@ -184,7 +270,7 @@ pub fn render(
             if word & TILE_HEADER != 0 {
                 break;
             }
-            fetch_planes(&params, format, word, &mut planes);
+            fetch_planes(&params, format, word, planes);
             if word & VERY_LAST != 0 {
                 last = true;
                 break;
@@ -195,37 +281,57 @@ pub fn render(
             break;
         }
     }
-    let threads = threads().min(tiles.len()).max(1);
-    let render_some = |k: usize| -> Vec<(usize, Tile, u64)> {
-        (k..tiles.len())
-            .step_by(threads)
-            .map(|i| {
-                let (header, range) = &tiles[i];
-                let mut shaded = 0;
-                let tile = render_tile(*header, &planes[range.clone()], &tsp, &mut shaded);
-                (i, tile, shaded)
-            })
-            .collect()
-    };
-    let isp_clocks = tiles.iter().map(|(header, range)| range.len() as u64 * ((header >> 5 & 0x3FF) as u64 + 1)).sum();
-    let mut done: Vec<(usize, Tile, u64)> = if threads == 1 {
-        render_some(0)
-    } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (1..threads).map(|k| scope.spawn(move || render_some(k))).collect();
-            let mut all = render_some(0);
-            for handle in handles {
-                all.extend(handle.join().expect("a PowerVR render thread"));
-            }
-            all
-        })
-    };
-    done.sort_unstable_by_key(|(i, _, _)| *i);
-    Rendered {
-        isp_clocks,
-        tsp_clocks: done.iter().map(|(_, _, shaded)| shaded).sum(),
-        tiles: done.into_iter().map(|(_, tile, _)| tile).collect(),
+    let mut out = std::mem::take(&mut renderer.spare);
+    out.tiles.resize_with(tiles.len(), Tile::default);
+    out.isp_clocks = tiles
+        .iter()
+        .map(|(header, range)| range.len() as u64 * ((header >> 5 & 0x3FF) as u64 + 1))
+        .sum();
+    #[cfg(not(target_arch = "wasm32"))]
+    if renderer.threads > 1 && tiles.len() > 1 {
+        let pool = renderer.pool.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(renderer.threads)
+                .thread_name(|i| format!("PowerVR-{i}"))
+                .build()
+                .ok()
+        });
+        if let Some(pool) = pool {
+            out.tsp_clocks = pool.install(|| {
+                out.tiles
+                    .par_iter_mut()
+                    .zip(tiles.par_iter())
+                    .map(|(tile, (header, range))| {
+                        SCRATCH.with(|scratch| {
+                            render_tile(
+                                *header,
+                                &planes[range.clone()],
+                                &tsp,
+                                &mut scratch.borrow_mut(),
+                                tile,
+                            )
+                        })
+                    })
+                    .sum()
+            });
+            return out;
+        }
     }
+    out.tsp_clocks = out
+        .tiles
+        .iter_mut()
+        .zip(tiles.iter())
+        .map(|(tile, (header, range))| {
+            render_tile(
+                *header,
+                &planes[range.clone()],
+                &tsp,
+                &mut renderer.scratch,
+                tile,
+            )
+        })
+        .sum();
+    out
 }
 
 /// The threads a render uses.
@@ -415,6 +521,7 @@ fn expand(instr: u8, second: bool, previous: Previous) -> (Control, Previous) {
 }
 
 /// The tile's cells, a pixel each.
+#[derive(Default)]
 struct Cells {
     i_depth: Vec<f32>,
     u_depth: Vec<f32>,
@@ -428,18 +535,16 @@ struct Cells {
 }
 
 impl Cells {
-    fn new(n: usize) -> Self {
-        Self {
-            i_depth: vec![0.0; n],
-            u_depth: vec![0.0; n],
-            i_id: vec![0; n],
-            u_id: vec![0; n],
-            i_visible: vec![false; n],
-            i_forward: vec![false; n],
-            shad_temp: vec![false; n],
-            u_visible: vec![false; n],
-            u_shadow: vec![false; n],
-        }
+    fn reset(&mut self, n: usize) {
+        reset(&mut self.i_depth, n, 0.0);
+        reset(&mut self.u_depth, n, 0.0);
+        reset(&mut self.i_id, n, 0);
+        reset(&mut self.u_id, n, 0);
+        reset(&mut self.i_visible, n, false);
+        reset(&mut self.i_forward, n, false);
+        reset(&mut self.shad_temp, n, false);
+        reset(&mut self.u_visible, n, false);
+        reset(&mut self.u_shadow, n, false);
     }
 
     /// `SurfProcess` for every cell: the plane with depth `depth(i)` at
@@ -540,18 +645,36 @@ impl Cells {
     }
 }
 
+/// Clear active elements while retaining the allocation.
+fn reset<T: Clone>(buffer: &mut Vec<T>, n: usize, value: T) {
+    buffer.clear();
+    buffer.resize(n, value);
+}
+
 /// A tile: its planes through the cells, and what they find shaded,
 /// counting the pixels shaded into `shaded`.
-fn render_tile(header: u32, planes: &[Plane], tsp: &Tsp, shaded: &mut u64) -> Tile {
+fn render_tile(
+    header: u32,
+    planes: &[Plane],
+    tsp: &Tsp,
+    scratch: &mut Scratch,
+    tile: &mut Tile,
+) -> u64 {
+    let mut shaded = 0;
     let width = ((header & 0x1F) + 1) * CELLS as u32;
     let height = (header >> 5 & 0x3FF) + 1;
     let x0 = (header >> 15 & 0x1F) * CELLS as u32;
     let y0 = header >> 20 & 0x3FF;
     let (w, h) = (width as usize, height as usize);
-    let mut cells = Cells::new(w * h);
-    let mut pixels = vec![0u32; w * h];
-    let xs: Vec<f32> = (0..w * h).map(|i| (x0 as usize + i % w) as f32).collect();
-    let ys: Vec<f32> = (0..w * h).map(|i| (y0 as usize + i / w) as f32).collect();
+    (tile.x, tile.y, tile.width, tile.height) = (x0, y0, width, height);
+    reset(&mut tile.pixels, w * h, 0);
+    let pixels = &mut tile.pixels;
+    let Scratch { cells, xs, ys } = scratch;
+    cells.reset(w * h);
+    xs.clear();
+    ys.clear();
+    xs.extend((0..w * h).map(|i| (x0 as usize + i % w) as f32));
+    ys.extend((0..w * h).map(|i| (y0 as usize + i / w) as f32));
     let mut objects = 0;
     let mut previous = Previous::None;
     for plane in planes {
@@ -587,7 +710,7 @@ fn render_tile(header: u32, planes: &[Plane], tsp: &Tsp, shaded: &mut u64) -> Ti
         }
         cells.process(control, plane.tag, |i| a * xs[i] + b * ys[i] + c);
         if plane.instr == instr::BEGIN_TRANS {
-            *shaded += shade(&cells, tsp, x0, y0, w, &mut pixels);
+            shaded += shade(cells, tsp, x0, y0, w, pixels);
         }
     }
     // After the region's last object a flush down the pipeline puts what
@@ -602,8 +725,8 @@ fn render_tile(header: u32, planes: &[Plane], tsp: &Tsp, shaded: &mut u64) -> Ti
         mux_u: true,
     };
     cells.process(flush, 0, |_| 0.0);
-    *shaded += shade(&cells, tsp, x0, y0, w, &mut pixels);
-    Tile { x: x0, y: y0, width, height, pixels }
+    shaded += shade(cells, tsp, x0, y0, w, pixels);
+    shaded
 }
 
 /// The TSP: the surfaces the cells hold, shaded into the tile. Returns
@@ -624,6 +747,100 @@ fn shade(cells: &Cells, tsp: &Tsp, x0: u32, y0: u32, w: usize, pixels: &mut [u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list of independently shaded tiles, sharing one plane and TSP
+    /// record. The page table maps parameter addresses to the same RAM.
+    fn scene(
+        chip: Chip,
+        count: usize,
+        height: u32,
+        depth: f32,
+        color: u32,
+    ) -> (Vec<u32>, Vec<u8>, Vec<u8>) {
+        let mut regs = vec![0; regs::COUNT];
+        regs[regs::TLB + 1] = 1;
+        regs[regs::OBJECT_OFFSET] = 0x1001;
+        regs[regs::IEEEFP] = u32::from(chip == Chip::Pcx2);
+        let mut ram = vec![0; 0x4000];
+        let mut put = |at: usize, value: u32| ram[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        let tag = if depth > 0.0 { 4 } else { 0 };
+        let plane = if chip == Chip::Pcx2 {
+            vec![0, 0, depth.to_bits(), 8 | tag << 4]
+        } else {
+            vec![
+                8 << 26,
+                tag << 20,
+                (depth as f64 * 2_147_483_648.0) as i32 as u32,
+            ]
+        };
+        for (i, word) in plane.into_iter().enumerate() {
+            put(0x100 + i * 4, word);
+        }
+        for i in 0..count {
+            put(
+                0x1000 + i * 8,
+                TILE_HEADER
+                    | (height - 1) << 5
+                    | (i as u32 % 10) << 15
+                    | (i as u32 / 10 * height) << 20,
+            );
+            put(
+                0x1004 + i * 8,
+                1 << 19 | 0x100 >> 2 | if i + 1 == count { VERY_LAST } else { 0 },
+            );
+        }
+        let mut tex = vec![0; 64];
+        tex[32..36].copy_from_slice(&(0x2000_0000 | (color >> 16)).to_le_bytes());
+        tex[36..40].copy_from_slice(&((color & 0xFFFF) << 16).to_le_bytes());
+        (regs, ram, tex)
+    }
+
+    #[test]
+    fn reused_parallel_scenes_match_serial_pixels_order_and_clocks() {
+        for chip in [Chip::Pcx1, Chip::Pcx2] {
+            let mut parallel = Renderer::with_threads(4);
+            let mut serial = Renderer::with_threads(1);
+            let shader = Shader::default();
+            // Reuse after changing shapes, colours and tile counts,
+            // alternating shaded surfaces with tag-zero ones. Include
+            // a wholly empty scene between populated ones.
+            for (frame, (count, height)) in [(64, 32), (3, 1), (37, 7), (0, 4), (64, 16), (2, 3)]
+                .into_iter()
+                .enumerate()
+            {
+                let depth = if frame % 2 == 0 { 0.5 } else { -0.5 };
+                let color = 0x112233 + frame as u32 * 0x010101;
+                let (regs, ram, tex) = scene(chip, count, height, depth, color);
+                let a = parallel.render(chip, &regs, &tex, Memory { ram: &ram }, &shader);
+                let b = serial.render(chip, &regs, &tex, Memory { ram: &ram }, &shader);
+                assert_eq!((a.isp_clocks, a.tsp_clocks), (b.isp_clocks, b.tsp_clocks));
+                assert_eq!(a.isp_clocks, count as u64 * height as u64);
+                assert_eq!(
+                    a.tsp_clocks,
+                    if depth > 0.0 {
+                        count as u64 * height as u64 * 32
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(a.tiles.len(), count);
+                for (i, (a, b)) in a.tiles.iter().zip(&b.tiles).enumerate() {
+                    assert_eq!(
+                        (a.x, a.y, a.width, a.height),
+                        ((i as u32 % 10) * 32, (i as u32 / 10) * height, 32, height)
+                    );
+                    assert_eq!(a.pixels, b.pixels);
+                    assert!(
+                        a.pixels
+                            .iter()
+                            .all(|&p| p == if depth > 0.0 { color } else { 0 })
+                    );
+                }
+                parallel.recycle(a);
+                serial.recycle(b);
+            }
+        }
+    }
 
     #[test]
     fn twenty_bit_floats_are_shifted_magnitudes() {
