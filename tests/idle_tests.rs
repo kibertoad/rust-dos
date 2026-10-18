@@ -336,6 +336,63 @@ fn an_interrupt_in_a_retrace_wait_sees_the_status_it_would_have() {
     assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
 }
 
+/// Wait for 200 ticks of the timer at 1 kHz as a Windows 98 game paces its
+/// frames (#160): a loop around a call that reads the tick count, until the
+/// time since the start reaches the frame's. The count moves at every
+/// timer interrupt, and with it AX at the loop's head. Then end.
+fn frame_limiter(a: &mut CodeAssembler) -> Result<(), IcedError> {
+    let (mut wait, mut ticks) = (a.create_label(), a.create_label());
+    pit(a, 1193)?;
+    a.xor(ax, ax)?;
+    a.mov(es, ax)?;
+    a.mov(ax, word_ptr(0x46C).es())?;
+    a.mov(word_ptr(DATA), ax)?;
+    a.set_label(&mut wait)?;
+    a.call(ticks)?;
+    a.sub(ax, word_ptr(DATA))?;
+    a.cmp(ax, 200)?;
+    a.jb(wait)?;
+    pit(a, 0)?;
+    a.mov(ax, 0x4C00)?;
+    a.int(0x21)?;
+    // GetTickCount.
+    a.set_label(&mut ticks)?;
+    a.mov(ax, word_ptr(0x46C).es())?;
+    a.xor(dx, dx)?;
+    a.ret()
+}
+
+#[test]
+fn a_frame_limiter_that_calls_for_the_time_is_skipped() {
+    let stats = compare("tick_call", frame_limiter);
+    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+}
+
+#[test]
+fn a_loop_that_failed_before_does_not_keep_another_from_being_skipped() {
+    // As Windows 98 boots before a game: a keyboard poll that counts each
+    // pass, whose proofs all fail, for 10 ticks of the BIOS's count, then
+    // the frame limiter.
+    let stats = compare("tick_call_after", |a| {
+        let mut busy = a.create_label();
+        a.xor(ax, ax)?;
+        a.mov(es, ax)?;
+        a.mov(ax, word_ptr(0x46C).es())?;
+        a.mov(word_ptr(DATA + 4), ax)?;
+        a.set_label(&mut busy)?;
+        a.inc(word_ptr(DATA + 2))?;
+        a.mov(ah, 1)?;
+        a.int(0x16)?;
+        a.mov(ax, word_ptr(0x46C).es())?;
+        a.sub(ax, word_ptr(DATA + 4))?;
+        a.cmp(ax, 10)?;
+        a.jb(busy)?;
+        frame_limiter(a)
+    });
+    assert!(stats.failures > 4, "{:?}", stats);
+    assert!(stats.proofs > 0 && stats.skipped > 0, "{:?}", stats);
+}
+
 /// Program the PIT's channel 0 to count `count` (0: 65536).
 fn pit(a: &mut CodeAssembler, count: u16) -> Result<(), IcedError> {
     a.mov(al, 0x36)?;
