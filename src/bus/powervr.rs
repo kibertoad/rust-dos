@@ -110,6 +110,7 @@ impl Bus {
         let now = self.clock.now_ticks();
         if let Some(p) = &mut self.powervr {
             p.rendering(&rendered, now);
+            p.recycle_render(rendered);
         }
         self.clock.schedule(self.next_event());
     }

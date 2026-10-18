@@ -177,6 +177,8 @@ pub struct PowerVr {
     /// `RUST_DOS_POWERVR_TRACE`: every access, written to `trace.txt` in
     /// that folder, with snapshots of the first renders beside it.
     trace: RefCell<Option<Trace>>,
+    /// Native workers and scratch buffers, not part of a save state.
+    renderer: RefCell<render::Renderer>,
 }
 
 struct Trace {
@@ -200,6 +202,7 @@ impl PowerVr {
             shader: tsp::Shader::default(),
             log: Vec::new(),
             trace: RefCell::new(None),
+            renderer: RefCell::new(render::Renderer::default()),
         };
         card.reset();
         if let Ok(dir) = std::env::var("RUST_DOS_POWERVR_TRACE") {
@@ -386,7 +389,18 @@ impl PowerVr {
 
     /// Render the scene from `ram`, the machine's memory.
     pub fn render(&self, ram: &[u8]) -> render::Rendered {
-        render::render(self.chip, &self.regs, &self.textures, render::Memory { ram }, &self.shader)
+        self.renderer.borrow_mut().render(
+            self.chip,
+            &self.regs,
+            &self.textures,
+            render::Memory { ram },
+            &self.shader,
+        )
+    }
+
+    /// The bus has copied the pixels out: keep their buffers for next time.
+    pub(crate) fn recycle_render(&self, rendered: render::Rendered) {
+        self.renderer.borrow_mut().recycle(rendered);
     }
 
     /// The render took the chip `rendered`'s clocks from `now` (PIT

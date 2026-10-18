@@ -9,6 +9,8 @@
 mod common;
 #[path = "video/voodoo.rs"]
 mod voodoo;
+#[path = "video/powervr.rs"]
+mod powervr;
 
 use common::*;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -297,6 +299,7 @@ criterion_group!(
     planar_program,
     cga_composite,
     voodoo::pipelines,
-    voodoo::frames
+    voodoo::frames,
+    powervr::frames
 );
 criterion_main!(benches);
