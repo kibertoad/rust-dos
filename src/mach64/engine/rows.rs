@@ -27,7 +27,7 @@ pub(super) fn draw(rect: &mut Rect, memory: &mut Memory) -> Option<bool> {
         || rect.empty()
         || !memory.vram.len().is_power_of_two()
         || s.mono != 0
-        || s.mix_fg != 7
+        || s.mix_fg.mode != 7
         || s.function != 0
         || s.compare.2 & 7 != 0
         || s.dst_cntl & POLYGON != 0
@@ -126,7 +126,7 @@ mod tests {
                 dst_pitch: 16,
                 src_pitch: 16,
                 src_base: 32,
-                mix_fg: 7,
+                mix_fg: Mix::new(7),
                 src_fg: source,
                 scissors: (0, 31, 0, 31),
                 x_dir: dx,
