@@ -34,7 +34,9 @@
 //! same flags and registers but for one (a loop, whose register may be a
 //! time read that the event between moved on). A head whose passes were
 //! skipped is armed again at the next event, as its loop usually goes on
-//! after it. Failed proofs at a head make the next tries at it rarer.
+//! after it, and whenever an event finds the CPU there later, as a game
+//! comes back to its frame limiter every frame. Failed proofs at a head
+//! make the next tries at it rarer.
 
 use std::cell::Cell;
 
@@ -55,6 +57,9 @@ const CHUNKS: usize = 256;
 const POLLS: u32 = 8;
 /// Heads whose failed proofs are remembered, to arm them less often.
 const BACKOFF_HEADS: usize = 8;
+/// Heads whose passes were skipped that are remembered, to arm them when
+/// an event finds the CPU there.
+const KNOWN_HEADS: usize = 16;
 /// Reads of the VGA's status in a row before the loop is armed.
 const STATUS_POLLS: u32 = 64;
 /// Bytes of RAM a pass may change and still be skipped, as counters (see
@@ -269,6 +274,9 @@ pub struct Observe {
     last_event: Option<(Head, [u32; 8], u32)>,
     /// The head whose passes were skipped up to the next event.
     proven: Option<Head>,
+    /// The last `KNOWN_HEADS` heads whose passes were skipped, oldest
+    /// first.
+    known: Vec<Head>,
     /// The port the instruction about to run may read: an IN AL of a port
     /// `Bus::idle_port` knows.
     port_ok: Option<u16>,
@@ -312,6 +320,7 @@ impl Default for Observe {
             poll: (None, 0),
             last_event: None,
             proven: None,
+            known: Vec::new(),
             port_ok: None,
             ports: Vec::new(),
             first_read: None,
@@ -615,10 +624,12 @@ pub fn keyboard_poll(cpu: &mut Cpu, cs: u16, eip: u32) {
 
 /// A timer event is due. A proof running ends, as the event may change what
 /// the loop sees (it is tried again after it). The head of passes skipped up
-/// to it is armed again; else a CPU at the same instruction as at the last
-/// event, with the same flags and all its registers but one the same, arms
-/// that instruction. That one may be what a loop reads of a time the event
-/// between moved on: `GetTickCount`'s count on Windows 98 (#160).
+/// to it is armed again. Else the CPU's instruction is armed when passes
+/// were skipped from it before (a game's frame limiter, which it comes back
+/// to every frame), or when the last event found the CPU there with the
+/// same flags and all its registers but one the same. That one may be what
+/// a loop reads of a time the event between moved on: `GetTickCount`'s
+/// count on Windows 98 (#160).
 #[cold]
 pub fn at_event(cpu: &mut Cpu) {
     if !cpu.bus.observe.enabled {
@@ -638,7 +649,7 @@ pub fn at_event(cpu: &mut Cpu) {
     o.last_event = Some(here);
     if let Some(head) = o.proven.take() {
         o.arm(head, now);
-    } else if near {
+    } else if near || o.known.contains(&here.0) {
         o.arm(here.0, now);
     }
 }
@@ -847,8 +858,16 @@ fn finish(cpu: &mut Cpu, visit: &Visit, base: u64, executed: u64, counted: Optio
         }
         let skipped = skip(cpu, period, executed, limit, passes);
         if skipped > 0 {
-            cpu.bus.observe.tally(head, |h| h.proofs += 1);
-            cpu.bus.observe.proven = head;
+            let o = &mut cpu.bus.observe;
+            o.tally(head, |h| h.proofs += 1);
+            o.proven = head;
+            if let Some(head) = head {
+                o.known.retain(|&k| k != head);
+                if o.known.len() == KNOWN_HEADS {
+                    o.known.remove(0);
+                }
+                o.known.push(head);
+            }
         }
         if let Some((port, read)) = held
             && skipped > 0
