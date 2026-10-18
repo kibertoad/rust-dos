@@ -20,10 +20,9 @@ pub fn addsub_st(cpu: &mut Cpu, dst: usize, a: usize, b: usize, sub: bool) {
     }
     let mut x = cpu.fpu_get(a);
     let y = cpu.fpu_get(b);
-    if sub {
-        x.sub(y);
-    } else {
-        x.add(y);
+    let invalid = if sub { x.sub(y) } else { x.add(y) };
+    if invalid {
+        cpu.set_fpu_flag(FpuFlags::IE, true);
     }
     cpu.fpu_set(dst, x);
 }
@@ -49,13 +48,17 @@ pub fn addsub_value(cpu: &mut Cpu, kind: u32, value: f64) {
     let mut val = F80::new();
     val.set_f64(value);
     let mut st0 = cpu.fpu_get(0);
-    match kind {
+    let invalid = match kind {
         ADD_VALUE => st0.add(val),
         SUB_VALUE => st0.sub(val),
         _ => {
-            val.sub(st0);
+            let invalid = val.sub(st0);
             st0 = val;
+            invalid
         }
+    };
+    if invalid {
+        cpu.set_fpu_flag(FpuFlags::IE, true);
     }
     cpu.fpu_set(0, st0);
 }
@@ -106,7 +109,9 @@ pub fn fiadd(cpu: &mut Cpu, instr: &Instruction) {
     }
     let val = cpu.load_int_to_f80(addr, instr.memory_size());
     let mut st0 = cpu.fpu_get(0);
-    st0.add(val);
+    if st0.add(val) {
+        cpu.set_fpu_flag(FpuFlags::IE, true);
+    }
     cpu.fpu_set(0, st0);
 }
 
@@ -121,7 +126,9 @@ pub fn fisub(cpu: &mut Cpu, instr: &Instruction) {
     }
     let val = cpu.load_int_to_f80(addr, instr.memory_size());
     let mut st0 = cpu.fpu_get(0);
-    st0.sub(val);
+    if st0.sub(val) {
+        cpu.set_fpu_flag(FpuFlags::IE, true);
+    }
     cpu.fpu_set(0, st0);
 }
 
@@ -136,7 +143,9 @@ pub fn fisubr(cpu: &mut Cpu, instr: &Instruction) {
     }
     let mut val = cpu.load_int_to_f80(addr, instr.memory_size());
     let st0 = cpu.fpu_get(0);
-    val.sub(st0);
+    if val.sub(st0) {
+        cpu.set_fpu_flag(FpuFlags::IE, true);
+    }
     cpu.fpu_set(0, val);
 }
 
@@ -356,30 +365,17 @@ pub fn fprem_internal(cpu: &mut Cpu, ieee: bool) {
     // we perform a "complete" reduction immediately using the underlying f64 remainder.
     // This is compliant as long as we clear C2 (indicating completion).
 
-    let (remainder, q_bits) = if ieee {
-        // FPREM1: Round to nearest
-        let quotient = st0 / st1;
-        let q_rnd = quotient.round();
-        let rem = st0 - q_rnd * st1;
-        (rem, q_rnd as i64)
-    } else {
-        // FPREM: Round toward zero (Truncate)
-        // Use f64 standard remainder (%) which is truncating
-        let rem = st0 % st1;
-
-        // Calculate quotient bits (Q2, Q1, Q0) without full quotient overflow
-        // Q = trunc(ST0 / ST1). We need Q % 8.
-        // Q % 8 = trunc( (ST0 % (8 * ST1)) / ST1 )
-        let st0_abs = st0.abs();
-        let st1_abs = st1.abs();
-        let st0_mod8 = st0_abs % (8.0 * st1_abs);
-        let q_mod8 = (st0_mod8 / st1_abs).trunc() as i64;
-
-        let sign_diff = st0.is_sign_negative() ^ st1.is_sign_negative();
-        let q_final = if sign_diff { -q_mod8 } else { q_mod8 };
-
-        (rem, q_final)
-    };
+    // From the magnitudes, as the FPU does: `%` is exact, and so is the
+    // quotient's low bits from it; FPREM1 then rounds the quotient to
+    // nearest, even on a tie. The remainder has ST(0)'s sign.
+    let (a, b) = (st0.abs(), st1.abs());
+    let mut rem = a % b;
+    let mut q_bits = ((a % (8.0 * b) - rem) / b).round() as i64;
+    if ieee && (2.0 * rem > b || (2.0 * rem == b && q_bits & 1 != 0)) {
+        rem -= b;
+        q_bits += 1;
+    }
+    let remainder = if st0.is_sign_negative() { -rem } else { rem };
 
     let mut res = F80::new();
     res.set_f64(remainder);
@@ -476,7 +472,7 @@ pub fn fchs(cpu: &mut Cpu) {
     let mut st0 = cpu.fpu_get(0);
     st0.neg();
     cpu.fpu_set(0, st0);
-    cpu.set_fpu_flag(FpuFlags::C1, st0.get_sign());
+    cpu.set_fpu_flag(FpuFlags::C1, false);
 }
 
 // FSCALE: Scale by 2^trunc(ST(1))
@@ -484,6 +480,14 @@ pub fn fchs(cpu: &mut Cpu) {
 pub fn fscale(cpu: &mut Cpu) {
     let mut st0 = cpu.fpu_get(0);
     let st1 = cpu.fpu_get(1).get_f64().trunc();
+    // A normal number whose result is one: only the exponent changes, as
+    // on the FPU, with all 64 bits and the 80 bits' range.
+    let exp = st0.get_exponent() as f64;
+    if st0.is_normal() && st0.get_integer_bit() != 0 && (1.0..=32766.0).contains(&(exp + st1)) {
+        st0.set_exponent((exp + st1) as u16);
+        cpu.fpu_set(0, st0);
+        return;
+    }
     let res = st0.get_f64() * 2.0_f64.powf(st1);
     st0.set_f64(res);
     cpu.fpu_set(0, st0);
@@ -523,19 +527,19 @@ pub fn fsqrt(cpu: &mut Cpu) {
 // ST(0) becomes Exponent (unbiased), Push Significand.
 pub fn fxtract(cpu: &mut Cpu) {
     let val = cpu.fpu_get(0);
-    let f_val = val.get_f64();
 
-    // Handle Zero case
-    if f_val == 0.0 {
-        // ST(0) = -Infinity
-        let mut neg_inf = F80::new();
-        neg_inf.set_f64(f64::NEG_INFINITY);
-        cpu.fpu_set(0, neg_inf);
-
-        // Push 0.0
-        let mut zero = F80::new();
-        zero.set_f64(0.0);
-        cpu.fpu_push(zero);
+    // A zero: the exponent -infinity (ZE), the zero as it was. An
+    // infinity: the exponent +infinity, the infinity. A NaN: both it.
+    if val.is_zero() || val.is_infinite() || val.is_nan() {
+        let mut exponent = val;
+        if val.is_zero() {
+            exponent.set_f64(f64::NEG_INFINITY);
+            cpu.set_fpu_flag(FpuFlags::ZE, true);
+        } else if val.is_infinite() {
+            exponent.set_f64(f64::INFINITY);
+        }
+        cpu.fpu_set(0, exponent);
+        cpu.fpu_push(val);
         return;
     }
 
@@ -561,13 +565,28 @@ pub fn f2xm1(cpu: &mut Cpu) {
 
 // FYL2X: y * log2(x)
 // ST(1) = ST(1) * log2(ST(0)); Pop ST(0)
+/// A NaN goes through (x's first); x < 0, 0 * infinity and infinity * 0
+/// are invalid, the real indefinite with IE; x = ±0 with y not 0 is the
+/// infinity of y's other sign, with ZE.
 pub fn fyl2x(cpu: &mut Cpu) {
-    let x = cpu.fpu_get(0).get_f64();
-    let mut y = cpu.fpu_get(1);
-    if x > 0.0 {
-        y.set_f64(y.get_f64() * x.log2());
+    let (x80, mut y) = (cpu.fpu_get(0), cpu.fpu_get(1));
+    let (x, yf) = (x80.get_f64(), y.get_f64());
+    if x80.is_nan() {
+        y = x80;
+        y.set(y.get() | 1 << 62);
+    } else if y.is_nan() {
+        y.set(y.get() | 1 << 62);
     } else {
-        y.set_QNaN();
+        let result = yf * x.log2();
+        if x < 0.0 || result.is_nan() {
+            y.set_real_indefinite();
+            cpu.set_fpu_flag(FpuFlags::IE, true);
+        } else {
+            if x == 0.0 {
+                cpu.set_fpu_flag(FpuFlags::ZE, true);
+            }
+            y.set_f64(result);
+        }
     }
     cpu.fpu_set(1, y);
     cpu.fpu_pop();
@@ -577,7 +596,8 @@ pub fn fyl2x(cpu: &mut Cpu) {
 pub fn fyl2xp1(cpu: &mut Cpu) {
     let x = cpu.fpu_get(0).get_f64();
     let mut y = cpu.fpu_get(1);
-    y.set_f64(y.get_f64() * (x + 1.0).log2());
+    // (ln_1p keeps the small x the instruction is for.)
+    y.set_f64(y.get_f64() * x.ln_1p() * std::f64::consts::LOG2_E);
     cpu.fpu_set(1, y);
     cpu.fpu_pop();
 }

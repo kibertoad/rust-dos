@@ -501,6 +501,132 @@ fn setcc_sees_the_flags_wherever_they_are() {
 }
 
 #[test]
+fn cmovcc_sees_the_flags_wherever_they_are() {
+    let (mut a, mut b) = twins(|rig| {
+        rig.cpu.model = rust_dos::cpu::CpuModel::PentiumII;
+        with_timer(rig, |a| {
+            // Every condition, on flags in the register and in the CPU
+            // (after a handler), from a register or memory into a dword
+            // or a word register, summed into EBP.
+            a.mov(eax, ecx)?;
+            a.imul_3(eax, eax, 0x9E37_79B1u32 as i32)?;
+            a.mov(ebx, ecx)?;
+            a.shl(ebx, 20)?;
+            a.mov(dword_ptr(DATA), eax)?;
+            macro_rules! cmov {
+                ($m:ident, $k:expr) => {
+                    match $k % 4 {
+                        0 => a.$m(edx, ebx)?,
+                        1 => a.$m(edx, dword_ptr(DATA))?,
+                        2 => a.$m(dx, bx)?,
+                        _ => a.$m(dx, word_ptr(DATA + 2))?,
+                    }
+                };
+            }
+            for k in 0..16u32 {
+                if k % 4 == 0 {
+                    a.cmp(eax, ebx)?;
+                } else if k % 4 == 2 {
+                    a.sub(ebx, eax)?;
+                    a.pushfd()?;
+                    a.popfd()?;
+                }
+                a.mov(edx, ebp)?;
+                match k {
+                    0 => cmov!(cmovo, k),
+                    1 => cmov!(cmovno, k),
+                    2 => cmov!(cmovb, k),
+                    3 => cmov!(cmovae, k),
+                    4 => cmov!(cmove, k),
+                    5 => cmov!(cmovne, k),
+                    6 => cmov!(cmovbe, k),
+                    7 => cmov!(cmova, k),
+                    8 => cmov!(cmovs, k),
+                    9 => cmov!(cmovns, k),
+                    10 => cmov!(cmovp, k),
+                    11 => cmov!(cmovnp, k),
+                    12 => cmov!(cmovl, k),
+                    13 => cmov!(cmovge, k),
+                    14 => cmov!(cmovle, k),
+                    _ => cmov!(cmovg, k),
+                }
+                a.add(ebp, edx)?;
+                a.rol(ebp, 3)?;
+            }
+            Ok(())
+        });
+    });
+    run_both(&mut a, &mut b);
+}
+
+#[test]
+fn cmovcc_runs_in_translated_code() {
+    let (mut a, mut b) = twins(|rig| {
+        rig.cpu.model = rust_dos::cpu::CpuModel::PentiumII;
+        rig.write32(DATA, 0x1234_5678);
+        rig.load(CODE, &asm32(CODE, |a| {
+            let mut again = a.create_label();
+            a.mov(ecx, 100u32)?;
+            a.xor(ebx, ebx)?;
+            a.set_label(&mut again)?;
+            a.mov(eax, ecx)?;
+            a.test(ecx, 1)?;
+            a.cmovz(eax, dword_ptr(DATA))?;
+            a.cmovnz(bx, ax)?;
+            a.add(ebx, eax)?;
+            a.dec(ecx)?;
+            a.jnz(again)?;
+            a.hlt()
+        }));
+    });
+    let stats = run_both(&mut a, &mut b);
+    if AVAILABLE && cfg!(target_arch = "x86_64") {
+        assert_eq!(untranslated(&stats), 0, "handlers ran them: {:?}", stats);
+    }
+}
+
+#[test]
+fn cmovcc_reads_its_memory_operand_where_it_doesnt_move() {
+    let (mut a, mut b) = twins(|rig| {
+        rig.cpu.model = rust_dos::cpu::CpuModel::PentiumII;
+        rig.record(GP);
+        // A data segment of 256 bytes at 40000h.
+        rig.set_gdt(FREE, seg_desc(0x40000, 0xFF, DATA_R0, 0x4));
+        rig.load(CODE, &asm32(CODE, |a| {
+            a.mov(ax, FREE as u32)?;
+            a.mov(fs, ax)?;
+            a.jmp(CODE as u64 + 0x100)
+        }));
+        rig.load(CODE + 0x100, &asm32(CODE + 0x100, |a| {
+            a.xor(eax, eax)?;
+            a.mov(ebx, 1u32)?;
+            a.cmovnz(ecx, dword_ptr(0xFE).fs())?;
+            a.mov(ebx, 2u32)?;
+            a.hlt()
+        }));
+    });
+    run_both(&mut a, &mut b);
+    assert_eq!((b.recorded().0, b.cpu.ebx()), (GP as u32, 1));
+}
+
+#[test]
+fn cmovcc_before_the_p6_faults_in_its_block() {
+    let (mut a, mut b) = twins(|rig| {
+        rig.cpu.model = rust_dos::cpu::CpuModel::Pentium;
+        rig.record(UD);
+        rig.load(CODE, &asm32(CODE, |a| {
+            a.mov(ebx, 1u32)?;
+            a.cmove(eax, ecx)?;
+            a.mov(ebx, 2u32)?;
+            a.hlt()
+        }));
+    });
+    run_both(&mut a, &mut b);
+    let (vector, stack) = b.recorded();
+    assert_eq!((vector, stack[0], b.cpu.ebx()), (UD as u32, CODE + 5, 1));
+}
+
+#[test]
 fn shifts_by_cl_and_of_memory_are_the_interpreters() {
     let (mut a, mut b) = twins(|rig| {
         with_timer(rig, |a| {
@@ -2789,6 +2915,197 @@ fn a_block_starts_in_the_tail_of_rams_last_page() {
     assert_eq!(b.cpu.edx(), a.cpu.edx());
 }
 
+/// How `across_a_page_boundary` runs its loop.
+#[derive(Clone, Copy, Default)]
+struct Across {
+    /// Paging on, the page at 31000h mapped to `next`; else at 31000h.
+    paging: bool,
+    next: u32,
+    /// The physical page the loop maps 31000h to after 500 times around,
+    /// with other bytes there for the ADD's immediate.
+    remap: Option<u32>,
+    /// Whether the loop's first instruction writes the low byte of ECX
+    /// into the ADD's last byte, in the next page.
+    poke: bool,
+}
+
+/// A loop 1000 times around, whose `ADD EBX, 04030201h` starts at 30FFDh
+/// and ends in the next page, where the loop goes on. Returns the
+/// recompiler's counts, EBX, and how many instructions the interpreter ran
+/// on the recompiler's rig.
+fn across_a_page_boundary(how: Across) -> (DynStats, u32, u64) {
+    let (dir, table) = (0x80000u32, 0x81000u32);
+    let (mut a, mut b) = twins(|rig| {
+        rig.write32(dir, table | 3);
+        for i in 0..1024u32 {
+            rig.write32(table + 4 * i, (i << 12) | 3);
+        }
+        rig.write32(table + 0x31 * 4, how.next | 3);
+        let body = asm32(0x30FF0, |a| {
+            let mut top = a.create_label();
+            let mut done = a.create_label();
+            a.set_label(&mut top)?;
+            if how.poke {
+                a.mov(byte_ptr(0x31002u64), cl)?;
+            } else {
+                a.mov(eax, 0x1111_1111u32)?;
+                a.nop()?;
+            }
+            a.add(esi, 2)?;
+            a.add(edi, 3)?;
+            a.inc(edx)?;
+            a.add(ebx, 0x0403_0201u32)?;
+            // 31003h, in the next page.
+            a.dec(ecx)?;
+            a.jz(done)?;
+            if let Some(remap) = how.remap {
+                a.cmp(ecx, 500u32)?;
+                a.jne(top)?;
+                a.mov(dword_ptr(table as u64 + 0x31 * 4), remap | 3)?;
+                a.invlpg(ptr(0x31000u64))?;
+            }
+            a.jmp(top)?;
+            a.set_label(&mut done)?;
+            a.jmp(CODE as u64 + 0x100)
+        });
+        let add = &body[13..16];
+        assert_eq!(add, &[0x81, 0xC3, 0x01], "the ADD starts 3 bytes before the page's end");
+        rig.load(0x30FF0, &body[..16]);
+        rig.load(if how.paging { how.next } else { 0x31000 }, &body[16..]);
+        if let Some(remap) = how.remap {
+            let mut there = body[16..].to_vec();
+            there[..3].copy_from_slice(&[0x12, 0x13, 0x14]);
+            rig.load(remap, &there);
+        }
+        let code = asm32(CODE, |a| {
+            if how.paging {
+                a.mov(eax, dir)?;
+                a.mov(cr3, eax)?;
+                a.mov(eax, cr0)?;
+                a.or(eax, 0x8000_0000u32)?;
+                a.mov(cr0, eax)?;
+            }
+            a.mov(ecx, 1000u32)?;
+            a.jmp(0x30FF0u64)
+        });
+        rig.load(CODE, &code);
+        rig.load(CODE + 0x100, &asm32(CODE + 0x100, |a| a.hlt()));
+    });
+    let stats = run_both(&mut a, &mut b);
+    assert_eq!(b.cpu.edx(), 1000);
+    let interpreted = b.cpu.executed - b.cpu.dynrec.counts().executed;
+    (stats, b.cpu.ebx(), interpreted)
+}
+
+#[test]
+fn an_instruction_into_the_next_page_runs_translated() {
+    // Without paging, and with paging the next page after this one in RAM
+    // and elsewhere.
+    for how in [
+        Across { next: 0x31000, ..Across::default() },
+        Across { paging: true, next: 0x31000, ..Across::default() },
+        Across { paging: true, next: 0x35000, ..Across::default() },
+    ] {
+        let (stats, total, interpreted) = across_a_page_boundary(how);
+        assert_eq!(total, 0x0403_0201u32.wrapping_mul(1000));
+        if TAIL_STARTS {
+            assert!(interpreted < 100, "the interpreter ran {interpreted} instructions: {stats:?}");
+            assert!(stats.runs < 100, "the loop went through the execution loop: {:?}", stats);
+        }
+    }
+}
+
+#[test]
+fn an_instruction_into_the_next_page_follows_its_remapping() {
+    let how = Across { paging: true, next: 0x35000, remap: Some(0x36000), ..Across::default() };
+    let (stats, total, interpreted) = across_a_page_boundary(how);
+    let sum = 0x0403_0201u32.wrapping_mul(500).wrapping_add(0x1413_1201u32.wrapping_mul(500));
+    assert_eq!(total, sum, "the ADD's last bytes came from the page mapped there");
+    if TAIL_STARTS {
+        assert!(interpreted < 100, "the interpreter ran {interpreted} instructions: {stats:?}");
+    }
+}
+
+#[test]
+fn a_store_into_the_next_pages_bytes_of_an_instruction_is_seen() {
+    // The loop writes the ADD's last byte, in the next page, from the
+    // block the ADD is in.
+    let sum = (1..=1000u32).fold(0u32, |sum, n| sum.wrapping_add(0x0003_0201 | (n & 0xFF) << 24));
+    let poke = Across { poke: true, ..Across::default() };
+    for how in [Across { next: 0x31000, ..poke }, Across { paging: true, next: 0x35000, ..poke }] {
+        let (stats, total, _) = across_a_page_boundary(how);
+        assert_eq!(total, sum);
+        // Once its bytes there are watched, the block stops before the ADD
+        // instead of being translated again for every store.
+        assert!(stats.blocks < 100, "translated again and again: {stats:?}");
+    }
+}
+
+#[test]
+fn an_instruction_into_a_next_page_made_not_present_faults_on_it() {
+    // A loop whose ADD runs on from 30FFDh into page 31000h, mapped to
+    // 35000h. After 500 times around, the loop marks 31000h not present
+    // (in the ADD's block, before it): the ADD's fetch then faults, with
+    // CR2 on the next page, EIP on the ADD, and EBX as the 500th ADD left
+    // it.
+    let (dir, table) = (0x80000u32, 0x81000u32);
+    let pte = table + 0x31 * 4;
+    let before = |a: &mut CodeAssembler| {
+        let mut on = a.create_label();
+        a.cmp(ecx, 500u32)?;
+        a.jne(on)?;
+        a.mov(dword_ptr(pte as u64), 0u32)?;
+        a.invlpg(ptr(0x31000u64))?;
+        a.set_label(&mut on)?;
+        a.inc(edx)
+    };
+    let top = 0x30FFD - asm32(0x30F00, before).len() as u32;
+    let (mut a, mut b) = twins(|rig| {
+        rig.write32(dir, table | 3);
+        for i in 0..1024u32 {
+            rig.write32(table + 4 * i, (i << 12) | 3);
+        }
+        rig.write32(pte, 0x35000 | 3);
+        rig.record(PF);
+        let body = asm32(top, |a| {
+            before(a)?;
+            a.add(ebx, 0x0403_0201u32)?;
+            a.dec(ecx)?;
+            a.jmp(top as u64)
+        });
+        let add = (0x30FFD - top) as usize;
+        assert_eq!(&body[add..add + 3], &[0x81, 0xC3, 0x01]);
+        rig.load(top, &body[..add + 3]);
+        rig.load(0x35000, &body[add + 3..]);
+        rig.load(
+            CODE,
+            &asm32(CODE, |a| {
+                a.mov(eax, dir)?;
+                a.mov(cr3, eax)?;
+                a.mov(eax, cr0)?;
+                a.or(eax, 0x8000_0000u32)?;
+                a.mov(cr0, eax)?;
+                a.mov(ecx, 1000u32)?;
+                a.jmp(top as u64)
+            }),
+        );
+    });
+    run_both(&mut a, &mut b);
+    let (vector, stack) = b.recorded();
+    // A fetch at level 0 from a page not present: error code 0.
+    assert_eq!((vector, stack[0], stack[1]), (PF as u32, 0, 0x30FFD));
+    assert_eq!(b.cpu.cr2, 0x31000);
+    assert_eq!(b.cpu.edx(), 501);
+    assert_eq!(b.cpu.ebx(), 0x0403_0201u32.wrapping_mul(500));
+    if TAIL_STARTS {
+        let interpreted = b.cpu.executed - b.cpu.dynrec.counts().executed;
+        assert!(
+            interpreted < 100,
+            "the interpreter ran {interpreted} instructions"
+        );
+    }
+}
+
 #[test]
 fn a_segment_load_that_changes_which_segments_are_flat_goes_on_in_its_block() {
     let (mut a, mut b) = twins(|rig| {
@@ -3180,6 +3497,22 @@ fn fpu_loads_stores_and_products_run_as_their_handlers() {
 }
 
 #[test]
+fn fpu_stores_into_empty_registers_make_them_valid_on_both_cores() {
+    let (_, b, _) = fpu_loop(|a| {
+        a.fld(dword_ptr(esi))?;
+        // FST ST(2) and FSTP ST(1) into empty registers, then both read.
+        a.fst(st2)?;
+        a.fstp(st1)?;
+        a.fadd_2(st0, st1)?;
+        a.fstp(dword_ptr(edi))?;
+        a.fstp(dword_ptr(edi + 4))?;
+        a.fnstsw(ax)?;
+        a.add(ebx, eax)
+    });
+    assert_ne!(b.read32(DATA + 0x10000 + 4), 0xFFC0_0000);
+}
+
+#[test]
 fn fpu_quotients_sums_and_comparisons_run_as_their_handlers() {
     let (_, b, _) = fpu_loop(|a| {
         a.fnclex()?;
@@ -3263,6 +3596,17 @@ fn fpu_integer_operands_run_as_their_handlers() {
         a.fiadd(word_ptr(esi + 8))?;
         a.fisub(dword_ptr(esi + 8))?;
         a.fisubr(word_ptr(esi + 8))?;
+        // Quotients, by 0 too.
+        a.fld(dword_ptr(esi))?;
+        a.fidiv(dword_ptr(esi + 8))?;
+        a.fst(dword_ptr(edi + 28))?;
+        a.fidivr(word_ptr(esi + 8))?;
+        a.fst(dword_ptr(edi + 32))?;
+        a.fidiv(word_ptr(esi + 8))?;
+        a.fidivr(dword_ptr(esi + 8))?;
+        a.fstp(dword_ptr(edi + 36))?;
+        a.fnstsw(ax)?;
+        a.add(ebx, eax)?;
         a.fstp(dword_ptr(edi + 20))?;
         a.fstp(dword_ptr(edi + 24))
     });
@@ -3271,6 +3615,43 @@ fn fpu_integer_operands_run_as_their_handlers() {
         assert!(stats.native + 20 > stats.instructions, "handlers ran them: {:?}", stats);
     }
 }
+
+#[test]
+fn fpu_square_roots_run_as_their_handlers() {
+    let (_, b, stats) = fpu_loop(|a| {
+        // Of every kind of single and its negation, and of the integers:
+        // FXAM sets C1 for a negative ST(0), FSQRT clears it but for a
+        // negative one.
+        a.fld(dword_ptr(esi))?;
+        a.fxam()?;
+        a.fsqrt()?;
+        a.fnstsw(ax)?;
+        a.add(ebx, eax)?;
+        a.fst(dword_ptr(edi))?;
+        a.fld(dword_ptr(esi + 4))?;
+        a.fchs()?;
+        a.fsqrt()?;
+        a.fstp(qword_ptr(edi + 8))?;
+        a.fild(dword_ptr(esi + 8))?;
+        a.fsqrt()?;
+        a.fmul_2(st0, st1)?;
+        a.fstp(dword_ptr(edi + 16))?;
+        a.fnstsw(ax)?;
+        a.add(ebx, eax)?;
+        a.fstp(dword_ptr(edi + 20))
+    });
+    assert_ne!(b.cpu.ebx(), 0);
+    if AVAILABLE && cfg!(target_arch = "x86_64") {
+        // FXAM alone runs as its handler, as in a loop of it alone.
+        let (_, _, fxam) = fpu_loop(|a| {
+            a.fld(dword_ptr(esi))?;
+            a.fxam()?;
+            a.fstp(st0)
+        });
+        assert_eq!(untranslated(&stats), untranslated(&fxam), "handlers ran them: {:?}", stats);
+    }
+}
+
 /// FCOM, FNSTSW AX, SAHF and a branch on the flags, as MSVC compiles a
 /// float compare, with OF set or clear before the SAHF (it stays), and a
 /// FILD of a qword: of `fpu_loop`'s second single and integer, or with
@@ -3343,6 +3724,50 @@ const EXTENDED: [(u16, u64); 14] = [
     (0x3FFF, 0x4000_0000_0000_0000), // an unnormal
     (0xC005, 0xA5A5_A5A5_A5A5_A5A5), // -41.29...
 ];
+
+#[test]
+fn fpu_square_roots_of_80_bit_values_run_as_their_handlers() {
+    // The root of the register's double, on both cores; the handler's
+    // where that is 0 though the 80 bits aren't (a denormal, a value
+    // below a double's normals), or the value is negative.
+    let (input, output) = (DATA, DATA + 0x8000);
+    let n = EXTENDED.len() as u32;
+    let (mut a, mut b) = twins(|rig| {
+        for (k, (se, man)) in EXTENDED.iter().enumerate() {
+            let at = input + 16 * k as u32;
+            rig.write32(at, *man as u32);
+            rig.write32(at + 4, (man >> 32) as u32);
+            rig.write32(at + 8, *se as u32);
+        }
+        rig.load(CODE, &asm32(CODE, |a| {
+            let mut again = a.create_label();
+            a.fninit()?;
+            a.mov(esi, input)?;
+            a.mov(edi, output)?;
+            a.xor(ebx, ebx)?;
+            a.mov(ecx, n)?;
+            a.set_label(&mut again)?;
+            a.fld(tword_ptr(esi))?;
+            a.fsqrt()?;
+            a.fstp(tword_ptr(edi))?;
+            a.fld(tword_ptr(esi))?;
+            a.fchs()?;
+            a.fsqrt()?;
+            a.fstp(tword_ptr(edi + 10))?;
+            a.fnstsw(ax)?;
+            a.add(ebx, eax)?;
+            a.add(esi, 16)?;
+            a.add(edi, 20)?;
+            a.dec(ecx)?;
+            a.jnz(again)?;
+            a.hlt()
+        }));
+    });
+    run_both(&mut a, &mut b);
+    // The root of 1 and a bit is 1.
+    let one = (b.read32(output), b.read32(output + 4), b.read32(output + 8) & 0xFFFF);
+    assert_eq!(one, (0, 0x8000_0000, 0x3FFF));
+}
 
 #[test]
 fn fpu_sums_of_80_bit_values_run_as_their_handlers() {

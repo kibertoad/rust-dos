@@ -586,8 +586,8 @@ fn fpu_addsub(ops: &mut Asm) {
 /// Operand `fpu_addsub` has in R`man`D (a physical register, or 8 for the
 /// double in XMM15) into `hi` (sign << 15 | exponent, of RAX or RDX) and
 /// R`man` (R8 or R9), as `FpuRegs::get` and `F80::set_f64` make its 80
-/// bits; to `slow` for an empty register or a double that is an infinity
-/// or a NaN. RCX is changed.
+/// bits; to `slow` for an empty register or an infinity or a NaN. RCX is
+/// changed.
 fn f80_operand(ops: &mut Asm, hi: u8, man: u8, slow: DynamicLabel) {
     let (value, stale, loaded, zero) =
         (ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label());
@@ -603,6 +603,11 @@ fn f80_operand(ops: &mut Asm, hi: u8, man: u8, slow: DynamicLabel) {
         ; shl Rd(hi), 4
         ; mov Rq(man), QWORD [rbx + Rq(hi) + FPU_X80]
         ; movzx Rd(hi), WORD [rbx + Rq(hi) + FPU_X80 + 8]
+        // An infinity or a NaN (exponent 7FFF) for `F80::add_special`.
+        ; mov ecx, Rd(hi)
+        ; not ecx
+        ; test ecx, 0x7FFF
+        ; jz =>slow
         ; jmp =>loaded
         ; =>stale
         ; mov rcx, QWORD [rbx + Rq(man) * 8 + FPU_F64]
@@ -919,7 +924,8 @@ pub struct Code {
 /// read the time from it; the count of executed instructions is only
 /// brought up to date where the code returns.
 /// Blocks go on into the last 15 bytes of their page (see
-/// `BlockData::in_tail`), with paging checking the TLB holds the next page.
+/// `BlockData::in_tail`), with paging checking the TLB holds the next page,
+/// and their last instruction may run on into it (`BlockData::crosses`).
 pub const TAIL: bool = true;
 /// It has the operations of segment loads, port I/O and STI.
 pub const SYSTEM: bool = true;
@@ -1158,6 +1164,10 @@ impl Gen<'_> {
         for chunk in data.chunk_first + 1..=data.chunk_last {
             dynasm!(self.ops ; .arch x64 ; add eax, DWORD [rcx + (chunk * 4) as i32]);
         }
+        if data.next_len != 0 {
+            let chunk = data.next >> crate::bus::GEN_SHIFT;
+            dynasm!(self.ops ; .arch x64 ; add eax, DWORD [rcx + (chunk * 4) as i32]);
+        }
         dynasm!(self.ops
             ; .arch x64
             ; cmp eax, DWORD [rdx + DATA_GEN_SUM]
@@ -1212,28 +1222,59 @@ impl Gen<'_> {
     /// interpreter's fetch looks that up, and may walk the page tables for
     /// it, for such an instruction. Where the TLB holds it, the lookup
     /// changes nothing.
+    ///
+    /// An instruction that runs on into the next page (`BlockData::crosses`)
+    /// also leaves where the TLB maps that page elsewhere than its bytes
+    /// were read from, or where an instruction before it in the block may
+    /// have written to the chunk of its bytes there: the stores' check
+    /// (`rest`) covers only the block's own page.
     fn check_next_page(&mut self) {
         let data = self.data;
-        if !data.in_tail(self.ix) || self.env.bits & super::ENV_PAGING == 0 {
+        let paging = self.env.bits & super::ENV_PAGING != 0;
+        let crosses = data.crosses(self.ix);
+        let written = crosses && data.writes[..self.ix].contains(&true);
+        if !data.in_tail(self.ix) || !paging && !written {
             return;
         }
         let at = self.fault_exit(EXIT_NEXT_PAGE);
-        let set = if self.env.bits & super::ENV_USER != 0 { layout::TLB_SET as i32 } else { 0 };
-        let entry = set * TLB_ENTRY + layout::TLB_READ_TAG as i32;
-        dynasm!(self.ops
-            ; .arch x64
-            ; mov eax, DWORD [rbx + seg_field(Seg::CS, layout::SEG_BASE)]
-            ; add eax, data.eips[self.ix] as i32
-            ; or eax, 0xFFF
-            ; inc eax
-            ; shr eax, 12
-            ; mov edx, eax
-            ; and edx, (layout::TLB_SET - 1) as i32
-            ; shl edx, TLB_ENTRY_SHIFT
-            ; inc eax
-            ; cmp eax, DWORD [rbx + rdx + TLB + entry]
-            ; jne =>at
-        );
+        if paging {
+            let set = if self.env.bits & super::ENV_USER != 0 { layout::TLB_SET as i32 } else { 0 };
+            let entry = set * TLB_ENTRY;
+            let tag = entry + layout::TLB_READ_TAG as i32;
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov eax, DWORD [rbx + seg_field(Seg::CS, layout::SEG_BASE)]
+                ; add eax, data.eips[self.ix] as i32
+                ; or eax, 0xFFF
+                ; inc eax
+                ; shr eax, 12
+                ; mov edx, eax
+                ; and edx, (layout::TLB_SET - 1) as i32
+                ; shl edx, TLB_ENTRY_SHIFT
+                ; inc eax
+                ; cmp eax, DWORD [rbx + rdx + TLB + tag]
+                ; jne =>at
+            );
+            if crosses {
+                let phys = entry + layout::TLB_PHYS as i32;
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; cmp DWORD [rbx + rdx + TLB + phys], data.next as i32
+                    ; jne =>at
+                );
+            }
+        }
+        if written {
+            let (data_ptr, chunk) = (self.data_ptr, (data.next >> crate::bus::GEN_SHIFT) as i32);
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, QWORD [r12 + CTX_PAGE_GEN]
+                ; mov eax, DWORD [rax + chunk * 4]
+                ; mov rdx, QWORD data_ptr
+                ; cmp eax, DWORD [rdx + DATA_NEXT_GEN]
+                ; jne =>at
+            );
+        }
     }
 
     /// Run instruction `ix` through its handler.
@@ -1800,6 +1841,14 @@ impl Gen<'_> {
                 }
                 dynasm!(self.ops ; .arch x64 ; movzx Rd(t), Rb(t));
             }
+            Uop::CondMove { t, src, cc } => {
+                let (t, src) = (r(t), r(src));
+                if self.test_condition(cc, self.dirty) {
+                    dynasm!(self.ops ; .arch x64 ; cmovnz Rd(t), Rd(src));
+                } else {
+                    dynasm!(self.ops ; .arch x64 ; cmovz Rd(t), Rd(src));
+                }
+            }
             Uop::Flag { mask, set } => {
                 // DF is always in the CPU, the arithmetic flags in EBP
                 // once the code has changed them.
@@ -2118,7 +2167,12 @@ impl Gen<'_> {
                     self.fpu_known = self.fpu_known << 1 | 1;
                 }
                 match dst {
-                    Some(dst) => dynasm!(self.ops ; .arch x64 ; lea edx, [rax + dst as i32] ; and edx, 7),
+                    Some(dst) => dynasm!(self.ops
+                        ; .arch x64
+                        ; lea edx, [rax + dst as i32]
+                        ; and edx, 7
+                        ; mov BYTE [rbx + rdx + FPU_TAGS], FPU_VALID
+                    ),
                     None => dynasm!(self.ops
                         ; .arch x64
                         ; lea edx, [rax - 1]
@@ -2275,6 +2329,27 @@ impl Gen<'_> {
                 dynasm!(self.ops ; .arch x64 ; addsub_done:);
             }
             Uop::FChs => self.fpu_op(1 << 13, None),
+            Uop::FSqrt => {
+                const C1: i16 = 0x200;
+                // The root inline where the double is above 0, else (a
+                // zero, a negative value or a NaN) the handler's.
+                self.fpu_phys(RAX, 0);
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; movsd xmm2, QWORD [rbx + rax * 8 + FPU_F64]
+                    ; xorpd xmm3, xmm3
+                    ; ucomisd xmm2, xmm3
+                    ; jbe >fsqrt_other
+                    ; sqrtsd xmm2, xmm2
+                    ; movsd QWORD [rbx + rax * 8 + FPU_F64], xmm2
+                    ; mov BYTE [rbx + rax + FPU_STALE], 1
+                    ; and WORD [rbx + FPU_FLAGS], !C1
+                    ; jmp >fsqrt_done
+                    ; fsqrt_other:
+                );
+                self.fpu_op(4 << 13, None);
+                dynasm!(self.ops ; .arch x64 ; fsqrt_done:);
+            }
             Uop::FLoad80 { m } => self.fpu_op(2 << 13, Some(m)),
             Uop::FAddValue { kind, x } => {
                 use crate::instructions::fpu::arithmetic::{ADD_VALUE, SUB_VALUE};
@@ -2938,7 +3013,7 @@ impl Gen<'_> {
         dynasm!(self.ops ; .arch x64 ; call QWORD [r12 + CTX_FPU + 32]);
     }
 
-    /// Call `jit_fpu_addsub_st` with `desc` and the handle in `arg`.
+    /// Call `jit_fpu_reg_op` with `desc` and the handle in `arg`.
     fn fpu_op(&mut self, desc: i32, arg: Option<T>) {
         self.save_for_call();
         if let Some(t) = arg {

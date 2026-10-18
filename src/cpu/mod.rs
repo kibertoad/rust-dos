@@ -488,6 +488,8 @@ pub struct Cpu {
     pub shell_prompt_at: Option<(u8, u8)>,
     /// What EDIT cut or copied, for pasting in this EDIT or the next.
     pub edit_clipboard: Vec<u8>,
+    /// RC while a command line it left to run runs, to come back after.
+    pub rc_resume: Option<crate::rc_command::RcWait>,
     /// How the session started, for a reboot to start it again.
     pub startup: crate::boot::Startup,
     /// Set by a reset of the built-in DOS (`bios::post`) with the state
@@ -771,6 +773,7 @@ impl Cpu {
             shell_wait: None,
             shell_prompt_at: None,
             edit_clipboard: Vec::new(),
+            rc_resume: None,
             startup: crate::boot::Startup::default(),
             reboot: false,
             secondary_shells: Vec::new(),
@@ -1413,6 +1416,19 @@ impl Cpu {
     pub fn fpu_set(&mut self, index: usize, val: F80) {
         let actual_idx = (self.fpu_top + index) & 7;
         self.fpu_stack.set(actual_idx, val);
+    }
+
+    /// Whether ST(i)'s tag is empty.
+    pub fn fpu_is_empty(&self, index: usize) -> bool {
+        self.fpu_tags[(self.fpu_top + index) & 7] == FPU_TAG_EMPTY
+    }
+
+    /// Set ST(i) and mark it valid, as FST ST(i) and FXCH do to a
+    /// register that may be empty.
+    pub fn fpu_set_valid(&mut self, index: usize, val: F80) {
+        let actual_idx = (self.fpu_top + index) & 7;
+        self.fpu_stack.set(actual_idx, val);
+        self.fpu_tags[actual_idx] = FPU_TAG_VALID;
     }
 
     /// Set ST(i) to a double: `fpu_set` of an `F80` set to it.

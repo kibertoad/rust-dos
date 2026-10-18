@@ -251,8 +251,8 @@ fn fpu_addsub(ops: &mut Asm) {
 
 /// Operand W`idx` of `fpu_addsub` (a physical register, or 8 for D16) into
 /// W`hi` (sign << 15 | exponent) and X`man`, as `FpuRegs::get` and
-/// `F80::set_f64` make its 80 bits; to `slow` for an empty register or a
-/// double that is an infinity or a NaN. X6 and X7 are changed.
+/// `F80::set_f64` make its 80 bits; to `slow` for an empty register or an
+/// infinity or a NaN. X6 and X7 are changed.
 fn f80_operand(ops: &mut Asm, idx: u8, hi: u8, man: u8, slow: DynamicLabel) {
     let (value, stale, loaded, zero) =
         (ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label(), ops.new_dynamic_label());
@@ -268,6 +268,10 @@ fn f80_operand(ops: &mut Asm, idx: u8, hi: u8, man: u8, slow: DynamicLabel) {
         ; add x6, x11, X(idx), lsl 4
         ; ldr X(man), [x6]
         ; ldrh W(hi), [x6, 8]
+        // An infinity or a NaN (exponent 7FFF) for `F80::add_special`.
+        ; mvn w6, W(hi)
+        ; tst w6, 0x7FFF
+        ; b.eq =>slow
         ; b =>loaded
         ; =>stale
         ; ldr x7, [x12, X(idx), lsl 3]
@@ -957,7 +961,7 @@ impl Gen<'_> {
         );
     }
 
-    /// Call `jit_fpu_addsub_st` with `desc` and the handle in `arg`.
+    /// Call `jit_fpu_reg_op` with `desc` and the handle in `arg`.
     fn fpu_op(&mut self, desc: u32, arg: Option<T>) {
         if let Some(t) = arg {
             dynasm!(self.ops ; .arch aarch64 ; mov w3, W(r(t)));
@@ -1828,6 +1832,14 @@ impl Gen<'_> {
                     dynasm!(self.ops ; .arch aarch64 ; cset W(r(t)), eq);
                 }
             }
+            Uop::CondMove { t, src, cc } => {
+                let (t, src) = (r(t), r(src));
+                if self.test_condition(cc, self.dirty) {
+                    dynasm!(self.ops ; .arch aarch64 ; csel W(t), W(src), W(t), ne);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; csel W(t), W(src), W(t), eq);
+                }
+            }
             Uop::Flag { mask, set } => {
                 // DF is always in the CPU, the arithmetic flags in W28 once
                 // the code has changed them.
@@ -2163,7 +2175,10 @@ impl Gen<'_> {
                 self.field(Access::Ldr64, 0, layout::fpu::TOP);
                 dynasm!(self.ops ; .arch aarch64 ; add w1, w0, src as u32 ; and w1, w1, 7);
                 match dst {
-                    Some(dst) => dynasm!(self.ops ; .arch aarch64 ; add w3, w0, dst as u32 ; and w3, w3, 7),
+                    Some(dst) => {
+                        dynasm!(self.ops ; .arch aarch64 ; add w3, w0, dst as u32 ; and w3, w3, 7);
+                        self.fpu_tag(3, FPU_VALID);
+                    }
                     None => {
                         self.fpu_known = self.fpu_known << 1 | 1;
                         dynasm!(self.ops ; .arch aarch64 ; sub w3, w0, 1 ; and w3, w3, 7);
@@ -2312,6 +2327,34 @@ impl Gen<'_> {
                 dynasm!(self.ops ; .arch aarch64 ; addsub_done:);
             }
             Uop::FChs => self.fpu_op(1 << 13, None),
+            Uop::FSqrt => {
+                const C1: u32 = 0x200;
+                // The root inline where the double is above 0, else (a
+                // zero, a negative value or a NaN, which compares
+                // unordered) the handler's.
+                self.fpu_phys(1, 0);
+                self.cpu_addr(2, layout::fpu::F64);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr d16, [x2, x1, lsl 3]
+                    ; fcmp d16, 0.0
+                    ; b.le >fsqrt_other
+                    ; fsqrt d16, d16
+                );
+                self.fpu_store(1, 16);
+                self.cpu_addr(2, layout::fpu::FLAGS);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldrh w4, [x2]
+                    ; movz w5, C1
+                    ; bic w4, w4, w5
+                    ; strh w4, [x2]
+                    ; b >fsqrt_done
+                    ; fsqrt_other:
+                );
+                self.fpu_op(4 << 13, None);
+                dynasm!(self.ops ; .arch aarch64 ; fsqrt_done:);
+            }
             Uop::FLoad80 { m } => self.fpu_op(2 << 13, Some(m)),
             Uop::FAddValue { kind, x } => {
                 use crate::instructions::fpu::arithmetic::{ADD_VALUE, SUB_VALUE};
