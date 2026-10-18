@@ -18,6 +18,9 @@
 use super::s3d::{S3d, Target};
 use super::streams::Streams;
 
+#[path = "virge/rows.rs"]
+mod rows;
+
 /// One of the three 2D register groups. The registers with the same
 /// mnemonic are one register at three addresses (databook 19.1), so all
 /// three groups take them; each keeps its own CMD_SET, whose command
@@ -443,6 +446,9 @@ impl Virge {
         if g.rect_width == 0 || g.rect_height == 0 {
             return false;
         }
+        if rows::copy(g, vram) {
+            return true;
+        }
         let (rx, dx, ex) = if cmd & (1 << 25) == 0 {
             let ex = g.rect_dst_x as i32 - (g.rect_width as i32 - 1);
             (u32::MAX, g.rect_dst_x, ex.max(0) as u32)
@@ -775,6 +781,11 @@ fn draw_rect(g: &mut Group, vram: &mut [u8]) {
     }
     let rop = crate::rasterop::ternary(g.rop());
     let transparent = g.command_set & 0x200 != 0;
+    if rows::fill(g, vram, [bex, enx, bey, eny]) {
+        g.rect_dst_x = enx.wrapping_add(1);
+        g.rect_dst_y = eny.wrapping_add(1);
+        return;
+    }
     for y in bey..=eny {
         let mut rb = (g.mono_pat >> (8 * ((y.wrapping_sub(g.rect_dst_y)) & 7))) as u8;
         if bex != g.rect_dst_x {
