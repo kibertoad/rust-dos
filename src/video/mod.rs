@@ -706,12 +706,18 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
     let span = spans(pan).max(spans(split_pan));
     let mut key = [0u8; 1 + 16 * 3 + 7 * 4];
     key[0] = b'P';
-    for (&(r, g, b), out) in colors.iter().zip(key[1..49].as_chunks_mut::<3>().0) {
-        *out = [r, g, b];
-    }
-    for (value, out) in [width, rows, canvas_w, canvas_h, pan, split_pan, split.min(rows)]
-        .into_iter()
-        .zip(key[49..].as_chunks_mut::<4>().0)
+    key[1..49].copy_from_slice(colors.map(|(r, g, b)| [r, g, b]).as_flattened());
+    for (value, out) in [
+        width,
+        rows,
+        canvas_w,
+        canvas_h,
+        pan,
+        split_pan,
+        split.min(rows),
+    ]
+    .into_iter()
+    .zip(key[49..].as_chunks_mut::<4>().0)
     {
         *out = (value as u32).to_le_bytes();
     }
@@ -1083,7 +1089,8 @@ fn render_cga_composite(
 ) {
     let width = SCREEN_WIDTH as usize;
     // The two CGA callers supply at most five mode/colour bytes.
-    let mut key = [0u8; 13];
+    debug_assert!(colors.len() <= 5);
+    let mut key = [0u8; 4 + 5 + 4];
     let id = decoder.id();
     key[..4].copy_from_slice(&[b'C', border, id[0], id[1]]);
     key[4..4 + colors.len()].copy_from_slice(colors);

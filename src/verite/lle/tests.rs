@@ -363,6 +363,27 @@ fn five_pair_draws_use_all_ten_values_and_align_register_groups() {
 }
 
 #[test]
+fn a_parameterized_draw_from_the_fifo_pops_the_values_before_the_deltas() {
+    let (mut core, mut memory, _) = machine(&[HALT], 0);
+    sixteen_bit(&mut core);
+    core.pe.dst_mode = 0xC;
+    core.pe.dst_fmt = 0xC;
+    core.pe.drawctl = 6; // pair1: X, R
+    // S2 and S1 both at the FIFO's group: SWFIFO, then FIFO.
+    let words = [
+        (1u32 << 16).swap_bytes(),
+        10 << 16,
+        (2u32 << 16).swap_bytes(),
+        20 << 16,
+    ];
+    core.in_fifo.extend(words);
+    core.pe.cnt = 1;
+    core.draw_param(0xF0, 192, 32, 32, &mut memory);
+    assert_eq!((core.reg[192], core.reg[193]), (3 << 16, 30 << 16));
+    assert!(core.in_fifo.is_empty());
+}
+
+#[test]
 fn textures_are_sampled_through_the_masks() {
     let (mut core, mut memory, _) = machine(&[HALT], 0);
     sixteen_bit(&mut core);
