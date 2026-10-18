@@ -195,31 +195,9 @@ pub enum Effect {
 
 /// ROP3: bit (P*4 + S*2 + D) of `rop` is the result for those pattern,
 /// source and destination bits.
+#[cfg(test)]
 fn mix(src: u32, pat: u32, dst: u32, rop: u8) -> u32 {
-    match rop {
-        0x00 => 0,
-        0x55 => !dst,
-        0x5A => dst ^ pat,
-        0x66 => dst ^ src,
-        0x88 => dst & src,
-        0xAA => dst,
-        0xCC => src,
-        0xEE => dst | src,
-        0xF0 => pat,
-        0xFF => 0xFFFF_FFFF,
-        _ => {
-            let mut r = 0;
-            for bit in 0..8 {
-                if rop & (1 << bit) != 0 {
-                    let p = if bit & 4 != 0 { pat } else { !pat };
-                    let s = if bit & 2 != 0 { src } else { !src };
-                    let d = if bit & 1 != 0 { dst } else { !dst };
-                    r |= p & s & d;
-                }
-            }
-            r
-        }
-    }
+    crate::rasterop::ternary(rop)(dst, src, pat)
 }
 
 impl Virge {
@@ -480,6 +458,7 @@ impl Virge {
         let sxa = g.rect_src_x.wrapping_sub(g.rect_dst_x);
         let sya = g.rect_src_y.wrapping_sub(g.rect_dst_y);
         let mono = cmd & 0x100 != 0;
+        let rop = crate::rasterop::ternary(g.rop());
         let (mut y, mut sy) = (dy, dy.wrapping_add(sya));
         let mut guard = 0u32;
         loop {
@@ -488,7 +467,7 @@ impl Virge {
                 let src = read_src(g, vram, sx, sy);
                 let dst = read_dst(g, vram, x, y);
                 let pat = if mono { self.pat_pixel_mono(x, y) } else { self.pat_pixel(x, y) };
-                draw_clipped(g, vram, x, y, mix(src, pat, dst, g.rop()));
+                draw_clipped(g, vram, x, y, rop(dst, src, pat));
                 guard += 1;
                 if x == ex || guard > 1 << 22 {
                     break;
@@ -530,7 +509,7 @@ impl Virge {
         let g = self.groups[BITBLT].clone();
         let cmd = g.command_set;
         let (mut x, mut y) = (g.rect_dst_x, g.rect_dst_y);
-        let rop = g.rop();
+        let rop = crate::rasterop::ternary(g.rop());
         let mono_pattern = cmd & 0x100 != 0;
         let transparent = cmd & 0x200 != 0;
         if cmd & 0x40 != 0 {
@@ -546,7 +525,7 @@ impl Virge {
                             let src = if set { g.src_fg } else { g.src_bg };
                             let dst = read_dst(&g, vram, x, y);
                             let pat = if mono_pattern { self.pat_pixel_mono(x, y) } else { self.pat_pixel(x, y) };
-                            draw_clipped(&g, vram, x, y, mix(src, pat, dst, rop));
+                            draw_clipped(&g, vram, x, y, rop(dst, src, pat));
                         }
                         self.transfer.src_drem -= 1;
                     }
@@ -584,7 +563,7 @@ impl Virge {
                     if !transparent || src != g.src_fg & bmask {
                         let dst = read_dst(&g, vram, x, y);
                         let pat = if mono_pattern { self.pat_pixel_mono(x, y) } else { self.pat_pixel(x, y) };
-                        draw_clipped(&g, vram, x, y, mix(src, pat, dst, rop));
+                        draw_clipped(&g, vram, x, y, rop(dst, src, pat));
                     }
                     self.transfer.src_drem -= 1;
                 }
@@ -794,7 +773,7 @@ fn draw_rect(g: &mut Group, vram: &mut [u8]) {
         enx = enx.min(g.right_clip);
         eny = eny.min(g.bottom_clip);
     }
-    let rop = g.rop();
+    let rop = crate::rasterop::ternary(g.rop());
     let transparent = g.command_set & 0x200 != 0;
     for y in bey..=eny {
         let mut rb = (g.mono_pat >> (8 * ((y.wrapping_sub(g.rect_dst_y)) & 7))) as u8;
@@ -806,7 +785,7 @@ fn draw_rect(g: &mut Group, vram: &mut [u8]) {
             if set || !transparent {
                 let src = if set { g.mono_pat_fg } else { g.mono_pat_bg };
                 let dst = read_dst(g, vram, x, y);
-                draw(g, vram, x, y, mix(src, g.mono_pat_fg, dst, rop));
+                draw(g, vram, x, y, rop(dst, src, g.mono_pat_fg));
             }
             rb = rb.rotate_left(1);
         }
@@ -824,11 +803,11 @@ fn draw_line(g: &Group, vram: &mut [u8]) {
     let mut xf = g.lindrawstartx;
     let xdelta = g.lindrawxdelta;
     let (mut xend, mut xstart) = (g.lindrawend1, g.lindrawend0);
-    let rop = g.rop();
+    let rop = crate::rasterop::ternary(g.rop());
     let mut plot = |x: i32, y: i32| {
         let (x, y) = (x as u32, y as u32);
         let dst = read_dst(g, vram, x, y);
-        draw_clipped(g, vram, x, y, mix(0, g.mono_pat_fg, dst, rop));
+        draw_clipped(g, vram, x, y, rop(dst, 0, g.mono_pat_fg));
     };
     let mut x = xstart;
     if ycount <= 1 {
@@ -903,7 +882,7 @@ fn draw_poly(g: &mut Group, vram: &mut [u8]) {
     }
     let mut ycount = (g.polyycount & 0x7FF) as i32;
     let mut y = g.polyystart & 0x7FF;
-    let rop = g.rop();
+    let rop = crate::rasterop::ternary(g.rop());
     while ycount > 0 {
         let (mut x, mut xend) = (g.polyledge >> 20, g.polyredge >> 20);
         if x > xend {
@@ -912,7 +891,7 @@ fn draw_poly(g: &mut Group, vram: &mut [u8]) {
         xend = xend.min(x + 4095);
         for x in x.max(0)..=xend {
             let dst = read_dst(g, vram, x as u32, y);
-            draw_clipped(g, vram, x as u32, y, mix(0, g.mono_pat_fg, dst, rop));
+            draw_clipped(g, vram, x as u32, y, rop(dst, 0, g.mono_pat_fg));
         }
         g.polyledge = g.polyledge.wrapping_add(g.polyldx);
         g.polyredge = g.polyredge.wrapping_add(g.polyrdx);

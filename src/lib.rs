@@ -119,6 +119,7 @@ pub mod verite;
 pub mod version_check;
 pub mod vfx1;
 pub mod vhd;
+mod rasterop;
 pub mod video;
 pub mod voodoo;
 pub mod vr;
