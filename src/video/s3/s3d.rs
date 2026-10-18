@@ -344,12 +344,30 @@ impl<'a, 'b> Context<'a, 'b> {
         self.t.vram.get((addr & self.memmask) as usize).copied().unwrap_or(0) as u32
     }
 
+    #[inline]
+    fn packed<const N: usize>(&self, addr: u32) -> u32 {
+        let start = (addr & self.memmask) as usize;
+        // The physical memory fits within the rounded address mask. A
+        // whole slice therefore cannot cross that mask's wrap boundary.
+        if let Some(bytes) = self.t.vram.get(start..).and_then(|v| v.first_chunk::<N>()) {
+            let mut value = [0; 4];
+            value[..N].copy_from_slice(bytes);
+            return u32::from_le_bytes(value);
+        }
+        // Preserve wrapping and zero-filled holes byte by byte.
+        let mut value = 0;
+        for i in 0..N {
+            value |= self.byte(addr.wrapping_add(i as u32)) << (i * 8);
+        }
+        value
+    }
+
     fn word(&self, addr: u32) -> u32 {
-        self.byte(addr) | self.byte(addr.wrapping_add(1)) << 8
+        self.packed::<2>(addr)
     }
 
     fn dword(&self, addr: u32) -> u32 {
-        self.word(addr) | self.word(addr.wrapping_add(2)) << 16
+        self.packed::<4>(addr)
     }
 
     /// Blend4: the 4-bit texel interpolates from COLOR0 (0) to COLOR1 (15).
@@ -532,6 +550,15 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 
     fn write_word(&mut self, addr: u32, value: u16) {
+        if let Some(bytes) = self
+            .t
+            .vram
+            .get_mut(addr as usize..)
+            .and_then(|v| v.first_chunk_mut::<2>())
+        {
+            *bytes = value.to_le_bytes();
+            return;
+        }
         let len = self.t.vram.len();
         for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
             if let Some(b) = self.t.vram.get_mut((addr as usize + i) % len) {
@@ -620,7 +647,13 @@ impl<'a, 'b> Context<'a, 'b> {
                 let d = if self.bypp == 2 {
                     rgb1555(self.word(dest), 0)
                 } else {
-                    Color { b: self.byte(dest) as i32, g: self.byte(dest + 1) as i32, r: self.byte(dest + 2) as i32, a: 0 }
+                    let value = self.packed::<3>(dest);
+                    Color {
+                        b: (value & 0xFF) as i32,
+                        g: (value >> 8 & 0xFF) as i32,
+                        r: (value >> 16 & 0xFF) as i32,
+                        a: 0,
+                    }
                 };
                 col.r = (col.r * a + d.r * (255 - a)) / 255;
                 col.g = (col.g * a + d.g * (255 - a)) / 255;
@@ -1137,3 +1170,7 @@ mod tests {
         assert_eq!((o.r, o.g, o.b), (0x40, 0x40, 0x40));
     }
 }
+
+#[cfg(test)]
+#[path = "s3d_memory_tests.rs"]
+mod memory_tests;
