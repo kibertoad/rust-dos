@@ -1,18 +1,26 @@
+use super::lod::Lod;
 use super::*;
+
+/// The level of detail as `sample` worked it out for every pixel before
+/// it was cached.
+fn original_lod(control: u32, largest: u32, steps: [i64; 4]) -> f64 {
+    let mut lod = 0.0;
+    if control & (1 << 24) == 0 && largest > 0 {
+        let scale = (1u64 << largest) as f64 / 1024.0 / 65536.0;
+        let rho = steps
+            .iter()
+            .map(|&d| (d as f64).abs() * scale)
+            .fold(0.0, f64::max);
+        if rho > 1.0 {
+            lod = rho.log2();
+        }
+    }
+    lod
+}
 
 fn reference(pipe: &Pipe, texels: &TexelSource<'_, '_>) -> Argb {
     let largest = pipe.tex_size >> 4 & 0xF;
-    let scale = (1u64 << largest) as f64 / 1024.0 / 65536.0;
-    let rho = pipe
-        .lod_steps()
-        .iter()
-        .map(|&d| (d as f64).abs() * scale)
-        .fold(0.0, f64::max);
-    let lod = if pipe.cntl & (1 << 24) == 0 && rho > 1.0 {
-        rho.log2()
-    } else {
-        0.0
-    };
+    let lod = original_lod(pipe.cntl, largest, pipe.lod_steps());
     let (s, t) = (pipe.span_s.0, pipe.span_t.0);
     if lod <= 0.0 {
         return pipe.sample_level(texels, largest, s, t, pipe.cntl & (1 << 25) != 0);
@@ -93,4 +101,51 @@ fn affine_and_curved_spans_keep_their_original_mip_samples() {
             }
         }
     }
+}
+
+#[test]
+fn cached_lod_matches_the_original_floating_point_operations() {
+    let mut random = 0x123456789ABCDEFu64;
+    for largest in 0..16 {
+        for disabled in [false, true] {
+            for curvature in [0, 1] {
+                let control = 2 << 6 | if disabled { 1 << 24 } else { 0 };
+                let mut cache = Lod::new(control, largest << 4, [curvature; 4]);
+                for i in 0..4096 {
+                    let steps = std::array::from_fn(|j| {
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        match i {
+                            0 => 0,
+                            1 => i64::MIN,
+                            2 => i64::MAX,
+                            3..=66 => (1i64 << (i - 3)).wrapping_add(j as i64).wrapping_sub(2),
+                            _ => random as i64,
+                        }
+                    });
+                    // An affine span works its level out at the start; a
+                    // curved one at every pixel, whatever the start saw.
+                    if curvature == 0 {
+                        cache.start(steps);
+                    }
+                    assert_eq!(
+                        cache.value(steps).to_bits(),
+                        original_lod(control, largest, steps).to_bits(),
+                        "largest={largest}, disabled={disabled}, curvature={curvature}, \
+                         steps={steps:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn affine_spans_refresh_at_their_start_and_ignore_smaller_derivatives() {
+    let mut cache = Lod::new(2 << 6, 10 << 4, [0; 4]);
+    cache.start([1 << 20, 0, 0, 0]);
+    assert_eq!(cache.value([1 << 20, 1 << 19, 10, 100]), 4.0);
+    cache.start([-(1 << 22), 0, 0, 0]);
+    assert_eq!(cache.value([0; 4]), 6.0);
 }
