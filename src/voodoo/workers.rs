@@ -1,10 +1,10 @@
 //! Drawing on worker threads. The card's commands (triangles and
 //! fastfills) are jobs, each with everything it draws with; batches of
-//! them go to every worker, and each worker draws the screen rows it owns
-//! (row `r` belongs to worker `r % N`). Every worker takes the jobs in
-//! order, so a pixel sees the triangles in the order the card got them,
-//! and the picture is the same for any number of workers: save states,
-//! rewind and tests stay deterministic.
+//! them are binned by the screen rows each worker owns. Triangle edges
+//! and the raster pipeline are prepared once; workers sample only their
+//! rows. Every worker takes the jobs in order, so a pixel sees them in the
+//! order the card got them. The picture is the same for any number of
+//! workers: save states, rewind and tests stay deterministic.
 //!
 //! Frame buffer writes that come while jobs are queued are jobs too, so
 //! they land in their turn without waiting. The emulator waits for the
@@ -18,6 +18,13 @@ use super::raster::{self, RasterState, Stats, TriParams};
 use super::setup::render_triangle;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
+
+#[path = "workers/bins.rs"]
+mod bins;
+
+#[cfg(test)]
+#[path = "workers/bin_tests.rs"]
+mod bin_tests;
 
 /// Something drawn. Not boxed: a job is made for every triangle.
 #[allow(clippy::large_enum_variant)]
@@ -89,7 +96,7 @@ impl Job {
 
 struct Queue {
     /// Batches not yet drawn by every worker, with their numbers.
-    batches: VecDeque<(u64, Arc<Vec<Job>>)>,
+    batches: VecDeque<(u64, Arc<bins::Batch>)>,
     /// The number of the last batch given out.
     last: u64,
     /// The last batch each worker finished.
@@ -148,7 +155,7 @@ impl Pool {
                 let shared = shared.clone();
                 std::thread::Builder::new()
                     .name(format!("3dfx {}", k))
-                    .spawn(move || worker(shared, k, workers))
+                    .spawn(move || worker(shared, k))
                     .expect("starting a 3dfx render thread")
             })
             .collect();
@@ -199,10 +206,11 @@ impl Pool {
         if batch.is_empty() {
             return;
         }
+        let batch = Arc::new(bins::Batch::new(batch, self.workers));
         let mut queue = self.shared.queue.lock().unwrap();
         queue.last += 1;
         let number = queue.last;
-        queue.batches.push_back((number, Arc::new(batch)));
+        queue.batches.push_back((number, batch));
         self.shared.work.notify_all();
     }
 
@@ -271,7 +279,7 @@ impl Drop for Pool {
 
 /// Worker `k` of `n`: draw its rows of every batch, in order.
 #[cfg(not(target_arch = "wasm32"))]
-fn worker(shared: Arc<Shared>, k: usize, n: usize) {
+fn worker(shared: Arc<Shared>, k: usize) {
     let mut queue = shared.queue.lock().unwrap();
     loop {
         if queue.shutdown {
@@ -286,9 +294,7 @@ fn worker(shared: Arc<Shared>, k: usize, n: usize) {
         let mut stats = Stats::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut stipple = 0;
-            for job in batch.iter() {
-                job.run(|row| row >= 0 && row as usize % n == k, &mut stipple, &mut stats);
-            }
+            batch.run(k, &mut stipple, &mut stats);
         }));
         queue = shared.queue.lock().unwrap();
         if let Err(panic) = result {

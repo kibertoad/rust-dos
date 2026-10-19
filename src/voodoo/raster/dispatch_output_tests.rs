@@ -77,7 +77,7 @@ fn worker_dispatch_matches_whole_triangle_drawing() {
         let reference = two_unit_state(regs);
         let framebuffer = reference.fb.clone();
         let p = parameters();
-        let verts = [(0.0, 0.0), (0.0, 16.0), (32.0, 16.0)];
+        let verts = [(0.0, 0.0), (0.0, 144.0), (32.0, 144.0)];
         let mut expected = Stats::default();
         Job::Triangle {
             st: reference,

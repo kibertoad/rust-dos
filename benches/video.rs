@@ -9,6 +9,8 @@
 mod common;
 #[path = "video/voodoo_dispatch.rs"]
 mod voodoo_dispatch;
+#[path = "video/voodoo_workers.rs"]
+mod voodoo_workers;
 #[path = "video/voodoo.rs"]
 mod voodoo;
 
@@ -300,6 +302,7 @@ criterion_group!(
     cga_composite,
     voodoo::pipelines,
     voodoo::frames,
-    voodoo_dispatch::lookup
+    voodoo_dispatch::lookup,
+    voodoo_workers::scheduling
 );
 criterion_main!(benches);

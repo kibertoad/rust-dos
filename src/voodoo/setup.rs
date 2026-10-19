@@ -10,12 +10,8 @@ use super::workers::Job;
 use super::regs::*;
 use super::{NONE, Voodoo};
 
-/// X to whole pixels: pixel centres at .5 belong to the pixel on the left
-/// (`round_coordinate`).
-fn round_coordinate(value: f32) -> i32 {
-    let result = (value as f64).floor() as i32;
-    result + (value - result as f32 > 0.5) as i32
-}
+pub(crate) mod scan;
+pub(crate) use scan::render_triangle;
 
 impl Voodoo {
     /// The word offset of a colour buffer, or None for a reserved choice.
@@ -269,73 +265,5 @@ impl Voodoo {
         if rgb {
             self.mark_drawn(dest);
         }
-    }
-}
-
-/// Scan-convert a triangle: for each scanline whose centre it covers, the
-/// pixels from its left to its right edge, sampled at the pixel centres
-/// (`poly_render_triangle`).
-pub(crate) fn render_triangle(verts: [(f32, f32); 3], mut scanline: impl FnMut(i32, i32, i32)) {
-    // Sorted by Y as the original sorts, keeping equal Ys in their order.
-    let (mut v1, mut v2, mut v3) = (verts[0], verts[1], verts[2]);
-    if v2.1 < v1.1 {
-        std::mem::swap(&mut v1, &mut v2);
-    }
-    if v3.1 < v2.1 {
-        std::mem::swap(&mut v2, &mut v3);
-        if v2.1 < v1.1 {
-            std::mem::swap(&mut v1, &mut v2);
-        }
-    }
-
-    let v1y = round_coordinate(v1.1);
-    let v3y = round_coordinate(v3.1);
-    if v3y - v1y <= 0 {
-        return;
-    }
-    let slope = |a: (f32, f32), b: (f32, f32)| if b.1 == a.1 { 0.0f32 } else { (b.0 - a.0) / (b.1 - a.1) };
-    let dxdy_v1v2 = slope(v1, v2);
-    let dxdy_v1v3 = slope(v1, v3);
-    let dxdy_v2v3 = slope(v2, v3);
-    // Scanlines beyond the 10-bit Y range can't be anywhere on screen.
-    for y in v1y.max(-2048)..v3y.min(4096) {
-        let fully = y as f32 + 0.5;
-        let startx = v1.0 + (fully - v1.1) * dxdy_v1v3;
-        let stopx = if fully < v2.1 { v1.0 + (fully - v1.1) * dxdy_v1v2 } else { v2.0 + (fully - v2.1) * dxdy_v2v3 };
-        let (mut x0, mut x1) = (round_coordinate(startx), round_coordinate(stopx));
-        if x0 > x1 {
-            std::mem::swap(&mut x0, &mut x1);
-        }
-        if x0 >= x1 {
-            (x0, x1) = (0, 0);
-        }
-        scanline(y, x0, x1.min(4096));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn spans(verts: [(f32, f32); 3]) -> Vec<(i32, i32, i32)> {
-        let mut out = Vec::new();
-        render_triangle(verts, |y, x0, x1| out.push((y, x0, x1)));
-        out
-    }
-
-    #[test]
-    fn scan_conversion_samples_pixel_centres() {
-        // A right triangle over a 4x4 square's lower left half.
-        let s = spans([(0.0, 0.0), (0.0, 4.0), (4.0, 4.0)]);
-        assert_eq!(s, vec![(0, 0, 0), (1, 0, 1), (2, 0, 2), (3, 0, 3)]);
-        // Rounding: x.5 goes left.
-        assert_eq!(round_coordinate(2.5), 2);
-        assert_eq!(round_coordinate(2.51), 3);
-        assert_eq!(round_coordinate(-0.5), -1);
-    }
-
-    #[test]
-    fn flat_triangles_draw_nothing() {
-        assert!(spans([(0.0, 1.0), (5.0, 1.0), (9.0, 1.2)]).is_empty());
     }
 }
