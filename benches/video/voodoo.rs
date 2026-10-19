@@ -249,3 +249,39 @@ pub fn frames(c: &mut Criterion) {
     }
     group.finish();
 }
+
+/// Clear the back buffer, then read the front or back buffer through the
+/// guest LFB window. Front reads can leave back-buffer work deferred;
+/// reading the back buffer must finish it. Consume mirror commands each
+/// iteration and finish the last software clear outside the measurement.
+pub fn lfb_reads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("video/voodoo/lfb_read");
+    group.throughput(Throughput::Elements(1));
+    for workers in [0, 4] {
+        for (name, read_buffer) in [("front", 0), ("back", 1)] {
+            let mut v = card(workers, true);
+            write(&mut v, FBZ_MODE, 1 << 9 | 1 << 14);
+            write(&mut v, LFB_MODE, read_buffer << 6);
+            let mut color = 0x0010_2030u32;
+            let mut clear_and_read = || {
+                color = color.wrapping_add(1) & 0x00FF_FFFF;
+                write(&mut v, COLOR1, color);
+                write(&mut v, FASTFILL_CMD, 0);
+                let value = v.read(0x40_0000, Now::default());
+                black_box(v.take_mirror().expect("mirror attached"));
+                value
+            };
+            let value = clear_and_read();
+            if read_buffer == 0 {
+                assert_eq!(value, 0);
+            } else {
+                assert_ne!(value, 0);
+            }
+            group.bench_function(BenchmarkId::new(name, workers), |b| {
+                b.iter(|| black_box(clear_and_read()));
+            });
+            v.flush();
+        }
+    }
+    group.finish();
+}

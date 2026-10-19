@@ -302,6 +302,7 @@ criterion_group!(
     cga_composite,
     voodoo::pipelines,
     voodoo::frames,
+    voodoo::lfb_reads,
     voodoo_dispatch::lookup,
     voodoo_workers::scheduling
 );

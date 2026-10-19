@@ -3,9 +3,10 @@
 //! it: frame buffer reads, the pixel counters, save states, screenshots.
 //! Until one comes, jobs wait here, and a job whose pixels a later
 //! fastfill covers before anything could see them is dropped, so the
-//! frames nobody reads back cost nothing to draw. What is left runs in
-//! order when something reads (`Voodoo::catch_up`), so the memory ends up
-//! as it would have been.
+//! frames nobody reads back cost nothing to draw. An LFB read releases
+//! the prefix that can write its words. Other memory consumers release
+//! everything (`Voodoo::catch_up`). Jobs run in order, so the memory ends
+//! up as it would have been.
 //!
 //! Which job's pixels stay visible is worked out on tiles: each buffer
 //! (colour buffers 0-2, the auxiliary buffer) is 8x8 tiles over the
@@ -59,6 +60,29 @@ impl TileLayout {
 
     fn slot(&self, dest: usize) -> Option<usize> {
         self.bases[..AUX].iter().position(|&b| b == Some(dest))
+    }
+
+    /// Tiles containing raw framebuffer word addresses. Padding and
+    /// memory outside the pictures have no tile; pinned jobs cover them.
+    fn read_tiles(&self, words: [usize; 2]) -> [u64; 4] {
+        let mut tiles = [0; 4];
+        for at in words {
+            for (slot, base) in self.bases.iter().enumerate() {
+                let Some(offset) = base.and_then(|base| at.checked_sub(base)) else {
+                    continue;
+                };
+                let (x, y) = (
+                    offset % self.rowpixels as usize,
+                    offset / self.rowpixels as usize,
+                );
+                if x < self.width as usize && y < self.height as usize {
+                    let tx = x as u64 * u64::from(TILES) / u64::from(self.width);
+                    let ty = y as u64 * u64::from(TILES) / u64::from(self.height);
+                    tiles[slot] |= 1 << (ty * u64::from(TILES) + tx);
+                }
+            }
+        }
+        tiles
     }
 
     /// Tile `k`'s first column (or row) of `size`: pixel `p` is in tile
@@ -299,6 +323,9 @@ pub struct Backlog {
     keep: Vec<bool>,
     /// Jobs pushed since the last pruning.
     since_prune: usize,
+    /// Cached pending writes, so repeated reads of an untouched buffer
+    /// do not walk the queue again. Invalidated whenever jobs change.
+    pending_writes: Option<([u64; 4], bool)>,
     /// Jobs dropped, for the debugger.
     pub pruned: u64,
 }
@@ -316,6 +343,7 @@ impl Backlog {
     /// oldest jobs, when there are too many.
     pub fn push(&mut self, job: Job, access: Access) -> Vec<Job> {
         let kills = access.kills.iter().any(|&k| k != 0);
+        self.pending_writes = None;
         self.jobs.push((job, access));
         self.since_prune += 1;
         // A fill may have made the frames before it invisible; prune
@@ -334,6 +362,7 @@ impl Backlog {
         if let Some((Job::Pixels { words, .. }, last)) = self.jobs.last_mut() {
             words.extend_from_slice(new);
             last.add(&access);
+            self.pending_writes = None;
             return self.overflow();
         }
         self.push(Job::Pixels { fb: fb.clone(), words: new.to_vec() }, access)
@@ -354,6 +383,7 @@ impl Backlog {
     }
 
     fn count_words(&mut self) {
+        self.pending_writes = None;
         self.words = self.jobs.iter().map(|(job, _)| if let Job::Pixels { words, .. } = job { words.len() } else { 0 }).sum();
     }
 
@@ -381,6 +411,53 @@ impl Backlog {
         self.jobs.retain(|_| k.next().unwrap_or(true));
         self.pruned += (before - self.jobs.len()) as u64;
         self.count_words();
+    }
+
+    /// Release only the prefix needed by a framebuffer read. Keeping the
+    /// prefix intact preserves all earlier dependencies and job order.
+    /// Later jobs cannot affect the words read; a pinned job may touch
+    /// any address, so it always has to run before the read.
+    pub fn take_for_read(&mut self, words: [usize; 2]) -> Vec<Job> {
+        if self.jobs.is_empty() {
+            return Vec::new();
+        }
+        if !self.layout.prunable {
+            return self.take();
+        }
+        let tiles = self.layout.read_tiles(words);
+        let jobs = &self.jobs;
+        let (writes, pinned) = *self.pending_writes.get_or_insert_with(|| {
+            let mut writes = [0; 4];
+            let mut pinned = false;
+            for (_, access) in jobs {
+                for (write, mask) in writes.iter_mut().zip(access.writes) {
+                    *write |= mask;
+                }
+                pinned |= access.pinned;
+            }
+            (writes, pinned)
+        });
+        if !pinned
+            && writes
+                .iter()
+                .zip(tiles)
+                .all(|(write, tile)| write & tile == 0)
+        {
+            return Vec::new();
+        }
+        self.prune();
+        let end = self.jobs.iter().rposition(|(_, access)| {
+            access.pinned
+                || access
+                    .writes
+                    .iter()
+                    .zip(tiles)
+                    .any(|(write, tile)| write & tile != 0)
+        });
+        let Some(end) = end else { return Vec::new() };
+        let out = self.jobs.drain(..=end).map(|(job, _)| job).collect();
+        self.count_words();
+        out
     }
 
     /// Everything left, pruned, oldest first.
@@ -500,3 +577,7 @@ mod tests {
         assert_eq!(words(&l, &[aux]), write(AUX, 1 << 7));
     }
 }
+
+#[cfg(test)]
+#[path = "backlog/read_tests.rs"]
+mod read_tests;

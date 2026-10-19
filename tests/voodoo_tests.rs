@@ -1617,3 +1617,62 @@ fn benchmark_lfb_writes() {
         println!("mirror {}: {:?} a frame, {} commands a frame", mirror, per_frame, commands as u32 / frames);
     }
 }
+
+#[test]
+fn lfb_reads_leave_later_unrelated_buffers_deferred() {
+    for workers in [0, 1, 4] {
+        let mut gl = gl_bus(Board::Standard, workers);
+        let mut sw = bus(Board::Standard);
+        init(&mut sw);
+        for bus in [&mut gl, &mut sw] {
+            w(bus, FBZ_MODE, RGB_WRITE | CLIPPING);
+            flat(bus, 255, 0, 0, 255);
+            triangle(bus, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0)]);
+            w(bus, FBZ_MODE, RGB_WRITE | CLIPPING | DRAW_BACK);
+            flat(bus, 0, 255, 0, 255);
+            triangle(bus, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0)]);
+        }
+        let at = BASE + 0x40_0000 + 2048 + 4;
+        assert_eq!(gl.read_32(at), sw.read_32(at));
+        let held = status_of(&gl)["held_jobs"].as_u64().unwrap();
+        assert!(
+            held > 0,
+            "back-buffer triangle was released, workers={workers}"
+        );
+        for x in (4..32).step_by(4) {
+            assert_eq!(gl.read_32(at + x), sw.read_32(at + x));
+            assert_eq!(status_of(&gl)["held_jobs"], held);
+        }
+        w(&mut gl, LFB_MODE, 1 << 6);
+        w(&mut sw, LFB_MODE, 1 << 6);
+        assert_eq!(gl.read_32(at), sw.read_32(at));
+        assert_eq!(status_of(&gl)["held_jobs"], 0);
+        assert_eq!(
+            gl.voodoo.as_ref().unwrap().frame_buffer().to_bytes(),
+            sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+        );
+    }
+}
+
+#[test]
+fn partial_lfb_read_keeps_pending_texture_usage() {
+    let mut gl = gl_bus(Board::Standard, 2);
+    let mut sw = bus(Board::Standard);
+    init(&mut sw);
+    for bus in [&mut gl, &mut sw] {
+        textured_square(bus, 10, false, |_, _| 0xF800);
+        w(bus, FBZ_MODE, RGB_WRITE | CLIPPING | DRAW_BACK);
+        triangle(bus, [(0.0, 0.0), (8.0, 0.0), (0.0, 8.0)]);
+    }
+    let at = BASE + 0x40_0000 + 2048 + 4;
+    assert_eq!(gl.read_32(at), sw.read_32(at));
+    assert!(status_of(&gl)["held_jobs"].as_u64().unwrap() > 0);
+    for bus in [&mut gl, &mut sw] {
+        bus.write_32(BASE + 0x80_0000 + (5 << 17), 0x07E0_07E0);
+    }
+    assert_eq!(status_of(&gl)["held_jobs"], 0);
+    assert_eq!(
+        gl.voodoo.as_ref().unwrap().frame_buffer().to_bytes(),
+        sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+    );
+}
