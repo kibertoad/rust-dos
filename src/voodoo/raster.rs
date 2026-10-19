@@ -18,6 +18,10 @@ use std::sync::Arc;
 #[path = "raster/dispatch.rs"]
 mod dispatch;
 
+#[cfg(all(test, feature = "sdl"))]
+#[path = "raster/scene_profile.rs"]
+pub(super) mod scene_profile;
+
 /// The pixel counters (`stats_block`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
