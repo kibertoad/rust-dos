@@ -294,6 +294,26 @@ impl<'a, 'b> Context<'a, 'b> {
         })
     }
 
+    /// The shading and texture state of triangle command `cmd`; false if
+    /// `cmd` isn't a triangle.
+    fn setup_triangle(&mut self, cmd: u32, tri: &[u32; 0x80]) -> bool {
+        match cmd_command(cmd) {
+            GOURAUD_TRI => {}
+            LIT_TEX_TRI | LIT_TEX_TRI_PERSP => {
+                self.textured = true;
+                self.lit = true;
+            }
+            UNLIT_TEX_TRI | UNLIT_TEX_TRI_PERSP => self.textured = true,
+            _ => return false,
+        }
+        if self.textured {
+            self.tex_blend = cmd_tex_blend(cmd);
+            self.setup_texture(cmd, tri);
+            self.fog = cmd & CMD_FE != 0;
+        }
+        true
+    }
+
     fn setup_texture(&mut self, cmd: u32, tri: &[u32; 0x80]) {
         const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
         let reg = |off: usize| tri[off >> 2];
@@ -602,11 +622,15 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
+    /// One pixel through the pipeline of the databook's figure 15-7, with
+    /// Z test, texturing and pixel depth read from the context.
     fn pixel(&mut self, x: i32, y: i32, at: &Attr) {
         self.pixel_in::<false, false, 0>(x, y, at);
     }
 
-    /// One pixel through the pipeline of the databook's figure 15-7.
+    /// `pixel` with Z test, texturing and pixel depth fixed at compile time
+    /// for the triangle spans. `BYPP` 0 is the dynamic `pixel`: it reads all
+    /// three from the context and ignores `ZTEST` and `TEXTURED`.
     #[inline(always)]
     fn pixel_in<const ZTEST: bool, const TEXTURED: bool, const BYPP: u32>(
         &mut self,
@@ -625,7 +649,8 @@ impl<'a, 'b> Context<'a, 'b> {
         if self.hc && (x < self.clip_l || x > self.clip_r || y < self.clip_t || y > self.clip_b) {
             return;
         }
-        let dest = self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * bypp as u64;
+        let dest =
+            self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * bypp as u64;
         if dest + bypp as u64 > self.memsize as u64 {
             return;
         }
@@ -913,19 +938,8 @@ impl S3d {
         let reg = |off: usize| tri[off >> 2];
         let cmd = reg(0x100);
         let Some(mut c) = Context::new(t, cmd, tri) else { return };
-        match cmd_command(cmd) {
-            GOURAUD_TRI => {}
-            LIT_TEX_TRI | LIT_TEX_TRI_PERSP => {
-                c.textured = true;
-                c.lit = true;
-            }
-            UNLIT_TEX_TRI | UNLIT_TEX_TRI_PERSP => c.textured = true,
-            _ => return,
-        }
-        if c.textured {
-            c.tex_blend = cmd_tex_blend(cmd);
-            c.setup_texture(cmd, tri);
-            c.fog = cmd & CMD_FE != 0;
+        if !c.setup_triangle(cmd, tri) {
+            return;
         }
         let dx = Attr {
             b: lo16s(reg(0x13C)),
