@@ -17,6 +17,7 @@ mod host;
 mod keys;
 mod memmap;
 mod options;
+mod present;
 mod state;
 mod vfs;
 
@@ -127,10 +128,10 @@ impl Callbacks {
     }
 
     /// The picture as it was last frame.
-    pub fn video_dupe(&self) {
+    pub fn video_dupe(&self, width: u32, height: u32) {
         if let Some(video) = self.video {
             // SAFETY: no data asks for the last picture again.
-            unsafe { video(ptr::null(), 0, 0, 0) }
+            unsafe { video(ptr::null(), width, height, width as usize * 4) }
         }
     }
 

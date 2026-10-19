@@ -48,15 +48,6 @@ pub fn display_size(width: u32, height: u32, aspect: AspectRatio) -> (u32, u32) 
     }
 }
 
-/// The rows (of `row_bytes` each) from the first to the last that differ
-/// between two pictures of the same size, if any do.
-fn changed_rows(old: &[u8], new: &[u8], row_bytes: usize) -> Option<std::ops::Range<usize>> {
-    let pairs = || old.chunks_exact(row_bytes).zip(new.chunks_exact(row_bytes));
-    let first = pairs().position(|(a, b)| a != b)?;
-    let last = pairs().rposition(|(a, b)| a != b)?;
-    Some(first..last + 1)
-}
-
 /// A coordinate in logical pixels (`logical` of them across the picture)
 /// as the frame pixel under it (`frame` of them). Positions in the black
 /// bars around the picture fall outside `0..frame`.
@@ -408,7 +399,7 @@ impl<'a> Display<'a> {
         {
             0..frame.height as usize
         } else {
-            match changed_rows(&self.shown, &frame.rgb, row_bytes) {
+            match video::changed_rows(&self.shown, &frame.rgb, row_bytes) {
                 Some(rows) => rows,
                 None => {
                     // The 3D scene is drawn every frame all the same.

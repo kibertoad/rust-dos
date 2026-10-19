@@ -21,6 +21,11 @@ crate-type = ["cdylib", "rlib"]
 rust-dos = { path = "..", default-features = false, features = ["midi", "cdaudio", "chd", "sevenz", "manuals", "voodoo-gl"] }
 # The frontend's OpenGL (src/gl.rs), as rust-dos has it.
 glow = "0.18.0"
+# A hidden context for the opt-in GL presentation regression only.
+sdl2 = { version = "0.38", optional = true }
+
+[features]
+gl-tests = ["dep:sdl2"]
 
 [dev-dependencies]
 # To make a game's zip in the tests.

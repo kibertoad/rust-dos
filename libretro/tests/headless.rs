@@ -32,6 +32,11 @@ struct Frontend {
     height: u32,
     pixels: Vec<u32>,
     audio_frames: usize,
+    can_dupe: bool,
+    duplicates: usize,
+    video_frames: usize,
+    /// Running ahead: frames whose pictures it drops.
+    hidden: bool,
     input: HashMap<(u32, u32, u32, u32), i16>,
     /// The folder `test://` paths are in, for a frontend with a VFS, and
     /// the calls made to it.
@@ -52,6 +57,14 @@ fn with<R>(f: impl FnOnce(&mut Frontend) -> R) -> R {
 unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
     unsafe {
         match cmd {
+            RETRO_ENVIRONMENT_GET_CAN_DUPE => {
+                *(data as *mut bool) = with(|fe| fe.can_dupe);
+                true
+            }
+            RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE => {
+                *(data as *mut i32) = if with(|fe| fe.hidden) { 2 } else { 3 };
+                true
+            }
             RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
                 *(data as *mut *const c_char) = with(|fe| fe.system.as_ptr());
                 true
@@ -139,12 +152,25 @@ unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn video(data: *const c_void, width: u32, height: u32, pitch: usize) {
+    if with(|fe| fe.hidden) {
+        return;
+    }
+    if data.is_null() {
+        with(|fe| {
+            assert!(fe.can_dupe, "frontend did not allow duplicate frames");
+            assert!(!fe.pixels.is_empty(), "first frame cannot be duplicated");
+            assert_eq!((width, height), (fe.width, fe.height));
+            fe.duplicates += 1;
+        });
+        return;
+    }
     assert_eq!(pitch, width as usize * 4);
     let pixels = unsafe { std::slice::from_raw_parts(data as *const u32, (width * height) as usize) };
     with(|fe| {
         fe.width = width;
         fe.height = height;
         fe.pixels = pixels.to_vec();
+        fe.video_frames += 1;
     });
 }
 
@@ -434,6 +460,81 @@ fn map_word(address: usize) -> Option<u16> {
 /// A program that puts BEEFh at offset 200h of its segment, then waits
 /// there for ever.
 const MARKER: &[u8] = &[0xC7, 0x06, 0x00, 0x02, 0xEF, 0xBE, 0xEB, 0xFE];
+
+#[test]
+fn unchanged_frames_are_duplicated_only_when_the_frontend_allows_it() {
+    for can_dupe in [false, true] {
+        with(|fe| *fe = Frontend::default());
+        let dir = scratch(if can_dupe { "dupe" } else { "no_dupe" });
+        start(&dir, &[]);
+        with(|fe| fe.can_dupe = can_dupe);
+        assert!(load(None));
+        run(90);
+        with(|fe| {
+            assert!(fe.video_frames > 0);
+            assert_eq!(fe.video_frames + fe.duplicates, 90);
+            assert_eq!(fe.duplicates > 0, can_dupe);
+        });
+        let before = picture_hash();
+        type_text("VER\r");
+        run(30);
+        assert_ne!(
+            picture_hash(),
+            before,
+            "changed frames still reach the frontend"
+        );
+        stop();
+    }
+}
+
+#[test]
+fn a_frame_after_hidden_ones_is_not_a_duplicate() {
+    with(|fe| *fe = Frontend::default());
+    let dir = scratch("dupe_hidden");
+    start(&dir, &[]);
+    with(|fe| fe.can_dupe = true);
+    assert!(load(None));
+    run(90);
+    let before = picture_hash();
+    // Run-ahead's frames: the core hands over pictures the frontend drops.
+    with(|fe| fe.hidden = true);
+    type_text("VER");
+    with(|fe| fe.hidden = false);
+    let frames = with(|fe| fe.video_frames);
+    run(1);
+    assert_eq!(
+        with(|fe| fe.video_frames),
+        frames + 1,
+        "the picture typed in hidden frames is handed over"
+    );
+    assert_ne!(picture_hash(), before);
+    stop();
+}
+
+#[test]
+fn the_settings_window_leaves_no_trace_when_closed() {
+    with(|fe| *fe = Frontend::default());
+    let dir = scratch("settings_closed");
+    start(&dir, &[]);
+    assert!(load(None));
+    // The cursor blinks every 30 frames: all of this happens between two
+    // blinks, so nothing under the window is drawn again.
+    run(95);
+    let before = picture_hash();
+    let toggle = |value| {
+        for id in [RETRO_DEVICE_ID_JOYPAD_L3, RETRO_DEVICE_ID_JOYPAD_R3] {
+            set_input(0, RETRO_DEVICE_JOYPAD, 0, id, value);
+        }
+        run(2);
+    };
+    toggle(1);
+    assert_ne!(picture_hash(), before, "the settings window is shown");
+    toggle(0);
+    toggle(1);
+    toggle(0);
+    assert_eq!(picture_hash(), before, "the picture under it is back");
+    stop();
+}
 
 #[test]
 fn without_content_it_starts_at_the_prompt() {
