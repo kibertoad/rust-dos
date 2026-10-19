@@ -7,6 +7,8 @@
 //! render, as the main loop does it (`render_screen`, then `clear_dirty`).
 
 mod common;
+#[path = "video/mach64_pipeline.rs"]
+mod mach64_pipeline;
 #[path = "video/mach64_lod.rs"]
 mod mach64_lod;
 #[path = "video/voodoo.rs"]
@@ -300,6 +302,7 @@ criterion_group!(
     cga_composite,
     voodoo::pipelines,
     voodoo::frames,
-    mach64_lod::spans
+    mach64_lod::spans,
+    mach64_pipeline::pipelines
 );
 criterion_main!(benches);
