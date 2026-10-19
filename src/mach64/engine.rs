@@ -17,11 +17,8 @@ use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
 #[cfg(test)]
-#[path = "engine/memory_tests.rs"]
 mod memory_tests;
-#[path = "engine/mix.rs"]
 mod mix;
-#[path = "engine/rows.rs"]
 mod rows;
 use mix::Mix;
 
