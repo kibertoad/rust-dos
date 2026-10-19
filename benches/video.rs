@@ -13,6 +13,8 @@ mod voodoo_dispatch;
 mod voodoo_workers;
 #[path = "video/voodoo.rs"]
 mod voodoo;
+#[path = "video/powervr.rs"]
+mod powervr;
 
 use common::*;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -304,6 +306,7 @@ criterion_group!(
     voodoo::frames,
     voodoo::lfb_reads,
     voodoo_dispatch::lookup,
-    voodoo_workers::scheduling
+    voodoo_workers::scheduling,
+    powervr::frames
 );
 criterion_main!(benches);

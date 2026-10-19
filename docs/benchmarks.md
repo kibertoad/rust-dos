@@ -90,6 +90,20 @@ These cases measure the CPU cost accompanying GL replay, including
 recording and pruning; they need no GL context and do not measure host
 GPU rendering, upload or readback. They do not replace a game benchmark.
 
+## PowerVR scenarios
+
+```sh
+cargo bench --no-default-features --bench video -- video/powervr
+```
+
+The scene is 640x480: 300 flat-shaded 32x32 tiles through the PCX2's
+parameter list, plane processing and TSP. The one-thread and four-thread
+cases use identical input. `reused` retains the renderer, workers, tile
+pixel buffers and scratch between frames; `fresh` constructs and drops a
+renderer each time. These compare host-resource lifetimes within the
+current implementation, not old and new raster algorithms. They exclude
+fixture creation and the bus's output-format conversion and copy-out.
+
 ## Adding benchmarks
 
 One file per subsystem (`benches/video.rs`, `benches/audio.rs`, ...), each
