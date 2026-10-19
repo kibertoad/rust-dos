@@ -11,6 +11,10 @@ mod common;
 mod voodoo_dispatch;
 #[path = "video/voodoo_workers.rs"]
 mod voodoo_workers;
+#[path = "video/mach64_pipeline.rs"]
+mod mach64_pipeline;
+#[path = "video/mach64_lod.rs"]
+mod mach64_lod;
 #[path = "video/voodoo.rs"]
 mod voodoo;
 #[path = "video/powervr.rs"]
@@ -307,6 +311,8 @@ criterion_group!(
     voodoo::lfb_reads,
     voodoo_dispatch::lookup,
     voodoo_workers::scheduling,
-    powervr::frames
+    powervr::frames,
+    mach64_lod::spans,
+    mach64_pipeline::pipelines
 );
 criterion_main!(benches);

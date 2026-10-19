@@ -14,6 +14,11 @@ use super::Mach64;
 use super::engine::{Memory, Size};
 use super::regs::*;
 
+#[path = "tri/lod.rs"]
+mod lod;
+#[path = "tri/pipeline.rs"]
+mod pipeline;
+
 /// An 8-bit colour with alpha, as the pipe works on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Argb {
@@ -244,6 +249,7 @@ impl TexelSource<'_, '_> {
 }
 
 /// The destination's pixel as a colour, for blending.
+#[inline]
 fn unpack(v: u32, format: u32) -> Argb {
     match format {
         3 => Argb {
@@ -288,6 +294,7 @@ const DITHER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15
 /// format's bits after the dither (SCALE_3D_CNTL bit 2) or rounding
 /// (bit 4). 8-bit destinations are RGB 3:3:2, red at most 6 with
 /// RED_DITHER_MAX (bit 14).
+#[inline]
 fn pack(c: Argb, format: u32, x: i32, y: i32, cntl: u32) -> u32 {
     let cut = |v: i32, bits: i32| -> u32 {
         let drop = 8 - bits;
@@ -439,6 +446,8 @@ pub struct Pipe {
     span_s: (i64, i64),
     span_t: (i64, i64),
     span_dy: (i64, i64),
+    lod: lod::Lod,
+    shade: pipeline::Pixel,
     dir: i32,
 }
 
@@ -450,7 +459,7 @@ impl Pipe {
         for (i, offset) in tex_offsets.iter_mut().enumerate() {
             *offset = card.reg(TEX_0_OFF + i) & 0x7F_FFFF;
         }
-        Pipe {
+        let mut pipe = Pipe {
             cntl: card.reg(SCALE_3D_CNTL),
             pix_width: card.reg(DP_PIX_WIDTH),
             tex_size: card.reg(TEX_SIZE_PITCH),
@@ -486,8 +495,17 @@ impl Pipe {
             span_s: (0, 0),
             span_t: (0, 0),
             span_dy: (0, 0),
+            lod: lod::Lod::default(),
+            shade: Self::pixel_mode::<false, false, false, 16>,
             dir: 1,
-        }
+        };
+        pipe.shade = pipe.select_pixel();
+        pipe.lod = lod::Lod::new(
+            pipe.cntl,
+            pipe.tex_size,
+            [pipe.s.dxx, pipe.t.dxx, pipe.s.dxy, pipe.t.dxy],
+        );
+        pipe
     }
 
     /// The leading edge moved a pixel across.
@@ -522,6 +540,7 @@ impl Pipe {
         self.span_s = self.s.across(n, dir);
         self.span_t = self.t.across(n, dir);
         self.span_dy = (self.s.dy + n * self.s.dxy, self.t.dy + n * self.t.dxy);
+        self.lod.start(self.lod_steps());
     }
 
     /// On to the span's next pixel.
@@ -564,6 +583,10 @@ impl Pipe {
         }
     }
 
+    fn lod_steps(&self) -> [i64; 4] {
+        [self.span_s.1, self.span_t.1, self.span_dy.0, self.span_dy.1]
+    }
+
     /// The texture sampled at the pixel: the level of detail from the
     /// largest step of S or T a pixel makes, in texels of the largest
     /// map; the largest map, filtered with BILINEAR_TEX_EN, when it
@@ -572,18 +595,7 @@ impl Pipe {
     /// larger.
     fn sample(&self, texels: &TexelSource) -> Argb {
         let largest = self.tex_size >> 4 & 0xF;
-        let mut lod = 0.0;
-        if self.cntl & 1 << 24 == 0 && largest > 0 {
-            let scale = (1u64 << largest) as f64 / 1024.0 / 65536.0;
-            let steps = [self.span_s.1, self.span_t.1, self.span_dy.0, self.span_dy.1];
-            let rho = steps
-                .iter()
-                .map(|&d| (d as f64).abs() * scale)
-                .fold(0.0, f64::max);
-            if rho > 1.0 {
-                lod = rho.log2();
-            }
-        }
+        let lod = self.lod.value(self.lod_steps());
         let (s, t) = (self.span_s.0, self.span_t.0);
         if lod <= 0.0 {
             return self.sample_level(texels, largest, s, t, self.cntl & 1 << 25 != 0);
@@ -665,11 +677,12 @@ impl Pipe {
     /// Z at the pixel against the Z buffer (Z_CNTL): 16 bits, the integer
     /// part of the interpolator. Returns whether it passes and where the
     /// pixel's Z is, with its new value.
-    fn z_test(&self, mem: &Memory, x: i32, y: i32) -> (bool, u32, u32) {
+    #[inline]
+    fn z_test(&self, mem: &Memory, x: i32, y: i32, enabled: bool) -> (bool, u32, u32) {
         let z = (self.span_z.0 >> 12).clamp(0, 0xFFFF) as u32;
         let pitch = ((self.z_off_pitch >> 22 & 0x3FF) * 8) as i32;
         let at = ((self.z_off_pitch & 0xF_FFFF) << 2).wrapping_add((y * pitch + x) as u32);
-        if self.z_cntl & 1 == 0 {
+        if !enabled {
             return (true, at, z);
         }
         let old = mem.read(at, Size::Word);
@@ -688,6 +701,7 @@ impl Pipe {
 
     /// The pixel at `x`, `y` over `dst`, or None where the pipe leaves it:
     /// failing the Z test, an alpha mask's 0, a keyed texel.
+    #[inline]
     pub fn pixel(
         &self,
         mem: &mut Memory,
@@ -696,7 +710,38 @@ impl Pipe {
         y: i32,
         dst: u32,
     ) -> Option<u32> {
-        let (pass, z_at, z) = self.z_test(mem, x, y);
+        (self.shade)(self, mem, palettes, x, y, dst)
+    }
+
+    fn pixel_mode<
+        const SPECIALIZED: bool,
+        const ZTEST: bool,
+        const TEXTURED: bool,
+        const FORMAT: u32,
+    >(
+        &self,
+        mem: &mut Memory,
+        palettes: &Palettes,
+        x: i32,
+        y: i32,
+        dst: u32,
+    ) -> Option<u32> {
+        let ztest = if SPECIALIZED {
+            ZTEST
+        } else {
+            self.z_cntl & 1 != 0
+        };
+        let textured = if SPECIALIZED {
+            TEXTURED
+        } else {
+            self.cntl >> 6 & 3 == 2
+        };
+        let format = if FORMAT < 16 {
+            FORMAT
+        } else {
+            self.pix_width & 0xF
+        };
+        let (pass, z_at, z) = self.z_test(mem, x, y, ztest);
         if !pass {
             return None;
         }
@@ -704,7 +749,7 @@ impl Pipe {
         let lit = self.interpolated();
         let mut c = lit;
         let mut alpha = lit.a;
-        if cntl >> 6 & 3 == 2 {
+        if textured {
             let texels = TexelSource {
                 mem,
                 palettes,
@@ -789,13 +834,13 @@ impl Pipe {
                     b: fog(0, c.b),
                 };
             }
-            1 => c = blend(c, unpack(dst, self.pix_width & 0xF), alpha, cntl),
+            1 => c = blend(c, unpack(dst, format), alpha, cntl),
             _ => {}
         }
-        if self.z_cntl & 0x101 == 0x101 {
+        if ztest && self.z_cntl & 0x100 != 0 {
             mem.write(z_at, Size::Word, z);
         }
-        Some(pack(c, self.pix_width & 0xF, x, y, cntl))
+        Some(pack(c, format, x, y, cntl))
     }
 }
 
@@ -942,3 +987,15 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "tri/lod_tests.rs"]
+mod lod_tests;
+
+#[cfg(test)]
+#[path = "tri/lod_unit_tests.rs"]
+mod lod_unit_tests;
+
+#[cfg(test)]
+#[path = "tri/pipeline_tests.rs"]
+mod pipeline_tests;
