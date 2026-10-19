@@ -18,6 +18,9 @@
 //! (LeonG-ZA's `verite` branch) names them, for the fields VLIB alone
 //! doesn't.
 
+#[path = "draw/coverage.rs"]
+mod coverage;
+
 /// RRedline's pixel formats (`V_PIXFMT_*`), as the library numbers them.
 pub mod fmt {
     pub const P332: u32 = 1;
@@ -380,6 +383,15 @@ fn argb(colour: u32) -> Rgba {
     [(colour >> 16 & 0xFF) as f32, (colour >> 8 & 0xFF) as f32, (colour & 0xFF) as f32, (colour >> 24) as f32]
 }
 
+#[inline]
+fn wrapped_coordinate(value: i32, last: u32) -> u32 {
+    if last < i32::MAX as u32 && (last + 1).is_power_of_two() {
+        value as u32 & last
+    } else {
+        value.rem_euclid(last as i32 + 1) as u32
+    }
+}
+
 fn mix(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -394,8 +406,8 @@ impl DrawState {
             v = v.clamp(0, self.tex_last_v as i32);
         }
         // Wrapped around the size, which is a mask for powers of two.
-        let u = u.rem_euclid(self.tex_last_u as i32 + 1) as u32;
-        let v = v.rem_euclid(self.tex_last_v as i32 + 1) as u32;
+        let u = wrapped_coordinate(u, self.tex_last_u);
+        let v = wrapped_coordinate(v, self.tex_last_v);
         let line = self.tex_base.wrapping_add(v * self.tex_stride);
         match bits(self.src_format) {
             // The even texel in the low nibble.
@@ -492,6 +504,32 @@ impl DrawState {
         let x1 = (a.x.max(b.x).max(c.x).ceil() as i32).min(right);
         let y0 = (a.y.min(b.y).min(c.y).floor() as i32).max(top);
         let y1 = (a.y.max(b.y).max(c.y).ceil() as i32).min(bottom);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        // Tiny triangles keep the bounding-box loop without edge setup.
+        if x1 - x0 <= 8 {
+            self.triangle_in::<false>(vram, [a, b, c], area, [x0, x1, y0, y1]);
+        } else {
+            self.triangle_in::<true>(vram, [a, b, c], area, [x0, x1, y0, y1]);
+        }
+    }
+
+    #[inline(always)]
+    fn triangle_in<const EDGES: bool>(
+        &self,
+        vram: &mut [u8],
+        vertices: [&Vertex; 3],
+        area: f32,
+        bounds: [i32; 4],
+    ) {
+        let [a, b, c] = vertices;
+        let [x0, x1, y0, y1] = bounds;
+        let mut coverage = if EDGES {
+            coverage::Coverage::new([a, b, c], area, x0..x1, y0)
+        } else {
+            None
+        };
         let textured = self.src_mode != 0;
         let z_on = self.z_mode != 0 || self.z_write;
         // Attributes the vertices lack take the state's defaults.
@@ -506,10 +544,11 @@ impl DrawState {
         let z_of = |v: &Vertex| if v.has_z { v.z } else { z };
         for py in y0..y1 {
             let fy = py as f32 + 0.5;
-            for px in x0..x1 {
+            let span = coverage.as_mut().map_or(x0..x1, coverage::Coverage::next);
+            for px in span {
                 let fx = px as f32 + 0.5;
-                // Barycentric weights, with the top-left rule's ties to
-                // the edges that have area on the inside.
+                // Retain the original barycentric arithmetic and its
+                // inclusive edges at the candidate pixels.
                 let w0 = ((b.x - fx) * (c.y - fy) - (c.x - fx) * (b.y - fy)) / area;
                 let w1 = ((c.x - fx) * (a.y - fy) - (a.x - fx) * (c.y - fy)) / area;
                 let w2 = 1.0 - w0 - w1;
@@ -519,7 +558,11 @@ impl DrawState {
                 let blend3 = |pa: f32, pb: f32, pc: f32| w0 * pa + w1 * pb + w2 * pc;
                 let lerp = |f: &dyn Fn(&Vertex) -> f32| blend3(f(a), f(b), f(c));
                 // Depth: linear across the screen, kept 16.0.
-                let depth = if z_on { lerp(&z_of).clamp(0.0, 65535.0) as u32 } else { 0 };
+                let depth = if z_on {
+                    lerp(&z_of).clamp(0.0, 65535.0) as u32
+                } else {
+                    0
+                };
                 if !self.z_test(vram, px, py, depth) {
                     continue;
                 }
@@ -529,7 +572,10 @@ impl DrawState {
                 if textured {
                     let q = lerp(&|v| v.q);
                     let (u, v) = if q != 0.0 {
-                        (lerp(&|v| v.u * v.q) / q, lerp(&|v| v.v * v.q) / q)
+                        (
+                            lerp(&|v| v.u * v.q) / q,
+                            lerp(&|v| v.v * v.q) / q,
+                        )
                     } else {
                         (lerp(&|v| v.u), lerp(&|v| v.v))
                     };
@@ -973,3 +1019,11 @@ mod tests {
         assert_eq!(s.texel(&vram, 1, 0), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "draw/triangle_reference.rs"]
+mod triangle_reference;
+
+#[cfg(test)]
+#[path = "draw/triangle_tests.rs"]
+mod triangle_tests;

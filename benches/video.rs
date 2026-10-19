@@ -15,6 +15,8 @@ mod voodoo_workers;
 mod mach64_pipeline;
 #[path = "video/mach64_lod.rs"]
 mod mach64_lod;
+#[path = "video/verite.rs"]
+mod verite;
 #[path = "video/voodoo.rs"]
 mod voodoo;
 #[path = "video/powervr.rs"]
@@ -313,6 +315,7 @@ criterion_group!(
     voodoo_workers::scheduling,
     powervr::frames,
     mach64_lod::spans,
-    mach64_pipeline::pipelines
+    mach64_pipeline::pipelines,
+    verite::triangles
 );
 criterion_main!(benches);
