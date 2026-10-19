@@ -152,10 +152,15 @@ impl Engine {
         }
     }
 
+    /// Whether the command writes to video memory (bits 0 and 4).
+    fn writes(&self) -> bool {
+        self.command & 0x11 == 0x11
+    }
+
     /// Draw a pixel as the command allows: when it writes (bits 0 and 4),
     /// inside the scissors, through the write mask.
     fn draw(&self, s: &mut Surface, x: u32, y: u32, value: u32) {
-        if self.command & 0x11 != 0x11 {
+        if !self.writes() {
             return;
         }
         let [left, top, right, bottom] = self.clip.map(|c| c as u32);

@@ -1,14 +1,16 @@
-//! Row operations for plain copies and solid fills. Anything whose mask,
-//! clipping, memory bounds or copy direction needs pixels uses the engine.
+//! Row operations for plain copies and solid fills. Rows are trimmed to
+//! the scissors first, since the engine draws nothing outside them.
+//! Anything whose mask, memory bounds or copy direction needs pixels uses
+//! the engine.
 
 use super::{Engine, Surface};
 use std::ops::Range;
 
 impl Surface<'_> {
-    fn row_range(&self, x: i32, y: i32, count: u32, dx: i32) -> Option<Range<usize>> {
-        let last = x + (count as i32 - 1) * dx;
-        let left = x.min(last);
-        let right = x.max(last);
+    /// The bytes of `count` pixels from `left` rightwards on row `y`, when
+    /// all of them are on that row and in video memory.
+    fn row_range(&self, left: i32, y: i32, count: u32) -> Option<Range<usize>> {
+        let right = left + count as i32 - 1;
         if count == 0 || y < 0 || left < 0 || right as u32 >= self.width {
             return None;
         }
@@ -21,29 +23,24 @@ impl Surface<'_> {
 impl Engine {
     pub(super) fn can_write_rows(&self, surface: &Surface) -> bool {
         let mask = match surface.bytes {
-            1 => 0xFF,
-            2 => 0xFFFF,
-            3 => 0xFF_FFFF,
-            4 => u32::MAX,
+            1..=4 => u32::MAX >> (32 - 8 * surface.bytes),
             _ => return false,
         };
-        self.command & 0x11 == 0x11 && self.write_mask & mask == mask
+        self.writes() && self.write_mask & mask == mask
     }
 
-    fn dest_row(
-        &self,
-        surface: &Surface,
-        x: i32,
-        y: i32,
-        count: u32,
-        dx: i32,
-    ) -> Option<Range<usize>> {
+    /// The part of a row of `count` pixels from `x` in direction `dx`
+    /// that is inside the scissors: its leftmost pixel and its length,
+    /// zero when the scissors leave none of it.
+    fn clip_row(&self, x: i32, y: i32, count: u32, dx: i32) -> (i32, u32) {
         let last = x + (count as i32 - 1) * dx;
         let [left, top, right, bottom] = self.clip.map(i32::from);
-        if x.min(last) < left || x.max(last) > right || y < top || y > bottom {
-            return None;
+        let from = x.min(last).max(left);
+        let to = x.max(last).min(right);
+        if y < top || y > bottom || from > to {
+            return (from, 0);
         }
-        surface.row_range(x, y, count, dx)
+        (from, (to - from + 1) as u32)
     }
 
     pub(super) fn fill_row(
@@ -55,7 +52,11 @@ impl Engine {
         dx: i32,
         value: u32,
     ) -> bool {
-        let Some(row) = self.dest_row(surface, x, y, count, dx) else {
+        let (left, count) = self.clip_row(x, y, count, dx);
+        if count == 0 {
+            return true;
+        }
+        let Some(row) = surface.row_range(left, y, count) else {
             return false;
         };
         let pixel = value.to_le_bytes();
@@ -83,10 +84,16 @@ impl Engine {
         count: u32,
         dx: i32,
     ) -> bool {
-        let Some(source) = surface.row_range(src.0, src.1, count, dx) else {
+        // Source pixels whose destination is outside the scissors are read
+        // but never written, so only the trimmed part matters.
+        let (left, count) = self.clip_row(dest.0, dest.1, count, dx);
+        if count == 0 {
+            return true;
+        }
+        let Some(source) = surface.row_range(left + src.0 - dest.0, src.1, count) else {
             return false;
         };
-        let Some(dest) = self.dest_row(surface, dest.0, dest.1, count, dx) else {
+        let Some(dest) = surface.row_range(left, dest.1, count) else {
             return false;
         };
         let overlaps = source.start < dest.end && dest.start < source.end;
@@ -118,8 +125,8 @@ mod tests {
             for direction in [0, 0x20, 0x80, 0xA0] {
                 for (x, y) in [(0, 0), (2, 2), (14, 4), (18, 2)] {
                     for major in [0, 3, 16] {
-                        for clip in [[0, 0, 0xFFF, 0xFFF], [1, 1, 14, 3]] {
-                            for mask in [u32::MAX, 0x5555_5555] {
+                        for clip in [[0, 0, 0xFFF, 0xFFF], [1, 1, 14, 3], [3, 0, 9, 5]] {
+                            for mask in [u32::MAX, 0x00FF_FFFF, 0x5555_5555] {
                                 for mode in [0x27, 0x25, 0x07, 0x67] {
                                     for write in [0x11, 0x10] {
                                         for omit in [0, 4] {
@@ -193,8 +200,8 @@ mod tests {
             for direction in [0, 0x20, 0x80, 0xA0] {
                 for (sx, sy) in [(2, 2), (6, 2), (14, 4), (0, 0)] {
                     for (tx, ty) in [(3, 2), (1, 2), (2, 3), (2, 1), (12, 4)] {
-                        for clip in [[0, 0, 0xFFF, 0xFFF], [1, 1, 14, 3]] {
-                            for mask in [u32::MAX, 0x5555_5555] {
+                        for clip in [[0, 0, 0xFFF, 0xFFF], [1, 1, 14, 3], [3, 0, 9, 5]] {
+                            for mask in [u32::MAX, 0x00FF_FFFF, 0x5555_5555] {
                                 for select in [0, 3] {
                                     for misc in [0, 0x100, 0x180] {
                                         for mode in [0x67, 0x65, 0x27] {
