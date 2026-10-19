@@ -74,6 +74,10 @@ const TEX_BLEND4_LO: u32 = 4;
 const TEX_BLEND4_HI: u32 = 5;
 const TEX_PAL8: u32 = 6;
 const TEX_YUV: u32 = 7;
+/// Bytes per texel, by texture format.
+const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
+/// The texture format argument that reads `tex_fmt` at run time.
+const TEX_DYNAMIC: u32 = 8;
 
 /// The engine's registers as written, by (offset & 1FCh) / 4 within the 3D
 /// line block (`line`) and the 3D triangle block (`tri`). Everything is
@@ -219,7 +223,6 @@ struct Context<'a, 'b> {
     fog_rgb: (i32, i32, i32),
     sample: fn(&Context<'a, 'b>, &Attr) -> Color,
     tex_fmt: u32,
-    tex_bypp: u32,
     filter: u32,
     max_d: i32,
     wrap: bool,
@@ -279,7 +282,6 @@ impl<'a, 'b> Context<'a, 'b> {
             fog: false,
             sample: Self::sample_texture_in::<TEX_ARGB8888>,
             tex_fmt: 0,
-            tex_bypp: 1,
             filter: 0,
             max_d: 0,
             wrap: false,
@@ -295,7 +297,6 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 
     fn setup_texture(&mut self, cmd: u32, tri: &[u32; 0x80]) {
-        const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
         let reg = |off: usize| tri[off >> 2];
         self.tex_fmt = cmd_tex_fmt(cmd);
         self.sample = match self.tex_fmt {
@@ -308,7 +309,7 @@ impl<'a, 'b> Context<'a, 'b> {
             TEX_PAL8 => Self::sample_texture_in::<TEX_PAL8>,
             _ => Self::sample_texture_in::<TEX_YUV>,
         };
-        self.tex_bypp = TEX_BYTES[self.tex_fmt as usize];
+        let tex_bypp = TEX_BYTES[self.tex_fmt as usize];
         self.filter = cmd_filter(cmd);
         self.max_d = cmd_mip_size(cmd).min(9) as i32;
         self.wrap = cmd & CMD_TWE != 0;
@@ -328,7 +329,7 @@ impl<'a, 'b> Context<'a, 'b> {
         for lv in (0..=9).rev() {
             self.tex_level_base[lv] = base;
             if lv as i32 <= self.max_d {
-                base = base.wrapping_add((1u32 << (2 * lv)) * self.tex_bypp);
+                base = base.wrapping_add((1u32 << (2 * lv)) * tex_bypp);
             }
         }
         // Flat textures may have their own row pitch.
@@ -392,7 +393,7 @@ impl<'a, 'b> Context<'a, 'b> {
 
     #[cfg(test)]
     fn decode_texel(&self, val: u32, pairval: u32, odd: bool) -> Color {
-        self.decode_texel_in::<8>(val, pairval, odd)
+        self.decode_texel_in::<TEX_DYNAMIC>(val, pairval, odd)
     }
 
     fn sample_texture(&self, at: &Attr) -> Color {
@@ -402,7 +403,7 @@ impl<'a, 'b> Context<'a, 'b> {
     #[inline]
     fn decode_texel_in<const FORMAT: u32>(&self, val: u32, pairval: u32, odd: bool) -> Color {
         let mut o = Color::default();
-        let format = if FORMAT < 8 { FORMAT } else { self.tex_fmt };
+        let format = if FORMAT < TEX_DYNAMIC { FORMAT } else { self.tex_fmt };
         match format {
             TEX_ARGB8888 => {
                 o = Color { b: (val & 0xFF) as i32, g: (val >> 8 & 0xFF) as i32, r: (val >> 16 & 0xFF) as i32, a: (val >> 24 & 0xFF) as i32 }
@@ -460,15 +461,15 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Texel (`ui`, `vi`) of mipmap level `level`.
     #[inline]
     fn fetch_texel<const FORMAT: u32>(&self, level: i32, ui: i32, vi: i32) -> Color {
-        let format = if FORMAT < 8 { FORMAT } else { self.tex_fmt };
-        let bypp = match format {
-            TEX_ARGB8888 => 4,
-            TEX_ARGB4444 | TEX_ARGB1555 | TEX_YUV => 2,
-            _ => 1,
-        };
+        let format = if FORMAT < TEX_DYNAMIC { FORMAT } else { self.tex_fmt };
+        let bypp = TEX_BYTES[format as usize];
         let size = 1i32 << level;
         let (ui, vi) = (ui & (size - 1), vi & (size - 1));
-        let row = if self.flat_stride != 0 { self.flat_stride } else { size as u32 * bypp };
+        let row = if self.flat_stride != 0 {
+            self.flat_stride
+        } else {
+            size as u32 * bypp
+        };
         let addr = self.tex_level_base[level as usize]
             .wrapping_add(vi as u32 * row)
             .wrapping_add(ui as u32 * bypp)
@@ -476,7 +477,11 @@ impl<'a, 'b> Context<'a, 'b> {
         let (val, pairval) = match bypp {
             4 => (self.dword(addr), 0),
             2 => {
-                let pair = if format == TEX_YUV { self.word((addr ^ 2) & self.memmask) } else { 0 };
+                let pair = if format == TEX_YUV {
+                    self.word((addr ^ 2) & self.memmask)
+                } else {
+                    0
+                };
                 (self.word(addr), pair)
             }
             _ => (self.byte(addr), 0),

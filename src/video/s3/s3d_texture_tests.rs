@@ -59,7 +59,7 @@ fn specialized_sampling_matches_dynamic_formats() {
                                         ..Attr::default()
                                     };
                                     let specialized = channels(c.sample_texture(&at));
-                                    let dynamic = channels(c.sample_texture_in::<8>(&at));
+                                    let dynamic = channels(c.sample_texture_in::<TEX_DYNAMIC>(&at));
                                     assert_eq!(
                                         specialized, dynamic,
                                         "len={len}, cmd={cmd:#x}, uvwd={u},{v},{w},{d}"
@@ -107,5 +107,65 @@ fn selected_formats_keep_their_channel_decoding() {
             })),
             want
         );
+    }
+}
+
+#[test]
+fn selected_formats_fetch_the_addressed_texel() {
+    let mut regs = [0; 0x80];
+    regs[0xF8 >> 2] = 0x000A14;
+    regs[0xFC >> 2] = 0x96A0AA;
+    for (format, value, want) in [
+        (TEX_ARGB8888, 0x12345678u32, [0x34, 0x56, 0x78, 0x12]),
+        (TEX_ARGB4444, 0x1234, [0x22, 0x33, 0x44, 0x11]),
+        (TEX_ARGB1555, 0xFC00, [255, 0, 0, 255]),
+        (TEX_ALPHA4BLEND4, 0x83, [30, 40, 50, 136]),
+        (TEX_BLEND4_LO, 0xAB, [110, 120, 130, 255]),
+        (TEX_BLEND4_HI, 0xAB, [100, 110, 120, 255]),
+        (TEX_PAL8, 0x42, [66, 198, 206, 255]),
+        (TEX_YUV, 0x80EB, [255, 255, 255, 255]),
+    ] {
+        let bypp = TEX_BYTES[format as usize];
+        // A 2x2 level 1 at 0 and a 1x1 level 0 right after it. Each case
+        // gives the filter, the flat row pitch, U, V, D and the offset of
+        // the texel they select.
+        for (filter, pitch, u, v, d, offset) in [
+            // Flat, packed rows: texel (1, 1) of level 1.
+            (4, 0, 1 << 26, 1 << 26, 0, 3 * bypp),
+            // Flat, with a row pitch of its own.
+            (4, 16, 1 << 26, 1 << 26, 0, 16 + bypp),
+            // Mipmapped, D selecting level 0.
+            (0, 0, 0, 0, 1 << 27, 4 * bypp),
+        ] {
+            let mut memory = [0u8; 32];
+            let mut put = |at: u32| {
+                let bytes = value.to_le_bytes();
+                let at = at as usize;
+                memory[at..at + bypp as usize].copy_from_slice(&bytes[..bypp as usize]);
+            };
+            put(offset);
+            if format == TEX_YUV {
+                // The other texel of the pair holds U or V.
+                put(offset ^ 2);
+            }
+            let mut target = Target {
+                vram: &mut memory,
+                palette: &palette,
+            };
+            regs[0xE4 >> 2] = pitch;
+            let cmd = CMD_3D | 1 << 2 | format << 5 | 1 << 8 | filter << 12 | UNLIT_TEX_TRI << 27;
+            let mut c = Context::new(&mut target, cmd, &regs).unwrap();
+            c.setup_texture(cmd, &regs);
+            let at = Attr {
+                u,
+                v,
+                d,
+                ..Attr::default()
+            };
+            let case = format!("format={format}, filter={filter}, pitch={pitch}");
+            assert_eq!(channels(c.sample_texture(&at)), want, "{case}");
+            let dynamic = c.sample_texture_in::<TEX_DYNAMIC>(&at);
+            assert_eq!(channels(dynamic), want, "{case}");
+        }
     }
 }
