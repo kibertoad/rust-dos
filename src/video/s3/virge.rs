@@ -18,7 +18,6 @@
 use super::s3d::{S3d, Target};
 use super::streams::Streams;
 
-#[path = "virge/rows.rs"]
 mod rows;
 
 /// One of the three 2D register groups. The registers with the same

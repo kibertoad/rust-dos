@@ -20,23 +20,19 @@ fn stepped(start: u32, step: u32, positive: bool) -> Option<u32> {
     }
 }
 
-fn copy_rows(g: &Group, y: u32) -> Option<(Range<usize>, Range<usize>)> {
-    let positive_x = g.command_set & (1 << 25) != 0;
+/// Row `y` of the copy, `width` pixels from columns `sx` and `dx`.
+fn copy_rows(
+    g: &Group,
+    sx: u32,
+    dx: u32,
+    width: u32,
+    y: u32,
+) -> Option<(Range<usize>, Range<usize>)> {
     let positive_y = g.command_set & (1 << 26) != 0;
-    let sx = stepped(
-        g.rect_src_x,
-        if positive_x { 0 } else { g.rect_width - 1 },
-        false,
-    )?;
-    let dx = stepped(
-        g.rect_dst_x,
-        if positive_x { 0 } else { g.rect_width - 1 },
-        false,
-    )?;
     let sy = stepped(g.rect_src_y, y, positive_y)?;
     let dy = stepped(g.rect_dst_y, y, positive_y)?;
-    let source = row(g.src_base, g.src_stride, sx, sy, g.bypp(), g.rect_width)?;
-    let dest = row(g.dst_base, g.dst_stride, dx, dy, g.bypp(), g.rect_width)?;
+    let source = row(g.src_base, g.src_stride, sx, sy, g.bypp(), width)?;
+    let dest = row(g.dst_base, g.dst_stride, dx, dy, g.bypp(), width)?;
     Some((source, dest))
 }
 
@@ -53,26 +49,58 @@ pub(super) fn copy(g: &Group, vram: &mut [u8]) -> bool {
         return false;
     }
     let positive_x = g.command_set & (1 << 25) != 0;
-    for y in 0..g.rect_height {
-        let Some((source, dest)) = copy_rows(g, y) else {
+    let positive_y = g.command_set & (1 << 26) != 0;
+    // A right to left copy starts at the rectangle's right edge.
+    let offset = if positive_x { 0 } else { g.rect_width - 1 };
+    let (Some(mut sx), Some(mut dx)) = (
+        g.rect_src_x.checked_sub(offset),
+        g.rect_dst_x.checked_sub(offset),
+    ) else {
+        return false;
+    };
+    let Some(mut right) = dx.checked_add(g.rect_width - 1) else {
+        return false;
+    };
+    // Rows run from 0 to rect_height - 1 in command order; with clipping
+    // on, those outside the clip rectangle are skipped.
+    let (mut first, mut last) = (0, g.rect_height - 1);
+    if g.command_set & 2 != 0 {
+        // The pixel path writes only inside the clip rectangle and in the
+        // same order, so the copy shrinks to that part of each row.
+        let left = dx.max(g.left_clip);
+        right = right.min(g.right_clip);
+        if left > right {
+            return true;
+        }
+        let Some(shifted) = sx.checked_add(left - dx) else {
+            return false;
+        };
+        (sx, dx) = (shifted, left);
+        let Some(end) = stepped(g.rect_dst_y, last, positive_y) else {
+            return false;
+        };
+        let (top, bottom) = if positive_y {
+            (g.rect_dst_y, end)
+        } else {
+            (end, g.rect_dst_y)
+        };
+        let (top, bottom) = (top.max(g.top_clip), bottom.min(g.bottom_clip));
+        if top > bottom {
+            return true;
+        }
+        (first, last) = if positive_y {
+            (top - g.rect_dst_y, bottom - g.rect_dst_y)
+        } else {
+            (g.rect_dst_y - bottom, g.rect_dst_y - top)
+        };
+    }
+    let width = right - dx + 1;
+    for y in first..=last {
+        let Some((source, dest)) = copy_rows(g, sx, dx, width, y) else {
             return false;
         };
         if source.end > vram.len() || dest.end > vram.len() {
             return false;
-        }
-        if g.command_set & 2 != 0 {
-            let x0 = if positive_x {
-                g.rect_dst_x
-            } else {
-                g.rect_dst_x - (g.rect_width - 1)
-            };
-            let dy = stepped(g.rect_dst_y, y, g.command_set & (1 << 26) != 0).unwrap();
-            let Some(x1) = x0.checked_add(g.rect_width - 1) else {
-                return false;
-            };
-            if x0 < g.left_clip || x1 > g.right_clip || dy < g.top_clip || dy > g.bottom_clip {
-                return false;
-            }
         }
         let overlaps = source.start < dest.end && dest.start < source.end;
         if overlaps
@@ -82,8 +110,8 @@ pub(super) fn copy(g: &Group, vram: &mut [u8]) -> bool {
             return false;
         }
     }
-    for y in 0..g.rect_height {
-        let (source, dest) = copy_rows(g, y).unwrap();
+    for y in first..=last {
+        let (source, dest) = copy_rows(g, sx, dx, width, y).unwrap();
         vram.copy_within(source, dest.start);
     }
     true
@@ -112,10 +140,11 @@ pub(super) fn fill(g: &Group, vram: &mut [u8], [left, right, top, bottom]: [u32;
     }
     let pixel = g.mono_pat_fg.to_le_bytes();
     let pixel = &pixel[..g.bypp() as usize];
+    let same_bytes = pixel.iter().all(|&byte| byte == pixel[0]);
     for y in top..=bottom {
         let range = row(g.dst_base, g.dst_stride, left, y, g.bypp(), width).unwrap();
         let dest = &mut vram[range];
-        if pixel.iter().all(|&byte| byte == pixel[0]) {
+        if same_bytes {
             dest.fill(pixel[0]);
         } else {
             dest[..pixel.len()].copy_from_slice(pixel);
@@ -166,7 +195,7 @@ mod tests {
 
     #[test]
     fn row_copies_match_pixel_order_with_overlap_and_memory_edges() {
-        let mut used_rows = 0;
+        let (mut used_rows, mut used_clipped) = (0, 0);
         for format in 0..=2 {
             for direction in [0, 1 << 25, 1 << 26, 3 << 25] {
                 for (sx, sy) in [(2, 2), (6, 2), (14, 4), (0, 0)] {
@@ -201,6 +230,9 @@ mod tests {
                                     let mut probe = memory();
                                     if copy(&g, &mut probe) {
                                         used_rows += 1;
+                                        if clip != 0 && probe != memory() {
+                                            used_clipped += 1;
+                                        }
                                         assert_eq!(probe, expected, "{g:?}");
                                     } else {
                                         assert_eq!(probe, memory(), "rejected copy wrote memory");
@@ -218,6 +250,7 @@ mod tests {
             }
         }
         assert!(used_rows > 100);
+        assert!(used_clipped > 20);
     }
 
     #[test]
