@@ -217,6 +217,7 @@ struct Context<'a, 'b> {
     zup: bool,
     ztest: bool,
     fog_rgb: (i32, i32, i32),
+    sample: fn(&Context<'a, 'b>, &Attr) -> Color,
     tex_fmt: u32,
     tex_bypp: u32,
     filter: u32,
@@ -276,6 +277,7 @@ impl<'a, 'b> Context<'a, 'b> {
             palettized: false,
             tex_blend: 2,
             fog: false,
+            sample: Self::sample_texture_in::<TEX_ARGB8888>,
             tex_fmt: 0,
             tex_bypp: 1,
             filter: 0,
@@ -296,6 +298,16 @@ impl<'a, 'b> Context<'a, 'b> {
         const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
         let reg = |off: usize| tri[off >> 2];
         self.tex_fmt = cmd_tex_fmt(cmd);
+        self.sample = match self.tex_fmt {
+            TEX_ARGB8888 => Self::sample_texture_in::<TEX_ARGB8888>,
+            TEX_ARGB4444 => Self::sample_texture_in::<TEX_ARGB4444>,
+            TEX_ARGB1555 => Self::sample_texture_in::<TEX_ARGB1555>,
+            TEX_ALPHA4BLEND4 => Self::sample_texture_in::<TEX_ALPHA4BLEND4>,
+            TEX_BLEND4_LO => Self::sample_texture_in::<TEX_BLEND4_LO>,
+            TEX_BLEND4_HI => Self::sample_texture_in::<TEX_BLEND4_HI>,
+            TEX_PAL8 => Self::sample_texture_in::<TEX_PAL8>,
+            _ => Self::sample_texture_in::<TEX_YUV>,
+        };
         self.tex_bypp = TEX_BYTES[self.tex_fmt as usize];
         self.filter = cmd_filter(cmd);
         self.max_d = cmd_mip_size(cmd).min(9) as i32;
@@ -344,12 +356,30 @@ impl<'a, 'b> Context<'a, 'b> {
         self.t.vram.get((addr & self.memmask) as usize).copied().unwrap_or(0) as u32
     }
 
+    #[inline]
+    fn packed<const N: usize>(&self, addr: u32) -> u32 {
+        let start = (addr & self.memmask) as usize;
+        // The physical memory fits within the rounded address mask. A
+        // whole slice therefore cannot cross that mask's wrap boundary.
+        if let Some(bytes) = self.t.vram.get(start..).and_then(|v| v.first_chunk::<N>()) {
+            let mut value = [0; 4];
+            value[..N].copy_from_slice(bytes);
+            return u32::from_le_bytes(value);
+        }
+        // Preserve wrapping and zero-filled holes byte by byte.
+        let mut value = 0;
+        for i in 0..N {
+            value |= self.byte(addr.wrapping_add(i as u32)) << (i * 8);
+        }
+        value
+    }
+
     fn word(&self, addr: u32) -> u32 {
-        self.byte(addr) | self.byte(addr.wrapping_add(1)) << 8
+        self.packed::<2>(addr)
     }
 
     fn dword(&self, addr: u32) -> u32 {
-        self.word(addr) | self.word(addr.wrapping_add(2)) << 16
+        self.packed::<4>(addr)
     }
 
     /// Blend4: the 4-bit texel interpolates from COLOR0 (0) to COLOR1 (15).
@@ -360,9 +390,20 @@ impl<'a, 'b> Context<'a, 'b> {
         o.b = c0.b + (c1.b - c0.b) * t / 15;
     }
 
+    #[cfg(test)]
     fn decode_texel(&self, val: u32, pairval: u32, odd: bool) -> Color {
+        self.decode_texel_in::<8>(val, pairval, odd)
+    }
+
+    fn sample_texture(&self, at: &Attr) -> Color {
+        (self.sample)(self, at)
+    }
+
+    #[inline]
+    fn decode_texel_in<const FORMAT: u32>(&self, val: u32, pairval: u32, odd: bool) -> Color {
         let mut o = Color::default();
-        match self.tex_fmt {
+        let format = if FORMAT < 8 { FORMAT } else { self.tex_fmt };
+        match format {
             TEX_ARGB8888 => {
                 o = Color { b: (val & 0xFF) as i32, g: (val >> 8 & 0xFF) as i32, r: (val >> 16 & 0xFF) as i32, a: (val >> 24 & 0xFF) as i32 }
             }
@@ -417,42 +458,51 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 
     /// Texel (`ui`, `vi`) of mipmap level `level`.
-    fn fetch_texel(&self, level: i32, ui: i32, vi: i32) -> Color {
+    #[inline]
+    fn fetch_texel<const FORMAT: u32>(&self, level: i32, ui: i32, vi: i32) -> Color {
+        let format = if FORMAT < 8 { FORMAT } else { self.tex_fmt };
+        let bypp = match format {
+            TEX_ARGB8888 => 4,
+            TEX_ARGB4444 | TEX_ARGB1555 | TEX_YUV => 2,
+            _ => 1,
+        };
         let size = 1i32 << level;
         let (ui, vi) = (ui & (size - 1), vi & (size - 1));
-        let row = if self.flat_stride != 0 { self.flat_stride } else { size as u32 * self.tex_bypp };
+        let row = if self.flat_stride != 0 { self.flat_stride } else { size as u32 * bypp };
         let addr = self.tex_level_base[level as usize]
             .wrapping_add(vi as u32 * row)
-            .wrapping_add(ui as u32 * self.tex_bypp)
+            .wrapping_add(ui as u32 * bypp)
             & self.memmask;
-        let (val, pairval) = match self.tex_bypp {
+        let (val, pairval) = match bypp {
             4 => (self.dword(addr), 0),
             2 => {
-                let pair = if self.tex_fmt == TEX_YUV { self.word((addr ^ 2) & self.memmask) } else { 0 };
+                let pair = if format == TEX_YUV { self.word((addr ^ 2) & self.memmask) } else { 0 };
                 (self.word(addr), pair)
             }
             _ => (self.byte(addr), 0),
         };
-        self.decode_texel(val, pairval, ui & 1 != 0)
+        self.decode_texel_in::<FORMAT>(val, pairval, ui & 1 != 0)
     }
 
     /// The border colour, stored in the texel format.
-    fn border_texel(&self) -> Color {
-        self.decode_texel(self.tex_bdr_clr, self.tex_bdr_clr, false)
+    #[inline]
+    fn border_texel<const FORMAT: u32>(&self) -> Color {
+        self.decode_texel_in::<FORMAT>(self.tex_bdr_clr, self.tex_bdr_clr, false)
     }
 
     /// Level `level` at `u`, `v` (1.0 = 1 << 27), with 1 tap (nearest), 2
     /// (a vertical pair, V2TPP) or 4 (bilinear).
-    fn sample_level(&self, level: i32, u: i32, v: i32, taps: u32) -> Color {
+    #[inline]
+    fn sample_level<const FORMAT: u32>(&self, level: i32, u: i32, v: i32, taps: u32) -> Color {
         let shift = 27 - level;
         // Without wrapping, beyond the texture is the border colour
         // (15.4.8.3).
         if !self.wrap && (u | v) as u32 & 0xF800_0000 != 0 {
-            return self.border_texel();
+            return self.border_texel::<FORMAT>();
         }
         let (ui, vi) = (u >> shift, v >> shift);
         if taps == 1 {
-            return self.fetch_texel(level, ui, vi);
+            return self.fetch_texel::<FORMAT>(level, ui, vi);
         }
         // The 8 bits below the texel position.
         let du = (u >> (shift - 8)) & 0xFF;
@@ -463,14 +513,17 @@ impl<'a, 'b> Context<'a, 'b> {
         let ui1 = if self.wrap || ui < last { ui + 1 } else { ui };
         let vi1 = if self.wrap || vi < last { vi + 1 } else { vi };
         if taps == 2 {
-            let (t0, t2) = (self.fetch_texel(level, ui, vi), self.fetch_texel(level, ui, vi1));
+            let (t0, t2) = (
+                self.fetch_texel::<FORMAT>(level, ui, vi),
+                self.fetch_texel::<FORMAT>(level, ui, vi1),
+            );
             let mix = |a: i32, b: i32| (a * (256 - dv) + b * dv) >> 8;
             return Color { r: mix(t0.r, t2.r), g: mix(t0.g, t2.g), b: mix(t0.b, t2.b), a: mix(t0.a, t2.a) };
         }
-        let t0 = self.fetch_texel(level, ui, vi);
-        let t1 = self.fetch_texel(level, ui1, vi);
-        let t2 = self.fetch_texel(level, ui, vi1);
-        let t3 = self.fetch_texel(level, ui1, vi1);
+        let t0 = self.fetch_texel::<FORMAT>(level, ui, vi);
+        let t1 = self.fetch_texel::<FORMAT>(level, ui1, vi);
+        let t2 = self.fetch_texel::<FORMAT>(level, ui, vi1);
+        let t3 = self.fetch_texel::<FORMAT>(level, ui1, vi1);
         let (w0, w1, w2, w3) = ((256 - du) * (256 - dv), du * (256 - dv), (256 - du) * dv, du * dv);
         let mix = |a: i32, b: i32, c: i32, d: i32| (a * w0 + b * w1 + c * w2 + d * w3) >> 16;
         Color {
@@ -481,7 +534,7 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    fn sample_texture(&self, at: &Attr) -> Color {
+    fn sample_texture_in<const FORMAT: u32>(&self, at: &Attr) -> Color {
         let (u, v) = if self.persp {
             // U and V are premultiplied by W. The shift is the original
             // ViRGE's and ViRGE/VX's (86Box has 8 for the ViRGE/DX on).
@@ -510,16 +563,16 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         match self.filter {
             // M1TPP, 1TPP: the nearest texel.
-            0 | 4 => self.sample_level(level, u, v, 1),
-            5 => self.sample_level(level, u, v, 2),
+            0 | 4 => self.sample_level::<FORMAT>(level, u, v, 1),
+            5 => self.sample_level::<FORMAT>(level, u, v, 2),
             // M4TPP, 4TPP: bilinear.
-            2 | 6 => self.sample_level(level, u, v, 4),
+            2 | 6 => self.sample_level::<FORMAT>(level, u, v, 4),
             // M2TPP, M8TPP: levels D and D+1, interpolated.
             1 | 3 => {
                 let taps = if self.filter == 1 { 1 } else { 4 };
-                let mut o = self.sample_level(level, u, v, taps);
+                let mut o = self.sample_level::<FORMAT>(level, u, v, taps);
                 if level > 0 && dfrac != 0 {
-                    let o2 = self.sample_level(level - 1, u, v, taps);
+                    let o2 = self.sample_level::<FORMAT>(level - 1, u, v, taps);
                     o.r += ((o2.r - o.r) * dfrac) >> 8;
                     o.g += ((o2.g - o.g) * dfrac) >> 8;
                     o.b += ((o2.b - o.b) * dfrac) >> 8;
@@ -527,11 +580,20 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
                 o
             }
-            _ => self.sample_level(level, u, v, 1),
+            _ => self.sample_level::<FORMAT>(level, u, v, 1),
         }
     }
 
     fn write_word(&mut self, addr: u32, value: u16) {
+        if let Some(bytes) = self
+            .t
+            .vram
+            .get_mut(addr as usize..)
+            .and_then(|v| v.first_chunk_mut::<2>())
+        {
+            *bytes = value.to_le_bytes();
+            return;
+        }
         let len = self.t.vram.len();
         for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
             if let Some(b) = self.t.vram.get_mut((addr as usize + i) % len) {
@@ -540,8 +602,22 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    /// One pixel through the pipeline of the databook's figure 15-7.
     fn pixel(&mut self, x: i32, y: i32, at: &Attr) {
+        self.pixel_in::<false, false, 0>(x, y, at);
+    }
+
+    /// One pixel through the pipeline of the databook's figure 15-7.
+    #[inline(always)]
+    fn pixel_in<const ZTEST: bool, const TEXTURED: bool, const BYPP: u32>(
+        &mut self,
+        x: i32,
+        y: i32,
+        at: &Attr,
+    ) {
+        // BYPP zero retains the dynamic path used by line commands.
+        let ztest = if BYPP == 0 { self.ztest } else { ZTEST };
+        let textured = if BYPP == 0 { self.textured } else { TEXTURED };
+        let bypp = if BYPP == 0 { self.bypp } else { BYPP };
         // 11-bit unsigned coordinates; anything outside is dropped.
         if x as u32 > 2047 || y as u32 > 2047 {
             return;
@@ -549,14 +625,14 @@ impl<'a, 'b> Context<'a, 'b> {
         if self.hc && (x < self.clip_l || x > self.clip_r || y < self.clip_t || y > self.clip_b) {
             return;
         }
-        let dest = self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * self.bypp as u64;
-        if dest + self.bypp as u64 > self.memsize as u64 {
+        let dest = self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * bypp as u64;
+        if dest + bypp as u64 > self.memsize as u64 {
             return;
         }
         let dest = dest as u32;
         let zs = z16(at.z);
         let mut z_addr = 0;
-        if self.ztest {
+        if ztest {
             let za = self.z_base as u64 + y as u64 * self.z_stride as u64 + x as u64 * 2;
             if za + 2 > self.memsize as u64 {
                 return;
@@ -584,7 +660,7 @@ impl<'a, 'b> Context<'a, 'b> {
         // The vertex colour.
         let src = Color { r: clamp8(at.r >> 7), g: clamp8(at.g >> 7), b: clamp8(at.b >> 7), a: clamp8(at.a >> 7) };
         let mut col = src;
-        if self.textured {
+        if textured {
             col = self.sample_texture(at);
             if self.lit && !self.palettized {
                 match self.tex_blend {
@@ -614,13 +690,19 @@ impl<'a, 'b> Context<'a, 'b> {
                 col.g = (col.g * a + fg * (255 - a)) / 255;
                 col.b = (col.b * a + fb * (255 - a)) / 255;
             }
-            if (self.abc == 2 || self.abc == 3) && self.bypp != 1 {
+            if (self.abc == 2 || self.abc == 3) && bypp != 1 {
                 // 10b: the alpha at this stage; 11b: the source alpha.
                 let a = if self.abc == 3 { src.a } else { clamp8(col.a) };
-                let d = if self.bypp == 2 {
+                let d = if bypp == 2 {
                     rgb1555(self.word(dest), 0)
                 } else {
-                    Color { b: self.byte(dest) as i32, g: self.byte(dest + 1) as i32, r: self.byte(dest + 2) as i32, a: 0 }
+                    let value = self.packed::<3>(dest);
+                    Color {
+                        b: (value & 0xFF) as i32,
+                        g: (value >> 8 & 0xFF) as i32,
+                        r: (value >> 16 & 0xFF) as i32,
+                        a: 0,
+                    }
                 };
                 col.r = (col.r * a + d.r * (255 - a)) / 255;
                 col.g = (col.g * a + d.g * (255 - a)) / 255;
@@ -629,7 +711,7 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         let (r, g, b) = (clamp8(col.r) as u32, clamp8(col.g) as u32, clamp8(col.b) as u32);
         let d = dest as usize;
-        match self.bypp {
+        match bypp {
             1 => self.t.vram[d] = b as u8,
             // ZRGB1555: bit 15, MUX buffering's Z flag, is written 0.
             2 => self.write_word(dest, (b >> 3 | (g >> 3) << 5 | (r >> 3) << 10) as u16),
@@ -639,7 +721,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 self.t.vram[d + 2] = r as u8;
             }
         }
-        if self.ztest && self.zup {
+        if ztest && self.zup {
             self.write_word(z_addr, zs as u16);
         }
     }
@@ -647,7 +729,20 @@ impl<'a, 'b> Context<'a, 'b> {
     /// One of a triangle's two parts, walking up from `y` (15.4.5.2): the
     /// first along side 01, the second along 12. `x1` runs along side 02.
     #[allow(clippy::too_many_arguments)]
-    fn tri_part(&mut self, dx_: &Attr, dy_: &Attr, xdir: i32, y: &mut i32, x1: &mut i32, mut x2: i32, dx1: i32, dx2: i32, ycount: i32, base: &mut Attr) {
+    fn tri_part(
+        &mut self,
+        span: spans::Span<'a, 'b>,
+        dx_: &Attr,
+        dy_: &Attr,
+        xdir: i32,
+        y: &mut i32,
+        x1: &mut i32,
+        mut x2: i32,
+        dx1: i32,
+        dx2: i32,
+        ycount: i32,
+        base: &mut Attr,
+    ) {
         for _ in 0..ycount.min(2048) {
             let visible = *y as u32 <= 2047 && (!self.hc || (*y >= self.clip_t && *y <= self.clip_b));
             if visible {
@@ -691,11 +786,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     }
                     if draw {
                         let count = if xdir > 0 { xe - x } else { x - xe }.min(4096);
-                        for _ in 0..count {
-                            self.pixel(x, *y, &at);
-                            at.add(dx_);
-                            x += xdir;
-                        }
+                        span(self, x, *y, count, xdir, &mut at, dx_);
                     }
                 }
             }
@@ -873,6 +964,7 @@ impl S3d {
             u: reg(0x138) as i32,
             z: reg(0x15C) as i32,
         };
+        let span = c.select_span();
         let ycnt = reg(0x17C);
         let ty12 = (ycnt & 0x7FF) as i32;
         let ty01 = (ycnt >> 16 & 0x7FF) as i32;
@@ -880,8 +972,32 @@ impl S3d {
         let mut y = (reg(0x178) & 0x7FF) as i32;
         let mut x1 = reg(0x174) as i32;
         let dx02 = reg(0x170) as i32;
-        c.tri_part(&dx, &dy, xdir, &mut y, &mut x1, reg(0x16C) as i32, dx02, reg(0x168) as i32, ty01, &mut base);
-        c.tri_part(&dx, &dy, xdir, &mut y, &mut x1, reg(0x164) as i32, dx02, reg(0x160) as i32, ty12, &mut base);
+        c.tri_part(
+            span,
+            &dx,
+            &dy,
+            xdir,
+            &mut y,
+            &mut x1,
+            reg(0x16C) as i32,
+            dx02,
+            reg(0x168) as i32,
+            ty01,
+            &mut base,
+        );
+        c.tri_part(
+            span,
+            &dx,
+            &dy,
+            xdir,
+            &mut y,
+            &mut x1,
+            reg(0x164) as i32,
+            dx02,
+            reg(0x160) as i32,
+            ty12,
+            &mut base,
+        );
     }
 
     /// A 3D line: 2D line drawing's X start, delta and ends, bottom up,
@@ -1137,3 +1253,14 @@ mod tests {
         assert_eq!((o.r, o.g, o.b), (0x40, 0x40, 0x40));
     }
 }
+
+#[cfg(test)]
+#[path = "s3d_memory_tests.rs"]
+mod memory_tests;
+
+#[path = "s3d_spans.rs"]
+mod spans;
+
+#[cfg(test)]
+#[path = "s3d_texture_tests.rs"]
+mod texture_tests;
