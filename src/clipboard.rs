@@ -153,8 +153,16 @@ impl Clipboard {
         Some(text.trim_end_matches('\n').to_string())
     }
 
-    /// Show the selected cells inverted on `frame`, the picture of `bus`'s
-    /// screen.
+    /// Rows of the selected cells on `frame`, the picture of `bus`'s
+    /// screen, where drawing inverts its pixels.
+    pub fn rows(&self, frame: &Frame, bus: &Bus) -> std::ops::Range<usize> {
+        let Some((sel, g)) = self.current(bus) else { return 0..0 };
+        let ((_, first), (_, last)) = sel.rect();
+        (first * g.cell_h()).min(frame.height as usize)
+            ..((last + 1) * g.cell_h()).min(frame.height as usize)
+    }
+
+    /// Draw the selected cells over the monitor's picture.
     pub fn draw(&self, frame: &mut Frame, bus: &Bus) {
         let Some((sel, g)) = self.current(bus) else { return };
         let ((c0, r0), (c1, r1)) = sel.rect();
@@ -263,6 +271,22 @@ mod tests {
         clipboard.drag(&cpu.bus, (100, 100));
         assert!(clipboard.finish(&cpu.bus, (3 * 8, 0)));
         assert_eq!(clipboard.text(&cpu.bus).unwrap(), ">DIR\nLO W\nEXT");
+    }
+
+    #[test]
+    fn row_bounds_include_the_inverted_selection_and_clear_when_it_ends() {
+        let cpu = cpu_with(&["first", "second", "third"]);
+        let mut clipboard = Clipboard::new();
+        assert!(clipboard.start(&cpu.bus, (12, 18)));
+        assert!(clipboard.finish(&cpu.bus, (40, 46)));
+        let mut frame = crate::video::Frame::from_rgb(640, 400, vec![117; 640 * 400 * 3]);
+        let previous = frame.rgba.clone();
+        let rows = clipboard.rows(&frame, &cpu.bus);
+        assert_eq!(rows, 16..48);
+        clipboard.draw(&mut frame, &cpu.bus);
+        assert_eq!(crate::video::changed_rows(&previous, &frame.rgba, 640 * 4), Some(rows));
+        clipboard.clear();
+        assert!(clipboard.rows(&frame, &cpu.bus).is_empty());
     }
 
     #[test]

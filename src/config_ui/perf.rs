@@ -68,13 +68,13 @@ struct Panel {
 /// frames a second and the host's CPU use, each over a small graph of its
 /// last half minute, side by side on a panel like the window's, but half
 /// as opaque, so the picture shows through.
-fn draw_overlay(frame: &mut Frame, view: &StatsView) {
+fn draw_overlay(frame: &mut Frame, view: &StatsView) -> std::ops::Range<usize> {
     let (width, height) = (frame.width as usize, frame.height as usize);
     let cell_h = if height >= 300 { 16 } else { 8 };
     let graph = (width / 64).clamp(8, 12);
     let (cols, rows) = (2 * graph + 3, 3);
     if cols * 8 + 16 > width || (rows + 1) * cell_h > height {
-        return;
+        return 0..0;
     }
     let layout = Layout { x: width - cols * 8 - 8, y: height - rows * cell_h - cell_h / 2, cell_h, cols, rows };
     let panels = [
@@ -91,6 +91,7 @@ fn draw_overlay(frame: &mut Frame, view: &StatsView) {
     for (i, (.., history, max, color)) in panels.into_iter().enumerate() {
         draw::plot(frame, &layout, (1 + i * (graph + 1), 1, graph, rows - 1), history, max, color, draw::OPAQUE / 2);
     }
+    layout.y..(layout.y + rows * cell_h).min(height)
 }
 
 impl ConfigUi {
@@ -125,11 +126,18 @@ impl ConfigUi {
     /// Draw the performance overlay over `frame`, if it is on and the
     /// window closed.
     pub fn draw_overlay(&self, frame: &mut Frame) {
+        self.draw_overlay_rows(frame);
+    }
+
+    /// Draw the performance panel and report its rows for restoration.
+    pub fn draw_overlay_rows(&self, frame: &mut Frame) -> std::ops::Range<usize> {
         if self.overlay
             && !self.open
             && let Some(view) = &self.stats
         {
-            draw_overlay(frame, view);
+            draw_overlay(frame, view)
+        } else {
+            0..0
         }
     }
 

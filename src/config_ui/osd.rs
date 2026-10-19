@@ -95,41 +95,50 @@ impl Osd {
         self.draw_at(frame, Instant::now());
     }
 
-    fn draw_at(&mut self, frame: &mut Frame, now: Instant) {
-        self.draw_notice(frame, now);
-        self.draw_corner(frame);
-        let Some(text) = self.text_at(now) else { return };
+    /// Draw messages and report their actual rows, including notices
+    /// that became visible after the base picture was composed.
+    pub fn draw_rows(&mut self, frame: &mut Frame) -> std::ops::Range<usize> {
+        self.draw_at(frame, Instant::now())
+    }
+
+    fn draw_at(&mut self, frame: &mut Frame, now: Instant) -> std::ops::Range<usize> {
+        use crate::video::compose::union;
+        let rows = union(self.draw_notice(frame, now), self.draw_corner(frame));
+        let Some(text) = self.text_at(now) else { return rows };
         let (width, height) = (frame.width as usize, frame.height as usize);
         let cols = (text.chars().count() + 2).min(width / 8);
         if cols < 3 {
-            return;
+            return rows;
         }
         let cell_h = if height >= 300 { 16 } else { 8 };
         let layout = Layout { x: (width - cols * 8) / 2, y: cell_h / 2, cell_h, cols, rows: 1 };
         let mut grid = Grid::new(cols, 1);
         grid.text_to(1, 0, text, draw::BRIGHT, cols - 1);
         draw::render(&grid, &layout, frame);
+        union(rows, layout.y.min(height)..(layout.y + cell_h).min(height))
     }
 
-    fn draw_notice(&mut self, frame: &mut Frame, now: Instant) {
+    fn draw_notice(&mut self, frame: &mut Frame, now: Instant) -> std::ops::Range<usize> {
         let (width, height) = (frame.width as usize, frame.height as usize);
-        let Some((title, detail)) = self.notice_at(now) else { return };
+        let Some((title, detail)) = self.notice_at(now) else { return 0..0 };
         let len = title.chars().count().max(detail.chars().count());
         let cols = (len + 4).min(width / 8);
         let cell_h = if height >= 300 { 16 } else { 8 };
         if cols < 3 || height < cell_h * 4 {
-            return;
+            return 0..0;
         }
         let layout = Layout { x: (width - cols * 8) / 2, y: height - cell_h * 7 / 2, cell_h, cols, rows: 2 };
         let mut grid = Grid::new(cols, 2);
         grid.text_to(2, 0, title, draw::KEY, cols - 1);
         grid.text_to(2, 1, detail, draw::TEXT, cols - 1);
         draw::render(&grid, &layout, frame);
+        layout.y..(layout.y + 2 * cell_h).min(height)
     }
 
-    fn draw_corner(&mut self, frame: &mut Frame) {
+    fn draw_corner(&mut self, frame: &mut Frame) -> std::ops::Range<usize> {
         let (width, height) = (frame.width as usize, frame.height as usize);
         let cell_h = if height >= 300 { 16 } else { 8 };
+        let mut rows = 0..0;
         for (i, line) in self.corner.iter().rev().enumerate() {
             let cols = (line.chars().count() + 2).min(width / 8);
             let y = height.saturating_sub(cell_h * (i + 1) + cell_h / 2);
@@ -140,13 +149,56 @@ impl Osd {
             let mut grid = Grid::new(cols, 1);
             grid.text_to(1, 0, line, draw::BRIGHT, cols - 1);
             draw::render(&grid, &layout, frame);
+            rows = crate::video::compose::union(rows, y..(y + cell_h).min(height));
         }
+        rows
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_bounds_restore_expired_messages_without_retinting_the_picture() {
+        use crate::video::{compose::Composition, mono};
+        for (width, height) in [(320, 200), (640, 400)] {
+            let mut osd = Osd::new();
+            let mut reference = Osd::new();
+            let mut composition = Composition::default();
+            let mut base = Frame::from_rgb(width, height, vec![120; (width * height * 3) as usize]);
+            let mut output = base.clone();
+            let start = Instant::now();
+            let mut narrow = 0;
+            for step in 0..20 {
+                let now = start + Duration::from_secs(step);
+                for messages in [&mut osd, &mut reference] {
+                    if step % 4 == 0 {
+                        messages.show_at("A completed capture", now);
+                        messages.notify("An achievement", "Its detail", false);
+                    }
+                    let corner = if step % 3 == 0 { vec![] } else { vec!["1:23.45".into()] };
+                    messages.set_corner(corner);
+                }
+                let y = step as usize * 7 % height as usize;
+                let bytes = width as usize * 4;
+                base.rgba[y * bytes..y * bytes + 3].fill(step as u8);
+                let monitor = mono::Monochrome::ALL[step as usize / 5 % 4];
+                let rows = composition.restore(&mut output, &base, y..y + 1, 0..0, monitor);
+                mono::apply_rows(&mut output, monitor, rows);
+                let painted = osd.draw_at(&mut output, now);
+                if !painted.is_empty() && painted.len() < height as usize {
+                    narrow += 1;
+                }
+                composition.include_overlay(painted);
+                let mut full = base.clone();
+                mono::apply(&mut full, monitor);
+                reference.draw_at(&mut full, now);
+                assert!(output == full, "{width}x{height}, step {step}");
+            }
+            assert!(narrow > 10);
+        }
+    }
 
     fn lit(frame: &Frame) -> bool {
         frame.rgba.as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|&b| b != 0))
@@ -179,6 +231,8 @@ mod tests {
         assert!(row(10) && !row(100));
         // Even on a tiny picture.
         osd.draw_at(&mut Frame::new(16, 8), start);
+        let rows = osd.draw_at(&mut Frame::new(640, 1), start);
+        assert!(rows.is_empty() && rows.end <= 1);
     }
 
     #[test]

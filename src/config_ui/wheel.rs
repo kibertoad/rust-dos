@@ -34,14 +34,19 @@ fn item_at(dx: f32, dy: f32, count: usize) -> usize {
 }
 
 pub fn draw(frame: &mut Frame, view: &WheelView) {
+    draw_rows(frame, view);
+}
+
+/// Draw the wheel, including its label boxes, and report their rows.
+pub fn draw_rows(frame: &mut Frame, view: &WheelView) -> std::ops::Range<usize> {
     let count = view.items.len();
     if count == 0 {
-        return;
+        return 0..0;
     }
     let layout = Layout::for_frame(frame.width as usize, frame.height as usize);
     let (cols, rows) = (layout.cols, layout.rows);
     if cols < 24 || rows < 8 {
-        return;
+        return 0..0;
     }
     let (width, height) = (frame.width as usize, frame.height as usize);
     // The ring, in pixels, around the panel's middle.
@@ -50,6 +55,7 @@ pub fn draw(frame: &mut Frame, view: &WheelView) {
     let inner = outer * 0.3;
     let (x0, x1) = ((cx - outer).max(0.0) as usize, ((cx + outer) as usize + 1).min(width));
     let (y0, y1) = ((cy - outer).max(0.0) as usize, ((cy + outer) as usize + 1).min(height));
+    let mut touched = y0..y1;
     for y in y0..y1 {
         for x in x0..x1 {
             let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
@@ -85,6 +91,7 @@ pub fn draw(frame: &mut Frame, view: &WheelView) {
         let top = (layout.y + row * layout.cell_h).saturating_sub(PAD_Y);
         let right = (layout.x + (col + len) * 8 + PAD_X).min(width);
         let bottom = (layout.y + (row + 1) * layout.cell_h + PAD_Y).min(height);
+        touched = crate::video::compose::union(touched, top..bottom);
         for y in top..bottom {
             for x in left..right {
                 let edge = y == top || y + 1 == bottom || x == left || x + 1 == right;
@@ -96,11 +103,41 @@ pub fn draw(frame: &mut Frame, view: &WheelView) {
         g.text(col, row, &name, if chosen { draw::BRIGHT } else { draw::TEXT });
         draw::render_area(&g, &layout, frame, 256, (col..col + len, row..row + 1));
     }
+    touched
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_bounds_include_label_boxes_and_clipped_ring_edges() {
+        for (width, height) in [(320, 200), (640, 400), (1024, 768)] {
+            for selected in [None, Some(0), Some(3)] {
+                let view = WheelView {
+                    items: vec![
+                        "North".into(),
+                        "A long label to the right".into(),
+                        "".into(),
+                        "West".into(),
+                    ],
+                    selected,
+                };
+                let mut frame = Frame::from_rgb(
+                    width,
+                    height,
+                    vec![177; (width * height * 3) as usize],
+                );
+                let previous = frame.rgba.clone();
+                let rows = draw_rows(&mut frame, &view);
+                let bytes = width as usize * 4;
+                assert!(!rows.is_empty() && rows.len() < height as usize);
+                assert_ne!(previous, frame.rgba);
+                assert_eq!(&previous[..rows.start * bytes], &frame.rgba[..rows.start * bytes]);
+                assert_eq!(&previous[rows.end * bytes..], &frame.rgba[rows.end * bytes..]);
+            }
+        }
+    }
 
     #[test]
     fn the_slices_are_the_mappers() {

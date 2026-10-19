@@ -352,6 +352,44 @@ fn opened(host: &FakeHost) -> ConfigUi {
     ui
 }
 
+#[test]
+fn row_bounds_cover_each_settings_page_and_the_performance_panel() {
+    let host = FakeHost::new();
+    let mut ui = opened(&host);
+    ui.setup = None;
+    ui.set_stats(crate::stats::StatsView {
+        fps: 70.0,
+        fps_history: vec![70.0; 12],
+        cpu_history: vec![50.0; 12],
+        ..Default::default()
+    });
+    for (width, height) in [(320, 200), (640, 480), (1024, 768)] {
+        for page in PAGES {
+            ui.page = page;
+            let mut frame = Frame::from_rgb(
+                width,
+                height,
+                [87, 132, 169].repeat((width * height) as usize),
+            );
+            let previous = frame.rgba.clone();
+            let rows = ui.draw_rows(&mut frame);
+            let bytes = width as usize * 4;
+            assert!(!rows.is_empty() && rows.len() < height as usize);
+            assert_ne!(previous, frame.rgba);
+            assert_eq!(&previous[..rows.start * bytes], &frame.rgba[..rows.start * bytes]);
+            assert_eq!(&previous[rows.end * bytes..], &frame.rgba[rows.end * bytes..]);
+        }
+    }
+    ui.open = false;
+    ui.overlay = true;
+    let mut frame = Frame::new(640, 400);
+    let previous = frame.rgba.clone();
+    let rows = ui.draw_overlay_rows(&mut frame);
+    assert_eq!(rows.len(), 48);
+    assert_eq!(&previous[..rows.start * 640 * 4], &frame.rgba[..rows.start * 640 * 4]);
+    assert_eq!(&previous[rows.end * 640 * 4..], &frame.rgba[rows.end * 640 * 4..]);
+}
+
 fn keys(ui: &mut ConfigUi, host: &mut FakeHost, keys: &[UiKey]) {
     for &key in keys {
         ui.key(key, host);

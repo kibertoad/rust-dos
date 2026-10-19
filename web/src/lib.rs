@@ -1077,12 +1077,8 @@ impl Machine {
         } else {
             0..0
         };
-        let overlay = if self.ui.is_open() || self.ui.overlay_shown() || !self.osd.is_empty() {
-            0..height as usize
-        } else {
-            video::overlay::cursor_rows(&self.picture, bus, self.cursor_visible)
-        };
-        let rows = self.composition.restore(
+        let overlay = video::overlay::cursor_rows(&self.picture, bus, self.cursor_visible);
+        let mut rows = self.composition.restore(
             &mut self.next,
             &self.picture,
             changed,
@@ -1097,9 +1093,11 @@ impl Machine {
         if self.ui.is_open() || self.ui.overlay_shown() {
             self.ui.set_stats(self.stats.view());
         }
-        self.ui.draw(&mut self.next);
-        self.ui.draw_overlay(&mut self.next);
-        self.osd.draw(&mut self.next);
+        let mut overlay = self.ui.draw_rows(&mut self.next);
+        overlay = video::compose::union(overlay, self.ui.draw_overlay_rows(&mut self.next));
+        overlay = video::compose::union(overlay, self.osd.draw_rows(&mut self.next));
+        self.composition.include_overlay(overlay.clone());
+        rows = video::compose::union(rows, overlay);
         if !self.rows.update(
             &self.screen.rgba,
             &self.next.rgba,

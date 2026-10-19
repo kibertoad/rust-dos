@@ -112,9 +112,9 @@ pub struct Core {
     /// Whether the frontend showed the last frame's picture: frames it
     /// runs ahead with aren't shown, so the next one can't be a repeat.
     frame_shown: bool,
-    /// Whether the last frame drew the settings window, the performance
-    /// overlay or the wheel over `filtered` in `screen`.
-    overlaid: bool,
+    /// Rows of the settings window, performance panel or wheel last
+    /// drawn over `filtered` in `screen`.
+    overlaid: std::ops::Range<usize>,
     /// The size of the picture handed over: the 3dfx card's OpenGL
     /// picture's while it is shown, else `screen`'s.
     shown: Option<(u32, u32)>,
@@ -296,7 +296,7 @@ impl Core {
             xrgb: Pixels::default(),
             can_dupe,
             frame_shown: false,
-            overlaid: false,
+            overlaid: 0..0,
             shown: None,
             voodoo_gl_shown: false,
             geometry: None,
@@ -602,10 +602,9 @@ impl Core {
         };
         // `screen` is `filtered` already when neither changed since the
         // last frame and nothing was drawn over it.
-        let overlaid = self.ui.is_open() || self.ui.overlay_shown() || self.wheel_view.is_some();
-        let rows = if overlaid || self.overlaid { 0..height as usize } else { filtered_rows };
-        let rows = self.screen.copy_rows_from(&self.filtered, rows);
-        self.overlaid = overlaid;
+        let old = self.overlaid.start.min(height as usize)..self.overlaid.end.min(height as usize);
+        let rows = video::compose::union(filtered_rows, old);
+        let mut rows = self.screen.copy_rows_from(&self.filtered, rows);
         if self.ui.is_open() {
             self.ui.set_mixer_status(bus.mixer.muted, bus.mixer.take_peaks());
         }
@@ -616,11 +615,14 @@ impl Core {
         let (w, h) = (self.screen.width.max(1) as f64, self.screen.height.max(1) as f64);
         let tall = self.m.settings.aspect.dimensions().map_or(1.0, |(rw, rh)| w * rh as f64 / (rw as f64 * h));
         self.ui.set_display((1.0, tall), false);
-        self.ui.draw(&mut self.screen);
-        self.ui.draw_overlay(&mut self.screen);
+        let mut overlay = self.ui.draw_rows(&mut self.screen);
+        overlay = video::compose::union(overlay, self.ui.draw_overlay_rows(&mut self.screen));
         if let Some(view) = &self.wheel_view {
-            rust_dos::config_ui::wheel::draw(&mut self.screen, view);
+            let wheel = rust_dos::config_ui::wheel::draw_rows(&mut self.screen, view);
+            overlay = video::compose::union(overlay, wheel);
         }
+        self.overlaid = overlay.clone();
+        rows = video::compose::union(rows, overlay);
 
         // The last picture handed over is the one the frontend has only if
         // it showed it: run-ahead runs frames whose pictures it drops.

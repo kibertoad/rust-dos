@@ -1835,12 +1835,6 @@ fn main() -> Result<(), String> {
         // the machine's nor anything drawn over it. Composing it, comparing
         // it with the one shown and drawing it again would cost a weak
         // host's memory bandwidth every frame for nothing.
-        let screen_key = (
-            video::overlay::cursors_key(&cpu.bus, cursor_visible),
-            settings.monochrome,
-            clipboard.draws(&cpu.bus),
-            osd.is_empty(),
-        );
         // The monitor follows the machine: a reset is a power on, another
         // frequency a resync.
         cpu.bus.monitor_noise.enabled = settings.monitor_effects.sound();
@@ -1853,6 +1847,22 @@ fn main() -> Result<(), String> {
         seen_power = now_power;
         let power_now = std::time::Instant::now();
         let power_look = power.active(power_now).then(|| power.look(power_now)).flatten();
+        // A disappearing overlay still needs one composition to restore
+        // its old rows, including the final frame of a power effect.
+        let screen_key = (
+            video::overlay::cursors_key(&cpu.bus, cursor_visible),
+            settings.monochrome,
+            clipboard.draws(&cpu.bus),
+            osd.is_empty(),
+            ui.is_open(),
+            ui.overlay_shown(),
+            ui.sound_viz_shown(),
+            wheel_view.is_some(),
+            power_look.is_some(),
+            recorder.is_active(),
+            sound_recording.is_some(),
+            video_recording.is_some(),
+        );
 
         let still = !rendered
             && power_look.is_none()
@@ -1875,17 +1885,7 @@ fn main() -> Result<(), String> {
             // Restore the affected base and overlay rows. A monochrome
             // monitor shows the cursors in its phosphor's colour, but not
             // the settings window.
-            let overlay = if clipboard.draws(&cpu.bus)
-                || ui.is_open()
-                || ui.overlay_shown()
-                || ui.sound_viz_shown()
-                || power_look.is_some()
-                || wheel_view.is_some()
-                || !osd.is_empty()
-                || recorder.is_active()
-                || sound_recording.is_some()
-                || video_recording.is_some()
-            {
+            let overlay = if power_look.is_some() {
                 0..height as usize
             } else {
                 video::overlay::cursor_rows(&cached_frame, &cpu.bus, cursor_visible)
@@ -1916,6 +1916,9 @@ fn main() -> Result<(), String> {
                 video::power::apply(&mut screen, look);
             }
             clipboard.draw(&mut screen, &cpu.bus);
+            let selected = clipboard.rows(&screen, &cpu.bus);
+            composition.include_overlay(selected.clone());
+            composed_rows = video::compose::union(composed_rows, selected);
             let frame_w = width as usize;
 
             // Screenshots and recordings show the machine alone, or with the
@@ -1990,19 +1993,19 @@ fn main() -> Result<(), String> {
             if ui.is_open() || ui.overlay_shown() {
                 ui.set_stats(stats.view());
             }
-            if ui.is_open() || ui.overlay_shown() || ui.sound_viz_shown() {
-                composition.include_overlay(0..height as usize);
-                composed_rows = 0..height as usize;
-            }
-            ui.draw(&mut screen);
-            ui.draw_overlay(&mut screen);
+            let mut ui_rows = ui.draw_rows(&mut screen);
+            ui_rows = video::compose::union(ui_rows, ui.draw_overlay_rows(&mut screen));
             if ui.sound_viz_shown() {
                 ui.set_sound(&cpu.bus);
-                ui.draw_sound_viz(&mut screen);
+                ui_rows = video::compose::union(ui_rows, ui.draw_sound_viz_rows(&mut screen));
             }
+            composition.include_overlay(ui_rows.clone());
+            composed_rows = video::compose::union(composed_rows, ui_rows);
             profile::set_host(Zone::FrameCompose);
             if let Some(view) = &wheel_view {
-                rust_dos::config_ui::wheel::draw(&mut screen, view);
+                let rows = rust_dos::config_ui::wheel::draw_rows(&mut screen, view);
+                composition.include_overlay(rows.clone());
+                composed_rows = video::compose::union(composed_rows, rows);
             }
             if capturing && record_ui {
                 capture!();
@@ -2020,18 +2023,18 @@ fn main() -> Result<(), String> {
             if det.is_some() {
                 debug_frame!();
             }
-            if !osd.is_empty() {
-                composition.include_overlay(0..height as usize);
-                composed_rows = 0..height as usize;
-            }
-            osd.draw(&mut screen);
+            let rows = osd.draw_rows(&mut screen);
+            composition.include_overlay(rows.clone());
+            composed_rows = video::compose::union(composed_rows, rows);
             if det.is_none() {
                 debug_frame!();
             }
 
             // Draw Recording Indicator
             if recorder.is_active() || sound_recording.is_some() || video_recording.is_some() {
-                draw_recording_indicator(&mut screen, frame_w);
+                let rows = draw_recording_indicator(&mut screen, frame_w);
+                composition.include_overlay(rows.clone());
+                composed_rows = video::compose::union(composed_rows, rows);
             }
         }
         // Waiting for the deadline of a frame paced to the retrace is
@@ -2175,7 +2178,10 @@ fn shut_down(
 
 /// The red dot in the top right corner that says something is being
 /// recorded.
-fn draw_recording_indicator(screen: &mut video::Frame, frame_w: usize) {
+fn draw_recording_indicator(screen: &mut video::Frame, frame_w: usize) -> std::ops::Range<usize> {
+    if frame_w < 20 {
+        return 0..0;
+    }
     let radius = 5;
     let center_x = frame_w - 15;
     let center_y = 15;
@@ -2194,12 +2200,25 @@ fn draw_recording_indicator(screen: &mut video::Frame, frame_w: usize) {
             }
         }
     }
+    (center_y - radius).min(screen.height as usize)
+        ..(center_y + radius + 1).min(screen.height as usize)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Args, open_log_file};
     use clap::Parser;
+
+    #[test]
+    fn row_bounds_include_the_recording_dot_and_handle_a_tiny_frame() {
+        let mut frame = crate::video::Frame::from_rgb(640, 400, vec![117; 640 * 400 * 3]);
+        let previous = frame.rgba.clone();
+        let rows = super::draw_recording_indicator(&mut frame, 640);
+        assert_eq!(rows, 10..21);
+        assert_eq!(crate::video::changed_rows(&previous, &frame.rgba, 640 * 4), Some(rows));
+        let mut tiny = crate::video::Frame::new(3, 3);
+        assert!(super::draw_recording_indicator(&mut tiny, 3).is_empty());
+    }
 
     #[test]
     fn the_log_goes_to_the_file_log_names() {

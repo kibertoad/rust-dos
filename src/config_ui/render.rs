@@ -13,6 +13,24 @@ use crate::mount::contract_home;
 use crate::video::Frame;
 
 impl ConfigUi {
+    /// Draw the window and report the rows it may have changed. Setup
+    /// clears the picture; a manual can cover its full height.
+    pub fn draw_rows(&mut self, frame: &mut Frame) -> std::ops::Range<usize> {
+        let full = self.setup.is_some() || self.manual_page_shown();
+        self.draw(frame);
+        if !self.open {
+            return 0..0;
+        }
+        if full {
+            return 0..frame.height as usize;
+        }
+        let layout = Layout::for_frame(frame.width as usize, frame.height as usize);
+        if layout.cols < 20 || layout.rows < 8 {
+            return 0..0;
+        }
+        layout.y..(layout.y + layout.rows * layout.cell_h).min(frame.height as usize)
+    }
+
     /// Draw the window over `frame`, if it is open.
     pub fn draw(&mut self, frame: &mut Frame) {
         if !self.open {
