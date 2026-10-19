@@ -459,12 +459,17 @@ impl Pipe {
         for (i, offset) in tex_offsets.iter_mut().enumerate() {
             *offset = card.reg(TEX_0_OFF + i) & 0x7F_FFFF;
         }
+        let (cntl, pix_width, z_cntl) = (
+            card.reg(SCALE_3D_CNTL),
+            card.reg(DP_PIX_WIDTH),
+            card.reg(Z_CNTL),
+        );
         let mut pipe = Pipe {
-            cntl: card.reg(SCALE_3D_CNTL),
-            pix_width: card.reg(DP_PIX_WIDTH),
+            cntl,
+            pix_width,
             tex_size: card.reg(TEX_SIZE_PITCH),
             tex_offsets,
-            z_cntl: card.reg(Z_CNTL),
+            z_cntl,
             z_off_pitch: card.reg(Z_OFF_PITCH),
             compare: (
                 card.reg(CLR_CMP_CLR),
@@ -496,10 +501,9 @@ impl Pipe {
             span_t: (0, 0),
             span_dy: (0, 0),
             lod: lod::Lod::default(),
-            shade: Self::pixel_mode::<false, false, false, 16>,
+            shade: Self::select_pixel(z_cntl, cntl, pix_width),
             dir: 1,
         };
-        pipe.shade = pipe.select_pixel();
         pipe.lod = lod::Lod::new(
             pipe.cntl,
             pipe.tex_size,
@@ -713,6 +717,9 @@ impl Pipe {
         (self.shade)(self, mem, palettes, x, y, dst)
     }
 
+    /// `pixel` for one mode. SPECIALIZED takes Z testing and texturing
+    /// from ZTEST and TEXTURED, otherwise from the registers; FORMAT is
+    /// the destination format, or 16 to read it from DP_PIX_WIDTH.
     fn pixel_mode<
         const SPECIALIZED: bool,
         const ZTEST: bool,

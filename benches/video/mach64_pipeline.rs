@@ -45,10 +45,12 @@ pub fn pipelines(c: &mut Criterion) {
                     text = textured as u8,
                     z = depth as u8
                 );
+                // One pipe for the whole command, as the engine has it;
+                // each iteration is a span of it.
+                let mut pipe = Pipe::new(&card);
                 group.bench_function(BenchmarkId::from_parameter(id), |b| {
                     b.iter(|| {
-                        let mut pipe = Pipe::new(black_box(&card));
-                        pipe.span(0, 1);
+                        pipe.span(black_box(0), 1);
                         for x in 0..64 {
                             let dst = mem.read(x as u32, size);
                             if let Some(out) = pipe.pixel(&mut mem, &palettes, x, 0, dst) {
