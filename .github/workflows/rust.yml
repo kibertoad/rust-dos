@@ -435,6 +435,11 @@ jobs:
       - name: Test
         run: cd web && cargo test --locked
 
+      # The page's drawing functions, run in the runner's headless Chrome:
+      # partial WebGL texture and 2D canvas uploads.
+      - name: Test screen drawing in a browser
+        run: node web/tests/screen.mjs "$(command -v google-chrome)"
+
       - name: Build
         run: ./web/build.sh
 
