@@ -14,9 +14,7 @@ use super::Mach64;
 use super::engine::{Memory, Size};
 use super::regs::*;
 
-#[path = "tri/lod.rs"]
 mod lod;
-#[path = "tri/pipeline.rs"]
 mod pipeline;
 
 /// An 8-bit colour with alpha, as the pipe works on it.
@@ -459,15 +457,28 @@ impl Pipe {
         for (i, offset) in tex_offsets.iter_mut().enumerate() {
             *offset = card.reg(TEX_0_OFF + i) & 0x7F_FFFF;
         }
-        let (cntl, pix_width, z_cntl) = (
-            card.reg(SCALE_3D_CNTL),
-            card.reg(DP_PIX_WIDTH),
-            card.reg(Z_CNTL),
+        let cntl = card.reg(SCALE_3D_CNTL);
+        let pix_width = card.reg(DP_PIX_WIDTH);
+        let z_cntl = card.reg(Z_CNTL);
+        let tex_size = card.reg(TEX_SIZE_PITCH);
+        let s = Coord::load(
+            card,
+            S_START,
+            S_XINC_START,
+            S_Y_INC,
+            [S_X_INC2, S_Y_INC2, S_XY_INC2],
         );
-        let mut pipe = Pipe {
+        let t = Coord::load(
+            card,
+            T_START,
+            T_XINC_START,
+            T_Y_INC,
+            [T_X_INC2, T_Y_INC2, T_XY_INC2],
+        );
+        Pipe {
             cntl,
             pix_width,
-            tex_size: card.reg(TEX_SIZE_PITCH),
+            tex_size,
             tex_offsets,
             z_cntl,
             z_off_pitch: card.reg(Z_OFF_PITCH),
@@ -481,35 +492,17 @@ impl Pipe {
             // light) saturate rather than wrap.
             colour: COLOURS.map(|reg| Linear::load(card, reg, (26, 25))),
             z: Linear::load(card, Z_START, (29, 29)),
-            s: Coord::load(
-                card,
-                S_START,
-                S_XINC_START,
-                S_Y_INC,
-                [S_X_INC2, S_Y_INC2, S_XY_INC2],
-            ),
-            t: Coord::load(
-                card,
-                T_START,
-                T_XINC_START,
-                T_Y_INC,
-                [T_X_INC2, T_Y_INC2, T_XY_INC2],
-            ),
+            s,
+            t,
             span_colour: [(0, 0); 4],
             span_z: (0, 0),
             span_s: (0, 0),
             span_t: (0, 0),
             span_dy: (0, 0),
-            lod: lod::Lod::default(),
+            lod: lod::Lod::new(cntl, tex_size, [s.dxx, t.dxx, s.dxy, t.dxy]),
             shade: Self::select_pixel(z_cntl, cntl, pix_width),
             dir: 1,
-        };
-        pipe.lod = lod::Lod::new(
-            pipe.cntl,
-            pipe.tex_size,
-            [pipe.s.dxx, pipe.t.dxx, pipe.s.dxy, pipe.t.dxy],
-        );
-        pipe
+        }
     }
 
     /// The leading edge moved a pixel across.
@@ -996,13 +989,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "tri/lod_tests.rs"]
 mod lod_tests;
 
 #[cfg(test)]
-#[path = "tri/lod_unit_tests.rs"]
-mod lod_unit_tests;
-
-#[cfg(test)]
-#[path = "tri/pipeline_tests.rs"]
 mod pipeline_tests;

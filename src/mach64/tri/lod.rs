@@ -1,6 +1,5 @@
 /// LOD is constant across affine spans. Curved spans retain the original
 /// per-pixel calculation so their changing derivatives select each mip.
-#[derive(Default)]
 pub(super) struct Lod {
     scale: f64,
     varying: bool,
