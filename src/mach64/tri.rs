@@ -158,7 +158,7 @@ impl TexelSource<'_, '_> {
         let at = image
             .base
             .wrapping_add((y * image.pitch + x) * texel_bytes(image.format));
-        let word = || byte_at(at) | byte_at(at + 1) << 8;
+        let word = || self.mem.read_bytes::<2>(at);
         match image.format {
             2 => {
                 let mut index = byte_at(at);
@@ -209,12 +209,15 @@ impl TexelSource<'_, '_> {
                     b: four(v & 15),
                 }
             }
-            6 => Argb {
-                a: byte_at(at + 3) as i32,
-                r: byte_at(at + 2) as i32,
-                g: byte_at(at + 1) as i32,
-                b: byte_at(at) as i32,
-            },
+            6 => {
+                let v = self.mem.read_bytes::<4>(at);
+                Argb {
+                    a: (v >> 24) as i32,
+                    r: (v >> 16 & 0xFF) as i32,
+                    g: (v >> 8 & 0xFF) as i32,
+                    b: (v & 0xFF) as i32,
+                }
+            }
             // YUYV: a pair of pixels shares U and V.
             11 => {
                 let pair = image.base.wrapping_add((y * image.pitch + (x & !1)) * 2);
@@ -227,14 +230,15 @@ impl TexelSource<'_, '_> {
                 )
             }
             14 => {
+                let v = self.mem.read_bytes::<4>(at);
                 let c = yuv(
-                    byte_at(at + 2) as i32,
-                    byte_at(at + 1) as i32,
-                    byte_at(at) as i32,
+                    (v >> 16 & 0xFF) as i32,
+                    (v >> 8 & 0xFF) as i32,
+                    (v & 0xFF) as i32,
                     self.signed_uv,
                 );
                 Argb {
-                    a: byte_at(at + 3) as i32,
+                    a: (v >> 24) as i32,
                     ..c
                 }
             }

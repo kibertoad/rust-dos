@@ -4,6 +4,7 @@
 //! video players use it.
 
 use super::Mach64;
+use super::engine::read_le;
 use super::regs::*;
 
 /// The overlay as its registers set it up.
@@ -117,7 +118,7 @@ impl Overlay {
             }
             let src_x = (((x - self.x0) * self.h_step) >> 12).min(self.width - 1);
             let at = line + src_x * bytes;
-            let word = || byte(at) | byte(at + 1) << 8;
+            let word = || read_le::<2>(vram, at);
             let five = |v: u32| (v << 3 | v >> 2) as u8;
             let (r, g, b) = match self.format {
                 3 => {
@@ -129,7 +130,10 @@ impl Overlay {
                     let g = p >> 5 & 63;
                     (five(p >> 11), (g << 2 | g >> 4) as u8, five(p & 31))
                 }
-                6 => (byte(at + 2) as u8, byte(at + 1) as u8, byte(at) as u8),
+                6 => {
+                    let p = read_le::<4>(vram, at);
+                    ((p >> 16) as u8, (p >> 8) as u8, p as u8)
+                }
                 // A pair of pixels shares U and V.
                 0xB | 0xC => {
                     let pair = line + (src_x & !1) * 2;

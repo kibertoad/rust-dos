@@ -16,6 +16,8 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
+#[cfg(test)]
+mod memory_tests;
 mod mix;
 mod rows;
 use mix::Mix;
@@ -68,6 +70,26 @@ impl Size {
     }
 }
 
+/// `BYTES` (2 or 4) bytes of `vram` from byte `start`, little-endian,
+/// each byte's address masked with `vram.len() - 1` like a single byte's.
+#[inline]
+pub fn read_le<const BYTES: usize>(vram: &[u8], start: u32) -> u32 {
+    let wrap = vram.len() - 1;
+    let start = start as usize;
+    if start & (BYTES - 1) == 0 && wrap & (BYTES - 1) == BYTES - 1 {
+        // An aligned start under a mask that keeps the low bits: all the
+        // bytes stay contiguous after wrapping.
+        let start = start & wrap;
+        let mut bytes = [0; 4];
+        bytes[..BYTES].copy_from_slice(&vram[start..start + BYTES]);
+        u32::from_le_bytes(bytes)
+    } else {
+        (0..BYTES).fold(0, |value, i| {
+            value | (vram[(start + i) & wrap] as u32) << (8 * i)
+        })
+    }
+}
+
 /// The video memory as the engine addresses it: by pixel, in pixels of a
 /// size, wrapping at its end. Sub-byte pixels are taken from the high
 /// bits of a byte first, or from the low bits with `lsb_first`
@@ -83,8 +105,8 @@ impl Memory<'_> {
         let byte = |i: u32| self.vram[i as usize & wrap] as u32;
         match size {
             Size::Byte => byte(at),
-            Size::Word => byte(at << 1) | byte((at << 1) + 1) << 8,
-            Size::Dword => (0..4).map(|i| byte((at << 2) + i) << (8 * i)).sum(),
+            Size::Word => self.read_word::<2>(at),
+            Size::Dword => self.read_word::<4>(at),
             Size::Nibble => byte(at >> 1) >> self.sub_shift(at, 4) & 0xF,
             Size::Bit => byte(at >> 3) >> self.sub_shift(at, 1) & 1,
         }
@@ -94,22 +116,42 @@ impl Memory<'_> {
         let wrap = self.vram.len() - 1;
         match size {
             Size::Byte => self.vram[at as usize & wrap] = value as u8,
-            Size::Word => {
-                for i in 0..2 {
-                    self.vram[((at << 1) + i) as usize & wrap] = (value >> (8 * i)) as u8;
-                }
-            }
-            Size::Dword => {
-                for i in 0..4 {
-                    self.vram[((at << 2) + i) as usize & wrap] = (value >> (8 * i)) as u8;
-                }
-            }
+            Size::Word => self.write_word::<2>(at, value),
+            Size::Dword => self.write_word::<4>(at, value),
             Size::Nibble | Size::Bit => {
                 let bits = size.bits();
                 let shift = self.sub_shift(at, bits);
                 let byte = &mut self.vram[(at / (8 / bits)) as usize & wrap];
                 let mask = (((1u32 << bits) - 1) << shift) as u8;
                 *byte = *byte & !mask | ((value << shift) as u8 & mask);
+            }
+        }
+    }
+
+    #[inline]
+    fn read_word<const BYTES: usize>(&self, at: u32) -> u32 {
+        read_le::<BYTES>(self.vram, at << BYTES.trailing_zeros())
+    }
+
+    /// `BYTES` (2 or 4) bytes from byte address `start`, little-endian,
+    /// each byte wrapping at the end of the memory: a texel, which can
+    /// start on any byte.
+    #[inline]
+    pub fn read_bytes<const BYTES: usize>(&self, start: u32) -> u32 {
+        read_le::<BYTES>(self.vram, start)
+    }
+
+    #[inline]
+    fn write_word<const BYTES: usize>(&mut self, at: u32, value: u32) {
+        let wrap = self.vram.len() - 1;
+        let start = (at << BYTES.trailing_zeros()) as usize;
+        let bytes = value.to_le_bytes();
+        if wrap & (BYTES - 1) == BYTES - 1 {
+            let start = start & wrap;
+            self.vram[start..start + BYTES].copy_from_slice(&bytes[..BYTES]);
+        } else {
+            for (i, &byte) in bytes[..BYTES].iter().enumerate() {
+                self.vram[(start + i) & wrap] = byte;
             }
         }
     }
