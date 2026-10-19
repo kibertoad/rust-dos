@@ -701,6 +701,7 @@ impl Pipe {
 
     /// The pixel at `x`, `y` over `dst`, or None where the pipe leaves it:
     /// failing the Z test, an alpha mask's 0, a keyed texel.
+    #[inline]
     pub fn pixel(
         &self,
         mem: &mut Memory,

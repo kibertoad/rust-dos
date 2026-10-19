@@ -9,7 +9,7 @@ use std::hint::black_box;
 
 pub fn pipelines(c: &mut Criterion) {
     let mut group = c.benchmark_group("mach64_pipeline");
-    for format in [3u32, 4, 6] {
+    for format in [3u32, 4, 6, 15] {
         for textured in [false, true] {
             for depth in [false, true] {
                 let mut card = Mach64::new(false);
