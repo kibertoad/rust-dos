@@ -16,7 +16,9 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
+mod mix;
 mod rows;
+use mix::Mix;
 
 /// What a register write started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,8 +175,8 @@ struct Setup {
     /// The source's start counted in bits: the mono source's and the
     /// polygon boundary's.
     src_bits: u32,
-    mix_fg: u32,
-    mix_bg: u32,
+    mix_fg: Mix,
+    mix_bg: Mix,
     src_fg: u32,
     src_bg: u32,
     mono: u32,
@@ -217,8 +219,8 @@ impl Setup {
             src_base: pixels(r(SRC_OFF_PITCH), src_size),
             src_pitch: pitch(r(SRC_OFF_PITCH)),
             src_bits: pixels(r(SRC_OFF_PITCH), Size::Bit),
-            mix_fg: r(DP_MIX) >> 16 & 0x1F,
-            mix_bg: r(DP_MIX) & 0x1F,
+            mix_fg: Mix::new(r(DP_MIX) >> 16 & 0x1F),
+            mix_bg: Mix::new(r(DP_MIX) & 0x1F),
             src_fg: r(DP_SRC) >> 8 & 7,
             src_bg: r(DP_SRC) & 7,
             mono: r(DP_SRC) >> 16 & 3,
@@ -318,33 +320,6 @@ impl Setup {
         self.compare.2 >> 24 & 3 == 0
     }
 
-    /// Mix `mix` of source `s` and destination `d`: the 16 logical
-    /// operations, and 17h the average of the two, its carries broken
-    /// where DP_CHAIN_MSK has a 1. The saturating mixes (10h-16h,
-    /// 18h-1Fh) take the source.
-    fn mix(&self, mix: u32, s: u32, d: u32) -> u32 {
-        match mix {
-            0x0 => !d,
-            0x1 => 0,
-            0x2 => u32::MAX,
-            0x3 => d,
-            0x4 => !s,
-            0x5 => s ^ d,
-            0x6 => !(s ^ d),
-            0x7 => s,
-            0x8 => !(s & d),
-            0x9 => !s | d,
-            0xA => s | !d,
-            0xB => s | d,
-            0xC => s & d,
-            0xD => s & !d,
-            0xE => !s & d,
-            0xF => !(s | d),
-            0x17 => self.average(s, d),
-            _ => s,
-        }
-    }
-
     fn average(&self, s: u32, d: u32) -> u32 {
         let bits = self.dst_size.bits().clamp(8, 32);
         let mut chain = self.chain_mask & 0x7FFF | 0x8000;
@@ -381,7 +356,8 @@ impl Setup {
             return;
         }
         let mask = rot.map_or(self.write_mask, |r| self.write_mask >> (8 * r) & 0xFF);
-        let out = self.mix(if foreground { self.mix_fg } else { self.mix_bg }, src, dst);
+        let mix = if foreground { self.mix_fg } else { self.mix_bg };
+        let out = mix.apply(self, src, dst);
         mem.write(at, self.dst_size, out & mask | dst & !mask);
     }
 
@@ -1475,6 +1451,24 @@ mod tests {
         write(&mut card, &mut vram, DST_Y_X, 9 << 16);
         write(&mut card, &mut vram, DST_HEIGHT_WIDTH, 8 << 16 | 1);
         assert_eq!(&vram[..10], &[1, 2, 1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn host_transfer_keeps_the_mix_selected_at_start() {
+        let (mut card, mut vram) = card();
+        write(&mut card, &mut vram, DP_SRC, 0x200);
+        write(&mut card, &mut vram, DST_Y_X, 0);
+        write(&mut card, &mut vram, DST_HEIGHT_WIDTH, 8 << 16 | 1);
+        write(&mut card, &mut vram, HOST_DATA0, 0x0403_0201);
+        assert!(card.engine.busy());
+        write(&mut card, &mut vram, DP_MIX, 0x0004_0007);
+        write(&mut card, &mut vram, HOST_DATA0, 0x0807_0605);
+        assert!(!card.engine.busy());
+        assert_eq!(&vram[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        write(&mut card, &mut vram, DST_HEIGHT_WIDTH, 8 << 16 | 1);
+        write(&mut card, &mut vram, HOST_DATA0, 0x0403_0201);
+        write(&mut card, &mut vram, HOST_DATA0, 0x0807_0605);
+        assert_eq!(&vram[..8], &[254, 253, 252, 251, 250, 249, 248, 247]);
     }
 
     #[test]
