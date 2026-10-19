@@ -246,16 +246,22 @@ impl ConfigUi {
     /// Draw the visualizer over the bottom of `frame`, while the window is
     /// closed.
     pub fn draw_sound_viz(&mut self, frame: &mut Frame) {
+        self.draw_sound_viz_rows(frame);
+    }
+
+    /// Draw the sound panel and report its current extent, which changes
+    /// with the instruments and sounding MIDI channels.
+    pub fn draw_sound_viz_rows(&mut self, frame: &mut Frame) -> std::ops::Range<usize> {
         if self.open {
-            return;
+            return 0..0;
         }
-        let Some(viz) = &mut self.sound_viz else { return };
+        let Some(viz) = &mut self.sound_viz else { return 0..0 };
         viz.hits.clear();
-        let Some(view) = &viz.view else { return };
+        let Some(view) = &viz.view else { return 0..0 };
         let (width, height) = (frame.width as usize, frame.height as usize);
         let cols = (width / 8).saturating_sub(2);
         if cols < 40 || height < 100 {
-            return;
+            return 0..0;
         }
 
         // The parts, and the cell height that lets them fit in the lower
@@ -388,6 +394,7 @@ impl ConfigUi {
             piano(frame, rect, &viz.glow[ch as usize], muted);
         }
         viz.hits = hits;
+        layout.y..(layout.y + rows * cell_h).min(height)
     }
 }
 
@@ -452,6 +459,37 @@ fn piano(frame: &mut Frame, (x0, y0, w, h): (usize, usize, usize, usize), glow: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_bounds_follow_the_sound_panels_changing_channel_count() {
+        for (width, height) in [(400, 300), (640, 400), (1024, 768)] {
+            let mut ui = ConfigUi::new();
+            for channels in [1, 8, 2, 0] {
+                let mut held = Box::new([[0; 128]; 16]);
+                for notes in held.iter_mut().take(channels) {
+                    notes[60] = 100;
+                }
+                ui.sound_viz = Some(SoundViz {
+                    view: Some(SoundView {
+                        scopes: vec![(Channel::Master, vec![1000.0; 128])],
+                        silenced: 0,
+                        opl: None,
+                        gus: None,
+                        midi: Some((held, 0)),
+                    }),
+                    ..Default::default()
+                });
+                let mut frame = Frame::new(width, height);
+                let previous = frame.rgba.clone();
+                let rows = ui.draw_sound_viz_rows(&mut frame);
+                let bytes = width as usize * 4;
+                assert!(!rows.is_empty() && rows.len() < height as usize);
+                assert_ne!(previous, frame.rgba);
+                assert_eq!(&previous[..rows.start * bytes], &frame.rgba[..rows.start * bytes]);
+                assert_eq!(&previous[rows.end * bytes..], &frame.rgba[rows.end * bytes..]);
+            }
+        }
+    }
 
     #[test]
     fn notes_and_bars() {
