@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod bios;
 pub mod cga;
 pub mod composite;
+pub mod compose;
 pub mod crt;
 pub mod echo;
 pub mod et4000;
@@ -219,6 +220,7 @@ impl Eq for Frame {}
 struct DrawnFrom {
     key: Vec<u8>,
     rows: Vec<u8>,
+    changed: std::ops::Range<usize>,
 }
 
 impl DrawnFrom {
@@ -226,6 +228,7 @@ impl DrawnFrom {
     /// rows kept under another key. True if the rows kept are still those
     /// on the canvas.
     fn reuse(&mut self, key: &[u8], len: usize) -> bool {
+        self.changed = 0..0;
         if self.key != key {
             self.key.clear();
             self.key.extend_from_slice(key);
@@ -234,6 +237,15 @@ impl DrawnFrom {
         let known = self.rows.len() == len;
         self.rows.resize(len, 0);
         known
+    }
+
+    fn changed(&mut self, rows: std::ops::Range<usize>) {
+        if self.changed.is_empty() {
+            self.changed = rows;
+        } else if !rows.is_empty() {
+            self.changed.start = self.changed.start.min(rows.start);
+            self.changed.end = self.changed.end.max(rows.end);
+        }
     }
 }
 
@@ -281,6 +293,51 @@ impl Frame {
         *self = Self::new(width, height);
         true
     }
+
+    /// Copy a band from a complete picture. A geometry change copies the
+    /// whole picture instead. The returned band is what was copied.
+    pub fn copy_rows_from(
+        &mut self,
+        source: &Self,
+        rows: std::ops::Range<usize>,
+    ) -> std::ops::Range<usize> {
+        assert!(rows.start <= rows.end && rows.end <= source.height as usize);
+        if (self.width, self.height) != (source.width, source.height) {
+            self.clone_from(source);
+            return 0..source.height as usize;
+        }
+        let bytes = source.width as usize * 4;
+        let band = rows.start * bytes..rows.end * bytes;
+        self.rgba[band.clone()].copy_from_slice(&source.rgba[band]);
+        self.doubled = source.doubled;
+        self.drawn_from = DrawnFrom::default();
+        rows
+    }
+}
+
+/// The rows (of `row_bytes` each) from the first to the last that differ
+/// between two pictures of the same size, if any do.
+pub fn changed_rows(old: &[u8], new: &[u8], row_bytes: usize) -> Option<std::ops::Range<usize>> {
+    let pairs = || old.chunks_exact(row_bytes).zip(new.chunks_exact(row_bytes));
+    let first = pairs().position(|(a, b)| a != b)?;
+    let last = pairs().rposition(|(a, b)| a != b)?;
+    Some(first..last + 1)
+}
+
+/// Compare only a band known to contain every possible change since
+/// `old`. The caller must include changes from any frames it skipped.
+pub fn changed_rows_in(
+    old: &[u8],
+    new: &[u8],
+    row_bytes: usize,
+    rows: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    if rows.is_empty() || row_bytes == 0 {
+        return None;
+    }
+    let band = rows.start * row_bytes..rows.end * row_bytes;
+    changed_rows(&old[band.clone()], &new[band], row_bytes)
+        .map(|changed| changed.start + rows.start..changed.end + rows.start)
 }
 
 /// The size of the picture of the current video mode: 640x400 for the
@@ -327,6 +384,14 @@ pub fn frame_size(bus: &Bus) -> (u32, u32) {
 /// Draw the rows the VGA marked dirty into `frame`, which must be
 /// `frame_size` big.
 pub fn render_screen(frame: &mut Frame, bus: &Bus) {
+    render_screen_rows(frame, bus);
+}
+
+/// Draw the dirty picture and return the band its decoder may have
+/// changed. Rows outside the band retain their previous pixels. Cached
+/// decoders report only the rows they actually repaint, including scaled
+/// copies. Other renderers conservatively include everything they touch.
+pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize> {
     if let Some(v) = &bus.voodoo
         && v.output()
     {
@@ -335,8 +400,9 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
             frame.drawn_from = DrawnFrom::default();
             frame.doubled = false;
             v.render(&mut frame.rgba, frame.width as usize);
+            return 0..frame.height as usize;
         }
-        return;
+        return 0..0;
     }
     // Re-render only the rows the VGA has marked dirty since the last call.
     // For the common case of a shell prompt blinking or one line of output,
@@ -346,7 +412,7 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
     let y_min = bus.vga.dirty_y_min.min(frame.height) as usize;
     let y_max = bus.vga.dirty_y_max.min(frame.height) as usize;
     if y_min >= y_max {
-        return;
+        return 0..0;
     }
 
     // The 256-color renderer covers every pixel, and leaves the rows it
@@ -357,7 +423,7 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
         frame.drawn_from = DrawnFrom::default();
         frame.doubled = false;
         render_hicolor(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, bpp);
-        return;
+        return 0..frame.height as usize;
     }
     if bus.video_mode == VideoMode::Graphics320x200 && !bus.vga.adapter.gate_array() {
         let (w, rows) = bus.vga.graphics_size();
@@ -369,14 +435,14 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
             &mut frame.drawn_from,
         );
         frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
-        return;
+        return frame.drawn_from.changed.clone();
     }
     // So does the 16-color one.
     if bus.video_mode.is_planar() && !bus.vga.adapter.gate_array() {
         let (w, rows) = bus.vga.graphics_size();
         render_planar(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
         frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
-        return;
+        return frame.drawn_from.changed.clone();
     }
     // And the CGA's graphics on a composite monitor, at 640x400.
     if matches!(bus.video_mode, VideoMode::Cga320x200Color | VideoMode::Cga320x200 | VideoMode::Cga640x200)
@@ -392,7 +458,7 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
         } else {
             render_cga_mode4(&mut frame.rgba, vram, bus, &mut frame.drawn_from);
         }
-        return;
+        return frame.drawn_from.changed.clone();
     }
     frame.drawn_from = DrawnFrom::default();
     frame.doubled = false;
@@ -410,7 +476,11 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
             Some(geometry) => text::render(canvas, width, bus, &geometry, y_min, y_max, bus.display_mem()),
             None => tandy::render_graphics(canvas, bus),
         }
-        return;
+        return if text::geometry(bus).is_some() {
+            y_min..y_max
+        } else {
+            0..frame.height as usize
+        };
     }
 
     match bus.video_mode {
@@ -442,6 +512,11 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
         VideoMode::Vesa => render_vbe(canvas, width, y_min, y_max, bus),
         // Only the gate array has them, which is drawn above.
         VideoMode::Tandy160x200x16 | VideoMode::Tandy320x200x16 | VideoMode::Tandy640x200x4 => {}
+    }
+    if bus.video_mode.is_text() || bus.video_mode == VideoMode::Vesa {
+        y_min..y_max
+    } else {
+        0..frame.height as usize
     }
 }
 
@@ -771,6 +846,7 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
         if y == last_y {
             if last_drawn {
                 canvas.copy_within(dst - row_bytes..dst, dst);
+                drawn_from.changed(ty..ty + 1);
             }
             continue;
         }
@@ -804,6 +880,7 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
         if same {
             continue;
         }
+        drawn_from.changed(ty..ty + 1);
         planar_row(vram, plane_size, start, pan, width, &mut line);
         let out = &mut canvas[dst..dst + row_bytes];
         if canvas_w == 2 * width {
@@ -984,6 +1061,7 @@ fn render_graphics_mode(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &B
             continue;
         }
         drawn.copy_from_slice(&line);
+        drawn_from.changed(first..end);
         let dst = &mut canvas[first * row_bytes..(first + 1) * row_bytes];
         if canvas_w == 2 * width {
             // Each pixel twice: its color looked up once.
@@ -1158,6 +1236,7 @@ fn render_cga_composite(
             let row = (y * 2 + dy) * width * 4;
             if row + rgb.len() <= canvas.len() {
                 canvas[row..row + rgb.len()].copy_from_slice(&rgb);
+                drawn_from.changed(y * 2 + dy..y * 2 + dy + 1);
             }
         }
     }

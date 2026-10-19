@@ -75,3 +75,47 @@ fn rgba_uploads_preserve_full_partial_and_subsampled_rows() {
     assert_eq!(screen.texture_size, (8, 6));
     assert_eq!(texture(&screen), doubled.rgba);
 }
+
+#[test]
+#[ignore = "requires a desktop OpenGL context"]
+fn persistent_compositions_keep_their_pixels_after_partial_presentation() {
+    use crate::display::{Display, Output};
+    let sdl = sdl2::init().unwrap();
+    let video = sdl.video().unwrap();
+    let textures = std::cell::OnceCell::new();
+    let mut display = Display::open(
+        &video,
+        "Persistent composition regression",
+        &Default::default(),
+        &textures,
+    )
+    .unwrap();
+    let mut frame = Frame::from_rgb(5, 4, (0..60).collect());
+    display.set_frame_size(5, 4).unwrap();
+    display.present_rows(&frame, None, None, 0..0).unwrap();
+    let check = |display: &Display<'_>, frame: &Frame| {
+        assert_eq!(display.shown, frame.rgba);
+        let Output::Gl(gl) = &display.out else { panic!("OpenGL is required") };
+        assert_eq!(texture(gl), frame.rgba);
+    };
+    check(&display, &frame);
+    for step in 0..30 {
+        let y = step % 4;
+        frame.rgba[y * 20..(y + 1) * 20]
+            .as_chunks_mut::<4>()
+            .0
+            .fill([step as u8, 99, 37, 255]);
+        let before = frame.rgba.clone();
+        display.present_rows(&frame, None, None, y..y + 1).unwrap();
+        assert_eq!(frame.rgba, before, "presenting must retain the composed pixels");
+        check(&display, &frame);
+    }
+    // A redraw and a mode change cannot rely on decoder damage alone.
+    display.redraw();
+    display.present_rows(&frame, None, None, 0..0).unwrap();
+    check(&display, &frame);
+    frame = Frame::from_rgb(4, 5, (0..60).rev().collect());
+    display.set_frame_size(4, 5).unwrap();
+    display.present_rows(&frame, None, None, 0..0).unwrap();
+    check(&display, &frame);
+}
