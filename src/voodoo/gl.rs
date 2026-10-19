@@ -24,6 +24,9 @@ const PIXELS_FRAG: &str = include_str!("gl/pixels.frag");
 const DEPTH_FRAG: &str = include_str!("gl/depth.frag");
 const CLUT_FRAG: &str = include_str!("gl/clut.frag");
 
+mod state;
+#[cfg(test)]
+mod state_tests;
 mod uniforms;
 use uniforms::{Locations, Quad, Triangle};
 
@@ -146,6 +149,7 @@ pub struct VoodooGl {
     staging_texture: glow::Texture,
     textures: HashMap<u32, GlTexture>,
     texture_bytes: Vec<u8>,
+    state: state::State,
     /// The gamma table as 256 entries a component, and the table it is.
     lut: glow::Texture,
     lut_of: Option<[u32; 33]>,
@@ -235,6 +239,7 @@ impl VoodooGl {
                 staging_texture,
                 textures: HashMap::new(),
                 texture_bytes: Vec::new(),
+                state: state::State::default(),
                 lut,
                 lut_of: None,
                 composite: None,
@@ -307,6 +312,11 @@ impl VoodooGl {
 
     /// Draw `recording`; whether the picture may have changed with it.
     pub fn run(&mut self, gl: &glow::Context, recording: Recording) -> bool {
+        self.state.invalidate();
+        // A frontend can leave face culling on, and the card draws both
+        // windings.
+        // SAFETY: see `VoodooGl`.
+        unsafe { gl.disable(glow::CULL_FACE) };
         let changed = !recording.commands.is_empty() || self.front != recording.front || self.clut != recording.clut;
         for command in &recording.commands {
             match command {
@@ -338,6 +348,7 @@ impl VoodooGl {
         self.front = recording.front;
         self.clut = recording.clut;
         restore(gl);
+        self.state.invalidate();
         changed
     }
 
@@ -392,6 +403,8 @@ impl VoodooGl {
             let (w, h) = (self.width as i32, self.height as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, none);
         }
+        // Target allocation binds framebuffers and changes the viewport.
+        self.state.invalidate();
         for (&offs, pixels) in layout.color.iter().zip(&snapshot.color) {
             self.stage_rows(Some(offs), pixels);
             self.flush_staging(gl, Some(offs));
@@ -463,18 +476,19 @@ impl VoodooGl {
             let pixels = glow::PixelUnpackData::Slice(Some(rows));
             let (y, h) = (y0 as i32, (y1 - y0) as i32);
             gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, y, w as i32, h, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, sw, sh);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
+            self.state.framebuffer(gl, fbo);
+            self.state.viewport(gl, [0, 0, sw, sh]);
+            self.state.blend(gl, false);
+            self.state.scissor(gl, None);
+            self.state.stencil(gl, false);
             if key.is_some() {
-                gl.disable(glow::DEPTH_TEST);
-                gl.color_mask(true, true, true, false);
+                self.state.depth(gl, false);
+                self.state.color_mask(gl, [true, true, true, false]);
             } else {
-                gl.enable(glow::DEPTH_TEST);
-                gl.depth_func(glow::ALWAYS);
-                gl.depth_mask(true);
-                gl.color_mask(false, false, false, false);
+                self.state.depth(gl, true);
+                self.state.depth_func(gl, glow::ALWAYS);
+                self.state.depth_mask(gl, true);
+                self.state.color_mask(gl, [false; 4]);
             }
             gl.use_program(Some(program.program));
             program.uniforms.u_rect.set(gl, [x0 as f32, y0 as f32, x1 as f32, y1 as f32]);
@@ -576,30 +590,37 @@ impl VoodooGl {
         let p = &self.triangle;
         // SAFETY: see `VoodooGl`.
         unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.draw_fbo()));
-            gl.viewport(0, 0, w, h);
+            self.state.framebuffer(gl, target.draw_fbo());
+            self.state.viewport(gl, [0, 0, w, h]);
             self.clip(gl, s.clip);
-            gl.disable(glow::STENCIL_TEST);
+            self.state.stencil(gl, false);
             if has_depth && (depth_test || depth_write) {
-                gl.enable(glow::DEPTH_TEST);
-                gl.depth_func(if depth_test { DEPTH_FUNCS[func] } else { glow::ALWAYS });
-                gl.depth_mask(depth_write);
+                self.state.depth(gl, true);
+                self.state.depth_func(
+                    gl,
+                    if depth_test { DEPTH_FUNCS[func] } else { glow::ALWAYS },
+                );
+                self.state.depth_mask(gl, depth_write);
             } else {
-                gl.disable(glow::DEPTH_TEST);
+                self.state.depth(gl, false);
             }
-            gl.color_mask(rgb, rgb, rgb, alpha_planes && fbz & (1 << 10) != 0);
+            self.state
+                .color_mask(gl, [rgb, rgb, rgb, alpha_planes && fbz & (1 << 10) != 0]);
             let am = s.alpha_mode;
             if am & (1 << 4) != 0 {
                 let alpha = |f: u32| if f == 4 { glow::ONE } else { glow::ZERO };
-                gl.enable(glow::BLEND);
-                gl.blend_func_separate(
-                    source_factor((am >> 8) & 15),
-                    dest_factor((am >> 12) & 15),
-                    alpha((am >> 16) & 15),
-                    alpha((am >> 20) & 15),
+                self.state.blend(gl, true);
+                self.state.blend_func(
+                    gl,
+                    [
+                        source_factor((am >> 8) & 15),
+                        dest_factor((am >> 12) & 15),
+                        alpha((am >> 16) & 15),
+                        alpha((am >> 20) & 15),
+                    ],
                 );
             } else {
-                gl.disable(glow::BLEND);
+                self.state.blend(gl, false);
             }
 
             gl.use_program(Some(p.program));
@@ -680,7 +701,7 @@ impl VoodooGl {
                 // Keep overlapping triangles in order, including with MSAA:
                 // each gets its own reference, so the buffer is cleared only
                 // every 255 triangles.
-                gl.enable(glow::STENCIL_TEST);
+                self.state.stencil(gl, true);
                 for (n, first) in (0..draw.vertices.len() as i32).step_by(3).enumerate() {
                     let reference = (n % 255) as i32 + 1;
                     gl.stencil_mask(0xFF);
@@ -690,22 +711,22 @@ impl VoodooGl {
                     }
                     gl.stencil_func(glow::ALWAYS, reference, 0xFF);
                     gl.stencil_op(glow::KEEP, glow::KEEP, glow::REPLACE);
-                    gl.depth_func(DEPTH_FUNCS[func]);
-                    gl.depth_mask(false);
-                    gl.color_mask(rgb, rgb, rgb, false);
+                    self.state.depth_func(gl, DEPTH_FUNCS[func]);
+                    self.state.depth_mask(gl, false);
+                    self.state.color_mask(gl, [rgb, rgb, rgb, false]);
                     p.uniforms.u_constant_depth.set(gl, 1);
                     gl.draw_arrays(glow::TRIANGLES, first, 3);
 
                     gl.stencil_mask(0);
                     gl.stencil_func(glow::EQUAL, reference, 0xFF);
                     gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
-                    gl.depth_func(glow::ALWAYS);
-                    gl.depth_mask(true);
-                    gl.color_mask(false, false, false, false);
+                    self.state.depth_func(gl, glow::ALWAYS);
+                    self.state.depth_mask(gl, true);
+                    self.state.color_mask(gl, [false; 4]);
                     p.uniforms.u_constant_depth.set(gl, 0);
                     gl.draw_arrays(glow::TRIANGLES, first, 3);
                 }
-                gl.disable(glow::STENCIL_TEST);
+                self.state.stencil(gl, false);
                 gl.stencil_mask(0xFF);
             } else {
                 gl.draw_arrays(glow::TRIANGLES, 0, draw.vertices.len() as i32);
@@ -719,42 +740,36 @@ impl VoodooGl {
     /// pixels), or everywhere.
     fn clip(&self, gl: &glow::Context, clip: Option<[u32; 4]>) {
         let s = self.scale as i32;
-        // SAFETY: see `VoodooGl`.
-        unsafe {
-            match clip {
-                Some([l, r, t, b]) => {
-                    let (l, r) = (l.min(self.width) as i32, r.min(self.width) as i32);
-                    let (t, b) = (t.min(self.height) as i32, b.min(self.height) as i32);
-                    gl.enable(glow::SCISSOR_TEST);
-                    gl.scissor(l * s, t * s, (r - l).max(0) * s, (b - t).max(0) * s);
-                }
-                None => gl.disable(glow::SCISSOR_TEST),
-            }
-        }
+        let rect = clip.map(|[l, r, t, b]| {
+            let (l, r) = (l.min(self.width) as i32, r.min(self.width) as i32);
+            let (t, b) = (t.min(self.height) as i32, b.min(self.height) as i32);
+            [l * s, t * s, (r - l).max(0) * s, (b - t).max(0) * s]
+        });
+        self.state.scissor(gl, rect);
     }
 
     fn fill(&mut self, gl: &glow::Context, fill: &Fill) {
         let [l, r, t, b] = fill.rect;
         // SAFETY: see `VoodooGl`.
         unsafe {
-            gl.disable(glow::BLEND);
+            self.state.blend(gl, false);
             self.clip(gl, Some([l, r, t, b]));
             let target = self.targets.get(&fill.dest).or_else(|| self.targets.values().next());
             let Some(target) = target else { return };
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.draw_fbo()));
+            self.state.framebuffer(gl, target.draw_fbo());
             if let Some(color) = fill.color {
-                gl.color_mask(true, true, true, false);
+                self.state.color_mask(gl, [true, true, true, false]);
                 let c = |shift: u32| ((color >> shift) & 0xFF) as f32 / 255.0;
                 gl.clear_color(c(16), c(8), c(0), 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
             if let Some(aux) = fill.aux {
                 if fill.alpha_planes {
-                    gl.color_mask(false, false, false, true);
+                    self.state.color_mask(gl, [false, false, false, true]);
                     gl.clear_color(0.0, 0.0, 0.0, (aux & 0xFF) as f32 / 255.0);
                     gl.clear(glow::COLOR_BUFFER_BIT);
                 } else if self.depth.is_some() {
-                    gl.depth_mask(true);
+                    self.state.depth_mask(gl, true);
                     gl.clear_depth_f64(aux as f64 / 65535.0);
                     gl.clear(glow::DEPTH_BUFFER_BIT);
                 }
