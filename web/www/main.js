@@ -165,6 +165,17 @@ const canvas = $('screen');
 /// on a 2D canvas as it is. A canvas keeps the kind it is first asked for.
 const screenGl = params.get('renderer') === '2d' ? null : makeGlScreen();
 const screen2d = screenGl ? null : canvas.getContext('2d', { alpha: false });
+/// The 2D canvas needs the whole picture, not just the changed rows: it
+/// was resized, or its context was lost and came back blank.
+let repaint2d = true;
+if (screen2d) {
+  canvas.addEventListener('contextrestored', () => {
+    repaint2d = true;
+    if (machine) {
+      draw();
+    }
+  });
+}
 
 let wasm;
 let machine;
@@ -423,6 +434,10 @@ function draw() {
     canvas.width = width;
     canvas.height = height;
     layout();
+    repaint2d = true;
+  }
+  if (repaint2d) {
+    repaint2d = false;
     first = 0;
     end = height;
   }
