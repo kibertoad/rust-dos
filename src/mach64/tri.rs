@@ -16,6 +16,8 @@ use super::regs::*;
 
 #[path = "tri/lod.rs"]
 mod lod;
+#[path = "tri/pipeline.rs"]
+mod pipeline;
 
 /// An 8-bit colour with alpha, as the pipe works on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -247,6 +249,7 @@ impl TexelSource<'_, '_> {
 }
 
 /// The destination's pixel as a colour, for blending.
+#[inline]
 fn unpack(v: u32, format: u32) -> Argb {
     match format {
         3 => Argb {
@@ -291,6 +294,7 @@ const DITHER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15
 /// format's bits after the dither (SCALE_3D_CNTL bit 2) or rounding
 /// (bit 4). 8-bit destinations are RGB 3:3:2, red at most 6 with
 /// RED_DITHER_MAX (bit 14).
+#[inline]
 fn pack(c: Argb, format: u32, x: i32, y: i32, cntl: u32) -> u32 {
     let cut = |v: i32, bits: i32| -> u32 {
         let drop = 8 - bits;
@@ -443,6 +447,7 @@ pub struct Pipe {
     span_t: (i64, i64),
     span_dy: (i64, i64),
     lod: lod::Lod,
+    shade: pipeline::Pixel,
     dir: i32,
 }
 
@@ -491,8 +496,10 @@ impl Pipe {
             span_t: (0, 0),
             span_dy: (0, 0),
             lod: lod::Lod::default(),
+            shade: Self::pixel_mode::<false, false, false, 16>,
             dir: 1,
         };
+        pipe.shade = pipe.select_pixel();
         pipe.lod = lod::Lod::new(
             pipe.cntl,
             pipe.tex_size,
@@ -670,11 +677,12 @@ impl Pipe {
     /// Z at the pixel against the Z buffer (Z_CNTL): 16 bits, the integer
     /// part of the interpolator. Returns whether it passes and where the
     /// pixel's Z is, with its new value.
-    fn z_test(&self, mem: &Memory, x: i32, y: i32) -> (bool, u32, u32) {
+    #[inline]
+    fn z_test(&self, mem: &Memory, x: i32, y: i32, enabled: bool) -> (bool, u32, u32) {
         let z = (self.span_z.0 >> 12).clamp(0, 0xFFFF) as u32;
         let pitch = ((self.z_off_pitch >> 22 & 0x3FF) * 8) as i32;
         let at = ((self.z_off_pitch & 0xF_FFFF) << 2).wrapping_add((y * pitch + x) as u32);
-        if self.z_cntl & 1 == 0 {
+        if !enabled {
             return (true, at, z);
         }
         let old = mem.read(at, Size::Word);
@@ -701,7 +709,38 @@ impl Pipe {
         y: i32,
         dst: u32,
     ) -> Option<u32> {
-        let (pass, z_at, z) = self.z_test(mem, x, y);
+        (self.shade)(self, mem, palettes, x, y, dst)
+    }
+
+    fn pixel_mode<
+        const SPECIALIZED: bool,
+        const ZTEST: bool,
+        const TEXTURED: bool,
+        const FORMAT: u32,
+    >(
+        &self,
+        mem: &mut Memory,
+        palettes: &Palettes,
+        x: i32,
+        y: i32,
+        dst: u32,
+    ) -> Option<u32> {
+        let ztest = if SPECIALIZED {
+            ZTEST
+        } else {
+            self.z_cntl & 1 != 0
+        };
+        let textured = if SPECIALIZED {
+            TEXTURED
+        } else {
+            self.cntl >> 6 & 3 == 2
+        };
+        let format = if FORMAT < 16 {
+            FORMAT
+        } else {
+            self.pix_width & 0xF
+        };
+        let (pass, z_at, z) = self.z_test(mem, x, y, ztest);
         if !pass {
             return None;
         }
@@ -709,7 +748,7 @@ impl Pipe {
         let lit = self.interpolated();
         let mut c = lit;
         let mut alpha = lit.a;
-        if cntl >> 6 & 3 == 2 {
+        if textured {
             let texels = TexelSource {
                 mem,
                 palettes,
@@ -794,13 +833,13 @@ impl Pipe {
                     b: fog(0, c.b),
                 };
             }
-            1 => c = blend(c, unpack(dst, self.pix_width & 0xF), alpha, cntl),
+            1 => c = blend(c, unpack(dst, format), alpha, cntl),
             _ => {}
         }
-        if self.z_cntl & 0x101 == 0x101 {
+        if ztest && self.z_cntl & 0x100 != 0 {
             mem.write(z_at, Size::Word, z);
         }
-        Some(pack(c, self.pix_width & 0xF, x, y, cntl))
+        Some(pack(c, format, x, y, cntl))
     }
 }
 
@@ -955,3 +994,7 @@ mod lod_tests;
 #[cfg(test)]
 #[path = "tri/lod_unit_tests.rs"]
 mod lod_unit_tests;
+
+#[cfg(test)]
+#[path = "tri/pipeline_tests.rs"]
+mod pipeline_tests;
