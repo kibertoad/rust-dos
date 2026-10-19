@@ -20,7 +20,6 @@ use rust_dos::voodoo::{Renderer, VoodooSettings};
 
 use crate::Callbacks;
 use crate::ffi::*;
-use crate::present::Pixels;
 
 thread_local! {
     /// The frontend's hardware rendering, once it agreed to it.
@@ -113,7 +112,7 @@ pub struct Screen {
     /// The machine's picture when the card's isn't shown.
     texture: glow::Texture,
     texture_size: (u32, u32),
-    upload: Pixels<[u8; 4]>,
+    upload: Frame,
     last_composite: bool,
     voodoo: Option<VoodooGl>,
     /// The scale, samples and anisotropy `voodoo` draws with.
@@ -150,7 +149,7 @@ impl Screen {
                 vao,
                 texture,
                 texture_size: (0, 0),
-                upload: Pixels::default(),
+                upload: Frame::new(0, 0),
                 last_composite: false,
                 voodoo: None,
                 voodoo_key: None,
@@ -250,7 +249,7 @@ impl Screen {
             let (texture, (w, h)) = match composite {
                 Some(picture) => picture,
                 None => {
-                    let rows = upload.update(screen, |[r, g, b]| [r, g, b, 255]);
+                    let rows = crate::present::changed_rows(upload, screen);
                     if rows.is_none() && !was_composite && can_dupe {
                         return (screen.width, screen.height, false);
                     }
@@ -279,7 +278,8 @@ impl Screen {
                         *texture_size = (screen.width, screen.height);
                     }
                     if let Some(rows) = rows {
-                        let pixels = &upload.data[rows.start * w as usize..rows.end * w as usize];
+                        let bytes = rows.start * w as usize * 4..rows.end * w as usize * 4;
+                        let pixels = &screen.rgba[bytes.clone()];
                         gl.tex_sub_image_2d(
                             glow::TEXTURE_2D,
                             0,
@@ -289,8 +289,10 @@ impl Screen {
                             rows.len() as i32,
                             glow::RGBA,
                             glow::UNSIGNED_BYTE,
-                            glow::PixelUnpackData::Slice(Some(pixels.as_flattened())),
+                            glow::PixelUnpackData::Slice(Some(pixels)),
                         );
+                        upload.resize(screen.width, screen.height);
+                        upload.rgba[bytes].copy_from_slice(pixels);
                     }
                     (*own, (screen.width, screen.height))
                 }
@@ -392,7 +394,7 @@ mod tests {
         let mut frame = Frame::from_rgb(3, 2, vec![17; 18]);
         assert_eq!(screen.present(&frame, None, true), (3, 2, true));
         assert_eq!(screen.present(&frame, None, true), (3, 2, false));
-        frame.rgb[9..].fill(37);
+        frame.rgba[12..].as_chunks_mut::<4>().0.fill([37, 37, 37, 255]);
         assert_eq!(screen.present(&frame, None, true), (3, 2, true));
         assert_eq!(screen.present(&frame, None, false), (3, 2, true));
         let read = |screen: &Screen, frame: &Frame| {
@@ -411,14 +413,7 @@ mod tests {
                 );
                 assert_eq!(screen.gl.get_error(), glow::NO_ERROR);
             }
-            let expected: Vec<_> = frame
-                .rgb
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .flat_map(|&[r, g, b]| [r, g, b, 255])
-                .collect();
-            assert_eq!(pixels, expected);
+            assert_eq!(&pixels, &frame.rgba);
         };
         read(&screen, &frame);
         // Same pixel count, different geometry: storage must be resized.

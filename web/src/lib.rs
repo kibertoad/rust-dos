@@ -158,8 +158,8 @@ pub struct Machine {
     /// being put together.
     screen: Frame,
     next: Frame,
-    /// `screen` as the canvas takes it: RGBA.
-    pixels: screen::Pixels,
+    /// The changed rows of the composed RGBA picture.
+    rows: screen::Rows,
     /// What the hotkeys did, over the picture, and whether the machine is
     /// paused (Alt+Pause).
     osd: Osd,
@@ -230,7 +230,7 @@ impl Machine {
             picture: blank.clone(),
             screen: blank.clone(),
             next: blank,
-            pixels: screen::Pixels::default(),
+            rows: screen::Rows::default(),
             osd: Osd::new(),
             paused: false,
             shaders: false,
@@ -444,17 +444,17 @@ impl Machine {
     /// Where the screen's pixels are in the module's memory, RGBA, as the
     /// canvas's `ImageData` takes them.
     pub fn screen_pixels(&self) -> *const u8 {
-        self.pixels.rgba.as_ptr()
+        self.screen.rgba.as_ptr()
     }
 
     /// First changed row and past the last changed row of the composed
     /// picture. Equal values mean that the previous texture still fits.
     pub fn screen_row_start(&self) -> u32 {
-        self.pixels.rows.start as u32
+        self.rows.rows.start as u32
     }
 
     pub fn screen_row_end(&self) -> u32 {
-        self.pixels.rows.end as u32
+        self.rows.rows.end as u32
     }
 
     /// Emulated instructions per millisecond, as the speed setting or the
@@ -1084,9 +1084,9 @@ impl Machine {
         self.ui.draw(&mut self.next);
         self.ui.draw_overlay(&mut self.next);
         self.osd.draw(&mut self.next);
-        if !self.pixels.update(
-            &self.screen.rgb,
-            &self.next.rgb,
+        if !self.rows.update(
+            &self.screen.rgba,
+            &self.next.rgba,
             width as usize,
             height as usize,
         ) {

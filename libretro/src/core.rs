@@ -635,7 +635,7 @@ impl Core {
         }
         let changed = self
             .xrgb
-            .update(&self.screen, |[r, g, b]| u32::from_be_bytes([0, r, g, b]));
+            .update(&self.screen, |[r, g, b, _]| u32::from_be_bytes([0, r, g, b]));
         let duplicate = changed.is_none() && self.shown.is_none() && can_dupe;
         self.shown = None;
         self.set_geometry(cb);
