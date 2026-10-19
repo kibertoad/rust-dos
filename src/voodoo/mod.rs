@@ -1223,7 +1223,9 @@ impl Voodoo {
             return switched;
         }
         if !self.picture_wanted() {
-            // The OpenGL renderer draws it: nothing needs the memory.
+            // The OpenGL renderer draws it: nothing needs the memory. The
+            // drawing and a Banshee's video processor stay dirty for the
+            // next picture that does.
             self.display_dirty |= changed;
             return switched;
         }
@@ -1551,6 +1553,13 @@ impl Voodoo {
     /// Whether the display draws the card's picture from its memory.
     pub fn picture_wanted(&self) -> bool {
         self.mirror.is_none() || self.software_picture
+    }
+
+    /// Whether the OpenGL renderer can draw its picture. A Banshee's is
+    /// the whole desktop, with the video overlay and hardware cursor,
+    /// which only its memory has.
+    pub fn gl_scanout(&self) -> bool {
+        self.banshee.is_none()
     }
 
     pub fn mirror_attached(&self) -> bool {

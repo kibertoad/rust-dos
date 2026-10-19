@@ -184,10 +184,9 @@ impl Screen {
             self.drop_voodoo();
             return false;
         };
-        // As in the desktop frontend, the Banshee's desktop, video
-        // overlay and hardware cursor need software scanout.
+        // As in the desktop frontend, a Banshee keeps software scanout.
         if settings.renderer != Renderer::OpenGl
-            || card.banshee.is_some()
+            || !card.gl_scanout()
             || self.voodoo_failed.is_some()
         {
             card.set_mirror(false);
