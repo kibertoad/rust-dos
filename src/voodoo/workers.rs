@@ -19,6 +19,8 @@ use super::setup::render_triangle;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
+// The browser draws synchronously; only native workers consume bins.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[path = "workers/bins.rs"]
 mod bins;
 
