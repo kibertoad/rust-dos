@@ -406,11 +406,13 @@ function watchPixelRatio() {
 function draw() {
   const width = machine.screen_width();
   const height = machine.screen_height();
+  let first = machine.screen_row_start();
+  let end = machine.screen_row_end();
   // The pixels stay in the module's memory; the view is made anew each
   // time, as the memory can grow.
   if (screenGl) {
     const pixels = new Uint8Array(wasm.memory.buffer, machine.screen_pixels(), width * height * 4);
-    if (screenGl.upload(pixels, width, height)) {
+    if (screenGl.upload(pixels, width, height, first, end)) {
       layout();
     } else {
       screenGl.render();
@@ -421,9 +423,14 @@ function draw() {
     canvas.width = width;
     canvas.height = height;
     layout();
+    first = 0;
+    end = height;
   }
-  const pixels = new Uint8ClampedArray(wasm.memory.buffer, machine.screen_pixels(), width * height * 4);
-  screen2d.putImageData(new ImageData(pixels, width, height), 0, 0);
+  if (first < end) {
+    const start = machine.screen_pixels() + first * width * 4;
+    const pixels = new Uint8ClampedArray(wasm.memory.buffer, start, width * (end - first) * 4);
+    screen2d.putImageData(new ImageData(pixels, width, end - first), 0, first);
+  }
 }
 
 /// The screen drawn with WebGL 2: the picture as a texture, shown through
@@ -545,17 +552,23 @@ function makeGlScreen() {
       filter();
     },
 
-    /// Take the picture's pixels (RGBA). Returns whether its size changed.
-    upload(pixels, width, height) {
+    /// Take the changed rows of the picture (RGBA). A new texture needs
+    /// the complete cached picture, including after context restoration.
+    upload(pixels, width, height, first, end) {
       gl.bindTexture(gl.TEXTURE_2D, texture);
       const resized = frame?.width !== width || frame?.height !== height;
       if (resized) {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
         frame = { width, height };
+        first = 0;
+        end = height;
       }
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-      if (look !== 'none') {
-        gl.generateMipmap(gl.TEXTURE_2D);
+      if (first < end) {
+        const rows = pixels.subarray(first * width * 4, end * width * 4);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, first, width, end - first, gl.RGBA, gl.UNSIGNED_BYTE, rows);
+        if (look !== 'none') {
+          gl.generateMipmap(gl.TEXTURE_2D);
+        }
       }
       return resized;
     },

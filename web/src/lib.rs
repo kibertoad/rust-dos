@@ -35,6 +35,8 @@ use rust_dos::video::{self, Frame};
 use wasm_bindgen::prelude::*;
 use web_time::{Duration, Instant};
 
+mod screen;
+
 /// C:'s image, as the drive list and downloads name it.
 const C_IMAGE: &str = "C.IMG";
 /// The configuration file, as the settings window names it. The page keeps
@@ -157,7 +159,7 @@ pub struct Machine {
     screen: Frame,
     next: Frame,
     /// `screen` as the canvas takes it: RGBA.
-    rgba: Vec<u8>,
+    pixels: screen::Pixels,
     /// What the hotkeys did, over the picture, and whether the machine is
     /// paused (Alt+Pause).
     osd: Osd,
@@ -228,7 +230,7 @@ impl Machine {
             picture: blank.clone(),
             screen: blank.clone(),
             next: blank,
-            rgba: Vec::new(),
+            pixels: screen::Pixels::default(),
             osd: Osd::new(),
             paused: false,
             shaders: false,
@@ -442,7 +444,17 @@ impl Machine {
     /// Where the screen's pixels are in the module's memory, RGBA, as the
     /// canvas's `ImageData` takes them.
     pub fn screen_pixels(&self) -> *const u8 {
-        self.rgba.as_ptr()
+        self.pixels.rgba.as_ptr()
+    }
+
+    /// First changed row and past the last changed row of the composed
+    /// picture. Equal values mean that the previous texture still fits.
+    pub fn screen_row_start(&self) -> u32 {
+        self.pixels.rows.start as u32
+    }
+
+    pub fn screen_row_end(&self) -> u32 {
+        self.pixels.rows.end as u32
     }
 
     /// Emulated instructions per millisecond, as the speed setting or the
@@ -1072,14 +1084,15 @@ impl Machine {
         self.ui.draw(&mut self.next);
         self.ui.draw_overlay(&mut self.next);
         self.osd.draw(&mut self.next);
-        let same = (self.next.width, self.next.height) == (self.screen.width, self.screen.height)
-            && self.next.rgb == self.screen.rgb;
-        if same && !self.rgba.is_empty() {
+        if !self.pixels.update(
+            &self.screen.rgb,
+            &self.next.rgb,
+            width as usize,
+            height as usize,
+        ) {
             return false;
         }
         std::mem::swap(&mut self.next, &mut self.screen);
-        self.rgba.clear();
-        self.rgba.extend(self.screen.rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 0xFF]));
         true
     }
 }
