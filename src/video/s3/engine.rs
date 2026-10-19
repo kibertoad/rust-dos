@@ -8,7 +8,6 @@
 //! Ported from DOSBox-X's XGA emulation (vga_xga.cpp), which Windows 95's
 //! S3 driver was installed and run against.
 
-#[path = "engine/mix.rs"]
 mod mix;
 mod rows;
 use mix::Mix;
@@ -566,14 +565,27 @@ impl Engine {
         self.cur_y = y as u16;
     }
 
-    /// The mix for a pixel whose mask bit comes from the screen (PIX_CNTL
-    /// bits 6-7 = 11b): the foreground mix where all the read-enabled bits
-    /// of `pixel` are set.
-    fn screen_mix(&self, pixel: u32, fore: Mix, back: Mix) -> Mix {
-        if pixel & self.read_mask == self.read_mask {
-            fore
-        } else {
-            back
+    /// The foreground, background and copy (67h) mixes a blit or pattern
+    /// fill picks from for each pixel, resolved once per command.
+    fn pixel_mixes(&self) -> [Mix; 3] {
+        [
+            Mix::new(self.fore_mix),
+            Mix::new(self.back_mix),
+            Mix::new(0x67),
+        ]
+    }
+
+    /// The mix for a blit's or pattern fill's pixel, with `select` from
+    /// PIX_CNTL bits 6-7: the foreground mix for 00b, a copy for 01b and
+    /// 10b, and for 11b, where the mask bit comes from the screen, the
+    /// foreground mix where all the read-enabled bits of `pixel` are set
+    /// and the background mix elsewhere.
+    fn pixel_mix(&self, select: u16, pixel: u32, [fore, back, copy]: [Mix; 3]) -> Mix {
+        match select {
+            0 => fore,
+            3 if pixel & self.read_mask == self.read_mask => fore,
+            3 => back,
+            _ => copy,
         }
     }
 
@@ -584,9 +596,7 @@ impl Engine {
         let dy: i32 = if value & 0x80 != 0 { 1 } else { -1 };
         let compare = self.color_compare & s.mask();
         let select = (self.pix_cntl >> 6) & 3;
-        let fore = Mix::new(self.fore_mix);
-        let back = Mix::new(self.back_mix);
-        let copy = Mix::new(0x67);
+        let mixes = self.pixel_mixes();
         let row_copy = select == 0
             && self.fore_mix & 0x0F == 7
             && self.fore_mix & 0x60 >= 0x40
@@ -602,11 +612,7 @@ impl Engine {
             }
             for _ in 0..=self.major {
                 let pixel = s.get(sx as u32, sy as u32);
-                let mode = match select {
-                    0 => fore,
-                    3 => self.screen_mix(pixel, fore, back),
-                    _ => copy,
-                };
+                let mode = self.pixel_mix(select, pixel, mixes);
                 let src = self.source(mode.mode, pixel);
                 // MULT_MISC bit 8: compare colours, leaving pixels equal
                 // to it (or with bit 7, unequal) alone.
@@ -628,20 +634,14 @@ impl Engine {
         let dx: i32 = if value & 0x20 != 0 { 1 } else { -1 };
         let dy: i32 = if value & 0x80 != 0 { 1 } else { -1 };
         let select = (self.pix_cntl >> 6) & 3;
-        let fore = Mix::new(self.fore_mix);
-        let back = Mix::new(self.back_mix);
-        let copy = Mix::new(0x67);
+        let mixes = self.pixel_mixes();
         let (px, py) = (self.cur_x as i32, self.cur_y as i32);
         let mut ty = self.dest_y as i32;
         for _ in 0..=self.minor {
             let mut tx = self.dest_x as i32;
             for _ in 0..=self.major {
                 let pixel = s.get((px + (tx & 7)) as u32, (py + (ty & 7)) as u32);
-                let mode = match select {
-                    0 => fore,
-                    3 => self.screen_mix(pixel, fore, back),
-                    _ => copy,
-                };
+                let mode = self.pixel_mix(select, pixel, mixes);
                 let src = self.source(mode.mode, pixel);
                 self.mix_point(s, tx as u32, ty as u32, mode, src);
                 tx += dx;
@@ -690,18 +690,16 @@ impl Engine {
         if !self.transfer.active {
             return false;
         }
-        let fore = Mix::new(self.fore_mix);
-        let back = Mix::new(self.back_mix);
         let mut value = value;
         if self.transfer.swap && len >= 2 {
             value = ((value & 0xFF00_FF00) >> 8) | ((value & 0x00FF_00FF) << 8);
         }
         match (self.pix_cntl >> 6) & 3 {
             0 => {
-                let mode = fore;
-                if mode.mode >> 5 & 3 != 2 {
+                if self.fore_mix >> 5 & 3 != 2 {
                     return false;
                 }
+                let mode = Mix::new(self.fore_mix);
                 match (s.bytes, self.transfer.bus) {
                     (1, 0x00) => self.transfer_pixel(s, mode, value & 0xFF),
                     (1, 0x20) => {
@@ -746,6 +744,8 @@ impl Engine {
                     0x40 => (32, 1),
                     _ => (8, len as u32),
                 };
+                let fore = Mix::new(self.fore_mix);
+                let back = Mix::new(self.back_mix);
                 'chunks: for k in 0..chunks {
                     self.transfer.newline = false;
                     for n in 0..chunk {

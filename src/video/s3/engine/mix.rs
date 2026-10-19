@@ -1,4 +1,4 @@
-//! Binary raster operations resolved once per command or host-data chunk.
+//! Binary raster operations resolved once per command or host write.
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Mix {
