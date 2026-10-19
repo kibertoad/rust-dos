@@ -64,7 +64,7 @@ impl TileLayout {
 
     /// Tiles containing raw framebuffer word addresses. Padding and
     /// memory outside the pictures have no tile; pinned jobs cover them.
-    fn read_tiles(&self, words: [usize; 2]) -> [u64; 4] {
+    fn word_tiles<const N: usize>(&self, words: [usize; N]) -> [u64; 4] {
         let mut tiles = [0; 4];
         for at in words {
             for (slot, base) in self.bases.iter().enumerate() {
@@ -284,6 +284,48 @@ pub fn fastfill(layout: &TileLayout, st: &RasterState, (x0, x1, y0, y1): (i32, i
     access
 }
 
+/// The two pixels of a pipelined LFB write. Colour is read back for the
+/// mirror even if the pipeline rejects the write. Depth reads can change
+/// counters as well as colour, so they must also observe older drawing.
+pub fn lfb(layout: &TileLayout, st: &RasterState, x: i32, scry: i32) -> Access {
+    if !layout.prunable || st.stride.tiled || st.aux_stride.tiled || x < 0 || scry < 0 {
+        return Access::PINNED;
+    }
+    let words = |base, stride: super::raster::Stride| {
+        let row = base + stride.row(scry as usize);
+        [
+            row + stride.col(x as usize),
+            row + stride.col(x as usize + 1),
+        ]
+    };
+    let color = layout.word_tiles(words(st.dest, st.stride));
+    let fbz = st.fbz_mode;
+    let depth_read = fbz & (1 << 4) != 0 && (1..=6).contains(&((fbz >> 5) & 7));
+    let alpha_read = st.alpha_mode & (1 << 4) != 0 && fbz & (1 << 18) != 0;
+    let aux = if depth_read || alpha_read || fbz & (1 << 10) != 0 {
+        st.aux
+            .map_or([0; 4], |base| layout.word_tiles(words(base, st.aux_stride)))
+    } else {
+        [0; 4]
+    };
+    let mut access = Access::default();
+    for slot in 0..4 {
+        access.reads[slot] = color[slot]
+            | if depth_read || alpha_read {
+                aux[slot]
+            } else {
+                0
+            };
+        if fbz & (1 << 9) != 0 {
+            access.writes[slot] |= color[slot];
+        }
+        if fbz & (1 << 10) != 0 {
+            access.writes[slot] |= aux[slot];
+        }
+    }
+    access
+}
+
 /// Frame buffer words written.
 pub fn words(layout: &TileLayout, words: &[Word]) -> Access {
     if !layout.prunable {
@@ -323,9 +365,9 @@ pub struct Backlog {
     keep: Vec<bool>,
     /// Jobs pushed since the last pruning.
     since_prune: usize,
-    /// Cached pending writes, so repeated reads of an untouched buffer
-    /// do not walk the queue again. Invalidated whenever jobs change.
-    pending_writes: Option<([u64; 4], bool)>,
+    /// Cached pending accesses, so repeated requests for an untouched
+    /// buffer do not walk the queue again. Invalidated when jobs change.
+    pending_access: Option<Access>,
     /// Jobs dropped, for the debugger.
     pub pruned: u64,
 }
@@ -343,7 +385,7 @@ impl Backlog {
     /// oldest jobs, when there are too many.
     pub fn push(&mut self, job: Job, access: Access) -> Vec<Job> {
         let kills = access.kills.iter().any(|&k| k != 0);
-        self.pending_writes = None;
+        self.pending_access = None;
         self.jobs.push((job, access));
         self.since_prune += 1;
         // A fill may have made the frames before it invisible; prune
@@ -362,7 +404,7 @@ impl Backlog {
         if let Some((Job::Pixels { words, .. }, last)) = self.jobs.last_mut() {
             words.extend_from_slice(new);
             last.add(&access);
-            self.pending_writes = None;
+            self.pending_access = None;
             return self.overflow();
         }
         self.push(Job::Pixels { fb: fb.clone(), words: new.to_vec() }, access)
@@ -383,7 +425,7 @@ impl Backlog {
     }
 
     fn count_words(&mut self) {
-        self.pending_writes = None;
+        self.pending_access = None;
         self.words = self.jobs.iter().map(|(job, _)| if let Job::Pixels { words, .. } = job { words.len() } else { 0 }).sum();
     }
 
@@ -413,10 +455,8 @@ impl Backlog {
         self.count_words();
     }
 
-    /// Release only the prefix needed by a framebuffer read. Keeping the
-    /// prefix intact preserves all earlier dependencies and job order.
-    /// Later jobs cannot affect the words read; a pinned job may touch
-    /// any address, so it always has to run before the read.
+    /// Release only the prefix needed by a framebuffer read. Later jobs
+    /// cannot affect these words; pinned jobs may touch any address.
     pub fn take_for_read(&mut self, words: [usize; 2]) -> Vec<Job> {
         if self.jobs.is_empty() {
             return Vec::new();
@@ -424,36 +464,42 @@ impl Backlog {
         if !self.layout.prunable {
             return self.take();
         }
-        let tiles = self.layout.read_tiles(words);
+        let access = Access {
+            reads: self.layout.word_tiles(words),
+            ..Access::default()
+        };
+        self.take_for_access(access)
+    }
+
+    /// Keep command order through the last conflicting job. An immediate
+    /// write must also follow older readers of the pixels it overwrites.
+    pub fn take_for_access(&mut self, request: Access) -> Vec<Job> {
+        if self.jobs.is_empty() {
+            return Vec::new();
+        }
+        if request.pinned || !self.layout.prunable {
+            return self.take();
+        }
+        let conflicts = |access: &Access| {
+            access.pinned
+                || (0..4).any(|slot| {
+                    access.writes[slot] & (request.reads[slot] | request.writes[slot]) != 0
+                        || access.reads[slot] & request.writes[slot] != 0
+                })
+        };
         let jobs = &self.jobs;
-        let (writes, pinned) = *self.pending_writes.get_or_insert_with(|| {
-            let mut writes = [0; 4];
-            let mut pinned = false;
+        let pending = *self.pending_access.get_or_insert_with(|| {
+            let mut pending = Access::default();
             for (_, access) in jobs {
-                for (write, mask) in writes.iter_mut().zip(access.writes) {
-                    *write |= mask;
-                }
-                pinned |= access.pinned;
+                pending.add(access);
             }
-            (writes, pinned)
+            pending
         });
-        if !pinned
-            && writes
-                .iter()
-                .zip(tiles)
-                .all(|(write, tile)| write & tile == 0)
-        {
+        if !conflicts(&pending) {
             return Vec::new();
         }
         self.prune();
-        let end = self.jobs.iter().rposition(|(_, access)| {
-            access.pinned
-                || access
-                    .writes
-                    .iter()
-                    .zip(tiles)
-                    .any(|(write, tile)| write & tile != 0)
-        });
+        let end = self.jobs.iter().rposition(|(_, access)| conflicts(access));
         let Some(end) = end else { return Vec::new() };
         let out = self.jobs.drain(..=end).map(|(job, _)| job).collect();
         self.count_words();

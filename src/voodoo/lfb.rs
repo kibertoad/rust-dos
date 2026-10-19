@@ -237,13 +237,14 @@ impl Voodoo {
                 self.mirror_pixel(dest, x, scry, color, auxval);
             }
         } else {
-            // Through the pixel pipeline, which reads the buffers.
-            self.flush();
+            // Through the pixel pipeline, after earlier accesses to its
+            // colour and depth words. Unrelated jobs can stay deferred.
             let st = self.raster_state(dest, 0);
+            let scry = raster::screen_y(&st, y, fbz & (1 << 17) != 0);
+            self.catch_up_lfb(&st, x, scry);
             let mut stipple = self.reg[STIPPLE];
             let mut stats = self.stats;
             let mut pix = 0;
-            let scry = raster::screen_y(&st, y, fbz & (1 << 17) != 0);
             let mut written = [0i32; 2];
             let mut count = 0;
             while mask != 0 {

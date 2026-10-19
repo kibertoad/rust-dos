@@ -1676,3 +1676,79 @@ fn partial_lfb_read_keeps_pending_texture_usage() {
         sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
     );
 }
+
+#[test]
+fn pipeline_lfb_writes_leave_unrelated_back_buffer_drawing_deferred() {
+    for workers in [0, 1, 4] {
+        let mut gl = gl_bus(Board::Standard, workers);
+        let mut sw = bus(Board::Standard);
+        init(&mut sw);
+        for bus in [&mut gl, &mut sw] {
+            w(bus, FBZ_MODE, RGB_WRITE | CLIPPING | DRAW_BACK);
+            flat(bus, 0, 255, 0, 255);
+            triangle(bus, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0)]);
+            w(bus, FBZ_MODE, RGB_WRITE | CLIPPING);
+            w(bus, LFB_MODE, 1 << 8);
+            bus.write_32(BASE + 0x40_0000 + 2048 + 4, 0xF800_F800);
+        }
+        assert!(status_of(&gl)["held_jobs"].as_u64().unwrap() > 0);
+        assert_eq!(
+            gl.voodoo.as_ref().unwrap().frame_buffer().to_bytes(),
+            sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+        );
+    }
+}
+
+#[test]
+fn pipeline_lfb_depth_writes_wait_for_older_depth_readers() {
+    let mut gl = gl_bus(Board::Standard, 2);
+    let mut sw = bus(Board::Standard);
+    init(&mut sw);
+    for bus in [&mut gl, &mut sw] {
+        w(bus, FBZ_MODE, AUX_WRITE);
+        w(bus, ZA_COLOR, 0xFFFF);
+        w(bus, FASTFILL_CMD, 0);
+        w(
+            bus,
+            FBZ_MODE,
+            RGB_WRITE | CLIPPING | DEPTH_TEST | 3 << 5 | DRAW_BACK,
+        );
+        flat(bus, 0, 255, 0, 255);
+        w(bus, START_Z, 0x1000 << 12);
+        triangle(bus, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0)]);
+        w(bus, FBZ_MODE, AUX_WRITE | CLIPPING);
+        w(bus, LFB_MODE, 15 | 1 << 8);
+        bus.write_32(BASE + 0x40_0000 + 2048 + 4, 0);
+    }
+    assert_eq!(status_of(&gl)["held_jobs"], 0);
+    assert_eq!(pixel(&gl, 1, 2, 1), 0x07E0);
+    assert_eq!(
+        gl.voodoo.as_ref().unwrap().frame_buffer().to_bytes(),
+        sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+    );
+}
+
+#[test]
+fn pipeline_lfb_partial_completion_keeps_pending_texture_usage() {
+    let mut gl = gl_bus(Board::Standard, 2);
+    let mut sw = bus(Board::Standard);
+    init(&mut sw);
+    for bus in [&mut gl, &mut sw] {
+        textured_square(bus, 10, false, |_, _| 0xF800);
+        w(bus, FBZ_MODE, RGB_WRITE | CLIPPING | DRAW_BACK);
+        triangle(bus, [(0.0, 0.0), (8.0, 0.0), (0.0, 8.0)]);
+        w(bus, FBZ_COLOR_PATH, 0);
+        w(bus, FBZ_MODE, RGB_WRITE | CLIPPING);
+        w(bus, LFB_MODE, 1 << 8);
+        bus.write_32(BASE + 0x40_0000 + 2048 + 4, 0x001F_001F);
+    }
+    assert!(status_of(&gl)["held_jobs"].as_u64().unwrap() > 0);
+    for bus in [&mut gl, &mut sw] {
+        bus.write_32(BASE + 0x80_0000 + (5 << 17), 0x07E0_07E0);
+    }
+    assert_eq!(status_of(&gl)["held_jobs"], 0);
+    assert_eq!(
+        gl.voodoo.as_ref().unwrap().frame_buffer().to_bytes(),
+        sw.voodoo.as_ref().unwrap().frame_buffer().to_bytes()
+    );
+}
