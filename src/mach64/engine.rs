@@ -16,7 +16,6 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
-#[path = "engine/rows.rs"]
 mod rows;
 
 /// What a register write started.

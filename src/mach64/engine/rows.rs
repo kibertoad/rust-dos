@@ -1,5 +1,7 @@
-//! Plain 2D rectangles, one row at a time. Memory wrapping, clipping,
-//! sub-byte pixels and source patterns retain the pixel pipeline.
+//! Plain 2D rectangles, one row at a time. Rows are trimmed to the
+//! scissors first, since the engine draws nothing outside them. Memory
+//! wrapping, sub-byte pixels and source patterns retain the pixel
+//! pipeline.
 
 use super::*;
 use std::ops::Range;
@@ -28,7 +30,8 @@ pub(super) fn draw(rect: &mut Rect, memory: &mut Memory) -> Option<bool> {
         || !memory.vram.len().is_power_of_two()
         || s.mono != 0
         || s.mix_fg != 7
-        || s.function != 0
+        || !matches!(s.src_fg, SRC_BLIT | SRC_FRGD | SRC_BKGD)
+        || s.function == 1
         || s.compare.2 & 7 != 0
         || s.dst_cntl & POLYGON != 0
         || s.src_cntl & (SRC_LINEAR | SRC_PATTERN_ON | SRC_ROTATE | SRC_TRACK_DST) != 0
@@ -58,12 +61,16 @@ pub(super) fn draw(rect: &mut Rect, memory: &mut Memory) -> Option<bool> {
     let last = rect
         .x0
         .checked_add((rect.width - 1).checked_mul(s.x_dir)?)?;
-    let left = rect.x0.min(last);
-    let right = rect.x0.max(last);
-    if left < 0 || y < 0 || !s.inside(left, y) || !s.inside(right, y) {
-        return None;
+    // Only the part of the row inside the scissors is drawn. A row they
+    // leave empty only moves the walk on.
+    let (left, right, top, bottom) = s.scissors;
+    let from = rect.x0.min(last).max(left);
+    let to = rect.x0.max(last).min(right);
+    if y < top || y > bottom || from > to {
+        return Some(rect.end_row());
     }
-    let dest = span(s.dst_base, s.dst_pitch, left, y, rect.width, bytes)?;
+    let count = to - from + 1;
+    let dest = span(s.dst_base, s.dst_pitch, from, y, count, bytes)?;
     if dest.end > memory.vram.len() {
         return None;
     }
@@ -72,14 +79,12 @@ pub(super) fn draw(rect: &mut Rect, memory: &mut Memory) -> Option<bool> {
             if s.src_size != s.dst_size {
                 return None;
             }
+            // Source pixels whose destination is outside the scissors are
+            // read but never written, so only the trimmed part matters.
             let sx = rect.src_x0.checked_add(rect.src_x)?;
-            let sx = if s.x_dir < 0 {
-                sx.checked_sub(rect.width - 1)?
-            } else {
-                sx
-            };
+            let sx = sx.checked_add(from - rect.x0)?;
             let sy = rect.src_y0.checked_add(rect.src_y)?;
-            let source = span(s.src_base, s.src_pitch, sx, sy, rect.width, bytes)?;
+            let source = span(s.src_base, s.src_pitch, sx, sy, count, bytes)?;
             if source.end > memory.vram.len() {
                 return None;
             }
@@ -92,22 +97,19 @@ pub(super) fn draw(rect: &mut Rect, memory: &mut Memory) -> Option<bool> {
             }
             memory.vram.copy_within(source, dest.start);
         }
-        SRC_FRGD | SRC_BKGD => {
+        _ => {
             let value = if s.src_fg == SRC_FRGD { s.frgd } else { s.bkgd };
             let pixel = value.to_le_bytes();
             if rotate {
-                let phase = if s.x_dir > 0 {
-                    rect.rot0
-                } else {
-                    (rect.rot0 + 3 - (rect.width as u32 - 1) % 3) % 3
-                } as usize;
+                // The byte of the colour at `x` is `rot0` moved on by the
+                // distance from `x0`, whichever way the row runs.
+                let phase = (rect.rot0 as i32 + from - rect.x0).rem_euclid(3) as usize;
                 let pattern = std::array::from_fn::<_, 3, _>(|n| pixel[(phase + n) % 3]);
                 fill(&mut memory.vram[dest], &pattern);
             } else {
                 fill(&mut memory.vram[dest], &pixel[..bytes]);
             }
         }
-        _ => return None,
     }
     // Both paths finish through the same source/rotation/row counters.
     // No per-pixel source wrap occurs in the eligible row.
@@ -215,7 +217,7 @@ mod tests {
                         for control in [0, SRC_LINEAR, SRC_PATTERN_ON | SRC_ROTATE, SRC_TRACK_DST] {
                             for rotate in [false, true] {
                                 for narrow in [false, true] {
-                                    for restricted in 0..4 {
+                                    for restricted in 0..7 {
                                         let mut r = rect(size, source, dx, dy, width);
                                         r.setup.src_cntl = control;
                                         if rotate {
@@ -231,7 +233,10 @@ mod tests {
                                             0 => {}
                                             1 => r.setup.scissors = (6, 9, 2, 4),
                                             2 => r.setup.write_mask = 0x5555_5555,
-                                            _ => r.setup.compare = (0x30, 0xFF, 5),
+                                            3 => r.setup.compare = (0x30, 0xFF, 5),
+                                            4 => r.setup.scissors = (9, 10, 0, 31),
+                                            5 => r.setup.scissors = (20, 31, 0, 31),
+                                            _ => r.setup.function = 2,
                                         }
                                         rows += compare(r);
                                     }
@@ -253,13 +258,16 @@ mod tests {
                 for sx in [0, 1, 4, 8] {
                     for x in [0, 1, 4, 8] {
                         for base in [0, 1, 127] {
-                            let mut r = rect(size, SRC_BLIT, dx, 1, 5);
-                            r.setup.src_base = base;
-                            r.setup.dst_base = base;
-                            r.x0 = x;
-                            r.src_x0 = sx;
-                            r.src_starts.0 = sx;
-                            rows += compare(r);
+                            for scissors in [(0, 31, 0, 31), (2, 9, 0, 31)] {
+                                let mut r = rect(size, SRC_BLIT, dx, 1, 5);
+                                r.setup.src_base = base;
+                                r.setup.dst_base = base;
+                                r.setup.scissors = scissors;
+                                r.x0 = x;
+                                r.src_x0 = sx;
+                                r.src_starts.0 = sx;
+                                rows += compare(r);
+                            }
                         }
                     }
                 }
