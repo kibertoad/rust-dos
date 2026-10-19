@@ -12,7 +12,6 @@ use std::ffi::{CString, c_void};
 use std::num::NonZeroU32;
 
 use glow::HasContext;
-use crate::present::Pixels;
 use rust_dos::bus::Bus;
 use rust_dos::video::Frame;
 use rust_dos::video::shader::{self, Glsl, Shader};
@@ -21,6 +20,7 @@ use rust_dos::voodoo::{Renderer, VoodooSettings};
 
 use crate::Callbacks;
 use crate::ffi::*;
+use crate::present::Pixels;
 
 thread_local! {
     /// The frontend's hardware rendering, once it agreed to it.
@@ -256,8 +256,13 @@ impl Screen {
                     }
                     gl.active_texture(glow::TEXTURE0);
                     gl.bind_texture(glow::TEXTURE_2D, Some(*own));
+                    // The rows come from memory, whatever the frontend
+                    // left set for its own uploads.
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
                     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
                     gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+                    gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+                    gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
                     let (w, h) = (screen.width as i32, screen.height as i32);
                     if *texture_size != (screen.width, screen.height) {
                         gl.tex_image_2d(

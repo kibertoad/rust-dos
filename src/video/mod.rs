@@ -252,6 +252,15 @@ impl Frame {
     }
 }
 
+/// The rows (of `row_bytes` each) from the first to the last that differ
+/// between two pictures of the same size, if any do.
+pub fn changed_rows(old: &[u8], new: &[u8], row_bytes: usize) -> Option<std::ops::Range<usize>> {
+    let pairs = || old.chunks_exact(row_bytes).zip(new.chunks_exact(row_bytes));
+    let first = pairs().position(|(a, b)| a != b)?;
+    let last = pairs().rposition(|(a, b)| a != b)?;
+    Some(first..last + 1)
+}
+
 /// The size of the picture of the current video mode: 640x400 for the
 /// text and CGA modes, and for the others their size, doubled in each
 /// direction where it is small (mode 13h's 320x200 is 640x400, mode 12h

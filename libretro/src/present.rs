@@ -1,6 +1,6 @@
 //! Cached pixel conversion and restoration of temporary overlays.
 
-use rust_dos::video::Frame;
+use rust_dos::video::{self, Frame};
 use std::ops::Range;
 
 /// Rows that differ, including all rows after a geometry change.
@@ -12,10 +12,7 @@ pub fn changed_rows(old: &Frame, new: &Frame) -> Option<Range<usize>> {
     if bytes == 0 {
         return None;
     }
-    let rows = || old.rgb.chunks_exact(bytes).zip(new.rgb.chunks_exact(bytes));
-    let first = rows().position(|(a, b)| a != b)?;
-    let last = rows().rposition(|(a, b)| a != b)?;
-    Some(first..last + 1)
+    video::changed_rows(&old.rgb, &new.rgb, bytes)
 }
 
 /// Restore the base picture where the last frame's overlays changed it.

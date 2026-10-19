@@ -29,7 +29,6 @@ use crate::keys;
 use crate::memmap::Published;
 use crate::options::{self, Values};
 use crate::present::{self, Pixels};
-use rust_dos::video::mono::Monochrome;
 use crate::{Callbacks, KeyEvent};
 
 /// The frames the core hands over a second.
@@ -98,10 +97,20 @@ pub struct Core {
     /// cursors and the settings window on top, as handed over.
     picture: Frame,
     screen: Frame,
+    /// `picture` with the cursors and the monochrome monitor's look,
+    /// and what they were drawn from (`cursors_key`, the monitor).
     filtered: Frame,
-    composition: Option<(u64, Monochrome)>,
+    composition: Option<(u64, video::mono::Monochrome)>,
+    /// The picture last handed over in software, XRGB8888.
     xrgb: Pixels<u32>,
+    /// Whether the frontend takes a null picture for the last one again.
     can_dupe: bool,
+    /// Whether the frontend showed the last frame's picture: frames it
+    /// runs ahead with aren't shown, so the next one can't be a repeat.
+    frame_shown: bool,
+    /// Whether the last frame drew the settings window, the performance
+    /// overlay or the wheel over `filtered` in `screen`.
+    overlaid: bool,
     /// The size of the picture handed over: the 3dfx card's OpenGL
     /// picture's while it is shown, else `screen`'s.
     shown: Option<(u32, u32)>,
@@ -143,6 +152,21 @@ fn directory(cb: &Callbacks, cmd: u32) -> Option<PathBuf> {
         let dir = unsafe { std::ffi::CStr::from_ptr(dir) };
         PathBuf::from(dir.to_string_lossy().into_owned())
     })
+}
+
+/// Whether the frontend shows this frame's picture. Run-ahead runs
+/// frames it doesn't show; a frontend that can't say shows them all.
+fn video_enabled(cb: &Callbacks) -> bool {
+    // Bit 0 is the picture's, bit 1 the sound's.
+    let mut enabled: std::ffi::c_int = 3;
+    // SAFETY: GET_AUDIO_VIDEO_ENABLE takes a writable int.
+    unsafe {
+        cb.env(
+            RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE,
+            &mut enabled as *mut _ as *mut std::ffi::c_void,
+        )
+    };
+    enabled & 1 != 0
 }
 
 impl Core {
@@ -265,6 +289,8 @@ impl Core {
             composition: None,
             xrgb: Pixels::default(),
             can_dupe,
+            frame_shown: false,
+            overlaid: false,
             shown: None,
             voodoo_gl_shown: false,
             geometry: None,
@@ -548,13 +574,20 @@ impl Core {
             video::overlay::cursors_key(bus, self.cursor_visible),
             self.m.settings.monochrome,
         );
-        if rendered || self.composition != Some(composition) {
+        let composed = rendered || self.composition != Some(composition);
+        if composed {
             self.filtered.clone_from(&self.picture);
             video::overlay::draw_cursors(&mut self.filtered, bus, self.cursor_visible);
             video::mono::apply(&mut self.filtered, composition.1);
             self.composition = Some(composition);
         }
-        present::restore(&mut self.screen, &self.filtered);
+        // `screen` is `filtered` already when neither changed since the
+        // last frame and nothing was drawn over it.
+        let overlaid = self.ui.is_open() || self.ui.overlay_shown() || self.wheel_view.is_some();
+        if composed || overlaid || self.overlaid {
+            present::restore(&mut self.screen, &self.filtered);
+        }
+        self.overlaid = overlaid;
         if self.ui.is_open() {
             self.ui.set_mixer_status(bus.mixer.muted, bus.mixer.take_peaks());
         }
@@ -571,14 +604,21 @@ impl Core {
             rust_dos::config_ui::wheel::draw(&mut self.screen, view);
         }
 
+        // The last picture handed over is the one the frontend has only if
+        // it showed it: run-ahead runs frames whose pictures it drops.
+        let can_dupe = self.can_dupe && self.frame_shown;
+        self.frame_shown = video_enabled(cb);
+
         // With the frontend's OpenGL, the picture is drawn into its
         // framebuffer; before it made a context, the last one stays.
         if crate::gl::granted() {
             let voodoo = voodoo_gl.then_some(&self.picture);
             let Some((w, h, refresh)) =
-                crate::gl::with_screen(|s| s.present(&self.screen, voodoo, self.can_dupe))
+                crate::gl::with_screen(|s| s.present(&self.screen, voodoo, can_dupe))
             else {
-                let (w, h) = self.shown.unwrap_or((self.screen.width, self.screen.height));
+                let (w, h) = self
+                    .shown
+                    .unwrap_or((self.screen.width, self.screen.height));
                 cb.video_dupe(w, h);
                 return;
             };
@@ -596,7 +636,7 @@ impl Core {
         let changed = self
             .xrgb
             .update(&self.screen, |[r, g, b]| u32::from_be_bytes([0, r, g, b]));
-        let duplicate = changed.is_none() && self.shown.is_none() && self.can_dupe;
+        let duplicate = changed.is_none() && self.shown.is_none() && can_dupe;
         self.shown = None;
         self.set_geometry(cb);
         let (w, h) = (self.screen.width, self.screen.height);

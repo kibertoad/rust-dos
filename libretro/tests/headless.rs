@@ -35,6 +35,8 @@ struct Frontend {
     can_dupe: bool,
     duplicates: usize,
     video_frames: usize,
+    /// Running ahead: frames whose pictures it drops.
+    hidden: bool,
     input: HashMap<(u32, u32, u32, u32), i16>,
     /// The folder `test://` paths are in, for a frontend with a VFS, and
     /// the calls made to it.
@@ -57,6 +59,10 @@ unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
         match cmd {
             RETRO_ENVIRONMENT_GET_CAN_DUPE => {
                 *(data as *mut bool) = with(|fe| fe.can_dupe);
+                true
+            }
+            RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE => {
+                *(data as *mut i32) = if with(|fe| fe.hidden) { 2 } else { 3 };
                 true
             }
             RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY => {
@@ -146,6 +152,9 @@ unsafe extern "C" fn environment(cmd: u32, data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn video(data: *const c_void, width: u32, height: u32, pitch: usize) {
+    if with(|fe| fe.hidden) {
+        return;
+    }
     if data.is_null() {
         with(|fe| {
             assert!(fe.can_dupe, "frontend did not allow duplicate frames");
@@ -476,6 +485,55 @@ fn unchanged_frames_are_duplicated_only_when_the_frontend_allows_it() {
         );
         stop();
     }
+}
+
+#[test]
+fn a_frame_after_hidden_ones_is_not_a_duplicate() {
+    with(|fe| *fe = Frontend::default());
+    let dir = scratch("dupe_hidden");
+    start(&dir, &[]);
+    with(|fe| fe.can_dupe = true);
+    assert!(load(None));
+    run(90);
+    let before = picture_hash();
+    // Run-ahead's frames: the core hands over pictures the frontend drops.
+    with(|fe| fe.hidden = true);
+    type_text("VER");
+    with(|fe| fe.hidden = false);
+    let frames = with(|fe| fe.video_frames);
+    run(1);
+    assert_eq!(
+        with(|fe| fe.video_frames),
+        frames + 1,
+        "the picture typed in hidden frames is handed over"
+    );
+    assert_ne!(picture_hash(), before);
+    stop();
+}
+
+#[test]
+fn the_settings_window_leaves_no_trace_when_closed() {
+    with(|fe| *fe = Frontend::default());
+    let dir = scratch("settings_closed");
+    start(&dir, &[]);
+    assert!(load(None));
+    // The cursor blinks every 30 frames: all of this happens between two
+    // blinks, so nothing under the window is drawn again.
+    run(95);
+    let before = picture_hash();
+    let toggle = |value| {
+        for id in [RETRO_DEVICE_ID_JOYPAD_L3, RETRO_DEVICE_ID_JOYPAD_R3] {
+            set_input(0, RETRO_DEVICE_JOYPAD, 0, id, value);
+        }
+        run(2);
+    };
+    toggle(1);
+    assert_ne!(picture_hash(), before, "the settings window is shown");
+    toggle(0);
+    toggle(1);
+    toggle(0);
+    assert_eq!(picture_hash(), before, "the picture under it is back");
+    stop();
 }
 
 #[test]
