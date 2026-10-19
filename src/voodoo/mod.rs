@@ -909,11 +909,34 @@ impl Voodoo {
     /// Make two words current without releasing later jobs that cannot
     /// write them. Outstanding worker batches still finish in order.
     pub(crate) fn catch_up_read(&self, words: [usize; 2]) {
+        self.catch_up_access(|backlog| backlog.take_for_read(words));
+    }
+
+    /// Finish earlier readers and writers before an immediate pipeline
+    /// write. Other held jobs remain available for later pruning.
+    pub(crate) fn catch_up_lfb(&mut self, st: &raster::RasterState, x: i32, scry: i32) {
+        self.catch_up_access(|backlog| {
+            let access = backlog::lfb(&backlog.layout, st, x, scry);
+            backlog.take_for_access(access)
+        });
+        if self.backlog.borrow().is_empty() {
+            self.drawn_to.clear();
+        }
+    }
+
+    fn catch_up_access(&self, take: impl FnOnce(&mut Backlog) -> Vec<Job>) {
         if self.banshee.is_some() || !self.deferring() || !self.words.borrow().is_empty() {
             self.catch_up();
             return;
         }
-        let jobs = self.backlog.borrow_mut().take_for_read(words);
+        let jobs = {
+            let mut backlog = self.backlog.borrow_mut();
+            if backlog.is_empty() {
+                Vec::new()
+            } else {
+                take(&mut backlog)
+            }
+        };
         if !jobs.is_empty() {
             self.catch_ups.set(self.catch_ups.get() + 1);
             self.hand_over(jobs);
