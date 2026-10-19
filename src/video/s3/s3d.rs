@@ -74,6 +74,10 @@ const TEX_BLEND4_LO: u32 = 4;
 const TEX_BLEND4_HI: u32 = 5;
 const TEX_PAL8: u32 = 6;
 const TEX_YUV: u32 = 7;
+/// Bytes per texel, by texture format.
+const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
+/// The texture format argument that reads `tex_fmt` at run time.
+const TEX_DYNAMIC: u32 = 8;
 
 /// The engine's registers as written, by (offset & 1FCh) / 4 within the 3D
 /// line block (`line`) and the 3D triangle block (`tri`). Everything is
@@ -217,8 +221,8 @@ struct Context<'a, 'b> {
     zup: bool,
     ztest: bool,
     fog_rgb: (i32, i32, i32),
+    sample: fn(&Context<'a, 'b>, &Attr) -> Color,
     tex_fmt: u32,
-    tex_bypp: u32,
     filter: u32,
     max_d: i32,
     wrap: bool,
@@ -276,8 +280,8 @@ impl<'a, 'b> Context<'a, 'b> {
             palettized: false,
             tex_blend: 2,
             fog: false,
+            sample: Self::sample_texture_in::<TEX_ARGB8888>,
             tex_fmt: 0,
-            tex_bypp: 1,
             filter: 0,
             max_d: 0,
             wrap: false,
@@ -313,10 +317,19 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 
     fn setup_texture(&mut self, cmd: u32, tri: &[u32; 0x80]) {
-        const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
         let reg = |off: usize| tri[off >> 2];
         self.tex_fmt = cmd_tex_fmt(cmd);
-        self.tex_bypp = TEX_BYTES[self.tex_fmt as usize];
+        self.sample = match self.tex_fmt {
+            TEX_ARGB8888 => Self::sample_texture_in::<TEX_ARGB8888>,
+            TEX_ARGB4444 => Self::sample_texture_in::<TEX_ARGB4444>,
+            TEX_ARGB1555 => Self::sample_texture_in::<TEX_ARGB1555>,
+            TEX_ALPHA4BLEND4 => Self::sample_texture_in::<TEX_ALPHA4BLEND4>,
+            TEX_BLEND4_LO => Self::sample_texture_in::<TEX_BLEND4_LO>,
+            TEX_BLEND4_HI => Self::sample_texture_in::<TEX_BLEND4_HI>,
+            TEX_PAL8 => Self::sample_texture_in::<TEX_PAL8>,
+            _ => Self::sample_texture_in::<TEX_YUV>,
+        };
+        let tex_bypp = TEX_BYTES[self.tex_fmt as usize];
         self.filter = cmd_filter(cmd);
         self.max_d = cmd_mip_size(cmd).min(9) as i32;
         self.wrap = cmd & CMD_TWE != 0;
@@ -336,7 +349,7 @@ impl<'a, 'b> Context<'a, 'b> {
         for lv in (0..=9).rev() {
             self.tex_level_base[lv] = base;
             if lv as i32 <= self.max_d {
-                base = base.wrapping_add((1u32 << (2 * lv)) * self.tex_bypp);
+                base = base.wrapping_add((1u32 << (2 * lv)) * tex_bypp);
             }
         }
         // Flat textures may have their own row pitch.
@@ -398,9 +411,20 @@ impl<'a, 'b> Context<'a, 'b> {
         o.b = c0.b + (c1.b - c0.b) * t / 15;
     }
 
+    #[cfg(test)]
     fn decode_texel(&self, val: u32, pairval: u32, odd: bool) -> Color {
+        self.decode_texel_in::<TEX_DYNAMIC>(val, pairval, odd)
+    }
+
+    fn sample_texture(&self, at: &Attr) -> Color {
+        (self.sample)(self, at)
+    }
+
+    #[inline]
+    fn decode_texel_in<const FORMAT: u32>(&self, val: u32, pairval: u32, odd: bool) -> Color {
         let mut o = Color::default();
-        match self.tex_fmt {
+        let format = if FORMAT < TEX_DYNAMIC { FORMAT } else { self.tex_fmt };
+        match format {
             TEX_ARGB8888 => {
                 o = Color { b: (val & 0xFF) as i32, g: (val >> 8 & 0xFF) as i32, r: (val >> 16 & 0xFF) as i32, a: (val >> 24 & 0xFF) as i32 }
             }
@@ -455,42 +479,55 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 
     /// Texel (`ui`, `vi`) of mipmap level `level`.
-    fn fetch_texel(&self, level: i32, ui: i32, vi: i32) -> Color {
+    #[inline]
+    fn fetch_texel<const FORMAT: u32>(&self, level: i32, ui: i32, vi: i32) -> Color {
+        let format = if FORMAT < TEX_DYNAMIC { FORMAT } else { self.tex_fmt };
+        let bypp = TEX_BYTES[format as usize];
         let size = 1i32 << level;
         let (ui, vi) = (ui & (size - 1), vi & (size - 1));
-        let row = if self.flat_stride != 0 { self.flat_stride } else { size as u32 * self.tex_bypp };
+        let row = if self.flat_stride != 0 {
+            self.flat_stride
+        } else {
+            size as u32 * bypp
+        };
         let addr = self.tex_level_base[level as usize]
             .wrapping_add(vi as u32 * row)
-            .wrapping_add(ui as u32 * self.tex_bypp)
+            .wrapping_add(ui as u32 * bypp)
             & self.memmask;
-        let (val, pairval) = match self.tex_bypp {
+        let (val, pairval) = match bypp {
             4 => (self.dword(addr), 0),
             2 => {
-                let pair = if self.tex_fmt == TEX_YUV { self.word((addr ^ 2) & self.memmask) } else { 0 };
+                let pair = if format == TEX_YUV {
+                    self.word((addr ^ 2) & self.memmask)
+                } else {
+                    0
+                };
                 (self.word(addr), pair)
             }
             _ => (self.byte(addr), 0),
         };
-        self.decode_texel(val, pairval, ui & 1 != 0)
+        self.decode_texel_in::<FORMAT>(val, pairval, ui & 1 != 0)
     }
 
     /// The border colour, stored in the texel format.
-    fn border_texel(&self) -> Color {
-        self.decode_texel(self.tex_bdr_clr, self.tex_bdr_clr, false)
+    #[inline]
+    fn border_texel<const FORMAT: u32>(&self) -> Color {
+        self.decode_texel_in::<FORMAT>(self.tex_bdr_clr, self.tex_bdr_clr, false)
     }
 
     /// Level `level` at `u`, `v` (1.0 = 1 << 27), with 1 tap (nearest), 2
     /// (a vertical pair, V2TPP) or 4 (bilinear).
-    fn sample_level(&self, level: i32, u: i32, v: i32, taps: u32) -> Color {
+    #[inline]
+    fn sample_level<const FORMAT: u32>(&self, level: i32, u: i32, v: i32, taps: u32) -> Color {
         let shift = 27 - level;
         // Without wrapping, beyond the texture is the border colour
         // (15.4.8.3).
         if !self.wrap && (u | v) as u32 & 0xF800_0000 != 0 {
-            return self.border_texel();
+            return self.border_texel::<FORMAT>();
         }
         let (ui, vi) = (u >> shift, v >> shift);
         if taps == 1 {
-            return self.fetch_texel(level, ui, vi);
+            return self.fetch_texel::<FORMAT>(level, ui, vi);
         }
         // The 8 bits below the texel position.
         let du = (u >> (shift - 8)) & 0xFF;
@@ -501,14 +538,17 @@ impl<'a, 'b> Context<'a, 'b> {
         let ui1 = if self.wrap || ui < last { ui + 1 } else { ui };
         let vi1 = if self.wrap || vi < last { vi + 1 } else { vi };
         if taps == 2 {
-            let (t0, t2) = (self.fetch_texel(level, ui, vi), self.fetch_texel(level, ui, vi1));
+            let (t0, t2) = (
+                self.fetch_texel::<FORMAT>(level, ui, vi),
+                self.fetch_texel::<FORMAT>(level, ui, vi1),
+            );
             let mix = |a: i32, b: i32| (a * (256 - dv) + b * dv) >> 8;
             return Color { r: mix(t0.r, t2.r), g: mix(t0.g, t2.g), b: mix(t0.b, t2.b), a: mix(t0.a, t2.a) };
         }
-        let t0 = self.fetch_texel(level, ui, vi);
-        let t1 = self.fetch_texel(level, ui1, vi);
-        let t2 = self.fetch_texel(level, ui, vi1);
-        let t3 = self.fetch_texel(level, ui1, vi1);
+        let t0 = self.fetch_texel::<FORMAT>(level, ui, vi);
+        let t1 = self.fetch_texel::<FORMAT>(level, ui1, vi);
+        let t2 = self.fetch_texel::<FORMAT>(level, ui, vi1);
+        let t3 = self.fetch_texel::<FORMAT>(level, ui1, vi1);
         let (w0, w1, w2, w3) = ((256 - du) * (256 - dv), du * (256 - dv), (256 - du) * dv, du * dv);
         let mix = |a: i32, b: i32, c: i32, d: i32| (a * w0 + b * w1 + c * w2 + d * w3) >> 16;
         Color {
@@ -519,7 +559,7 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    fn sample_texture(&self, at: &Attr) -> Color {
+    fn sample_texture_in<const FORMAT: u32>(&self, at: &Attr) -> Color {
         let (u, v) = if self.persp {
             // U and V are premultiplied by W. The shift is the original
             // ViRGE's and ViRGE/VX's (86Box has 8 for the ViRGE/DX on).
@@ -548,16 +588,16 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         match self.filter {
             // M1TPP, 1TPP: the nearest texel.
-            0 | 4 => self.sample_level(level, u, v, 1),
-            5 => self.sample_level(level, u, v, 2),
+            0 | 4 => self.sample_level::<FORMAT>(level, u, v, 1),
+            5 => self.sample_level::<FORMAT>(level, u, v, 2),
             // M4TPP, 4TPP: bilinear.
-            2 | 6 => self.sample_level(level, u, v, 4),
+            2 | 6 => self.sample_level::<FORMAT>(level, u, v, 4),
             // M2TPP, M8TPP: levels D and D+1, interpolated.
             1 | 3 => {
                 let taps = if self.filter == 1 { 1 } else { 4 };
-                let mut o = self.sample_level(level, u, v, taps);
+                let mut o = self.sample_level::<FORMAT>(level, u, v, taps);
                 if level > 0 && dfrac != 0 {
-                    let o2 = self.sample_level(level - 1, u, v, taps);
+                    let o2 = self.sample_level::<FORMAT>(level - 1, u, v, taps);
                     o.r += ((o2.r - o.r) * dfrac) >> 8;
                     o.g += ((o2.g - o.g) * dfrac) >> 8;
                     o.b += ((o2.b - o.b) * dfrac) >> 8;
@@ -565,7 +605,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
                 o
             }
-            _ => self.sample_level(level, u, v, 1),
+            _ => self.sample_level::<FORMAT>(level, u, v, 1),
         }
     }
 
@@ -1239,3 +1279,7 @@ mod memory_tests;
 
 #[path = "s3d_spans.rs"]
 mod spans;
+
+#[cfg(test)]
+#[path = "s3d_texture_tests.rs"]
+mod texture_tests;
