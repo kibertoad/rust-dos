@@ -62,20 +62,38 @@ checks and the 80-bit FPU helper.
   Fix: round-to-nearest-even on the dropped 11 bits with carry into the
   exponent, then mirror in the trampoline.
 
+- **Low–Medium.** `src/f80.rs:379-383` `F80::get_f64` turns an 80-bit
+  infinity into a NaN. The inf/NaN branch shifts the whole significand,
+  integer bit included, so `7FFF 8000000000000000h` gives a non-zero
+  `f64_mantissa` (bit 52) and the QNaN bit gets set. `F80::set_f64`
+  stores infinity without the integer bit, so infinities the FPU makes
+  itself round-trip, but `FLD tbyte` of a real x87 infinity (a constant
+  in the program's data) becomes NaN in the working f64.
+  Fix: decide NaN on the fraction without the integer bit
+  (`mantissa << 1 != 0`) and mask bit 52 off as the normal branch does.
+
 - **Low (panic in debug/test builds).** `src/f80.rs:300-312`
-  `to_integer_u128` shifts a u128 by `actual_exp - 63`, which is ≥ 128 for
-  exponents up to 16383: shift overflow panic under overflow checks, garbage
-  in release. Reachable via `FBSTP` of any value ≥ 2^128
+  `to_integer_u128` shifts a u128 left by `actual_exp - 63`. From 2^128
+  up the high bits are shifted out silently, and from 2^191 up the shift
+  amount reaches 128: a shift overflow panic under overflow checks,
+  garbage in release. Reachable via `FBSTP`
   (`instructions/fpu/data.rs:195`). `to_bcd_packed` also stores
   `value mod 10^18` instead of the BCD indefinite for values ≥ 10^18.
-  Fix: return the packed-BCD indefinite when `actual_exp >= 64` or the value
-  exceeds 10^18 - 1.
+  Fix: return the packed-BCD indefinite when `actual_exp >= 64` or the
+  value exceeds 10^18 - 1.
 
 - **Low.** `src/f80.rs:191-242` `add_signed` treats exponent `0x7FFF`
-  operands as numbers: `inf - inf` yields +0 instead of the indefinite, NaN
-  payloads are shifted and summed, and a carry out of exponent `0x7FFE`
-  wraps into the sign bit (acknowledged in a comment).
-  Fix: special-case inf/NaN before aligning significands.
+  operands as numbers: `inf - inf` yields +0 instead of the indefinite,
+  and NaN payloads are shifted and summed. A carry out of exponent
+  `0x7FFE` gives exponent `0x7FFF` with a non-zero fraction, a NaN where
+  x87 gives infinity. The wrap into the sign that the comment at `:223`
+  acknowledges comes from the other end: a cancellation whose shift `up`
+  exceeds `exp` (results near the bottom of the range) makes
+  `exp.wrapping_sub(up)` wrap to `FFxxh`, which sets the sign and an
+  exponent near `7FFFh`, so a tiny difference becomes a huge number of
+  the wrong sign.
+  Fix: special-case inf/NaN before aligning significands, produce
+  infinity on exponent overflow, and flush or denormalise on underflow.
 
 - **Low.** `src/cpu/task.rs:175-180` loads CR3 from a 32-bit TSS only when
   CR0.PG is set; a 386 loads it unconditionally. An OS that task-switches
@@ -188,9 +206,13 @@ checks and the 80-bit FPU helper.
   (`mcb.rs:237`) already uses `checked_add` for exactly this.
   Fix: `checked_add`, return `ERR_MCB_DESTROYED`.
 
-- **Low.** `src/bus.rs:2649-2656` port 61h write keeps only bits 0–1; the
-  read at `bus.rs:2978` reconstructs the byte from `speaker_on`, so programs
-  that store a value and read it back see it changed.
+- **Low–Medium.** `src/bus.rs:2648-2655` port 61h write folds bits 0 and
+  1 into one flag (`speaker_on = value & 3 == 3`), and the read at
+  `bus.rs:2977` rebuilds the byte from that flag. Writing 01h (gate on,
+  speaker off) reads back 00h, so a program that sets the gate first and
+  later turns the speaker on with `in al,61h; or al,2; out 61h,al` writes
+  02h and stays silent. Any other value stored and read back comes out
+  changed too.
   Fix: keep the last written byte, mask in live bits 4 and 5 on read.
 
 ### Gaps
@@ -299,11 +321,14 @@ indices, `idle.rs` block copies; the `expect`/`unwrap` calls in
   on the difference.
   Fix: `PermissionDenied → 05h`, `NotFound → 02h`, others `05h`.
 
-- **Low–Medium.** `src/disk.rs:2644-2672` `seek_file`: origin 0 with
-  CX:DX ≥ `80000000h` becomes `SeekFrom::Start(offset as u64)` ≈ 2^64 and
-  `seek_in` (`:2631`) rejects it with `19h`. DOS treats CX:DX as unsigned
-  for AL=0.
-  Fix: pass `(cx << 16 | dx) as u32 as i64` for origin 0.
+- **Low–Medium.** `src/interrupts/int21.rs:1389` sign-extends CX:DX
+  (`as i32`) for every origin, so origin 0 with CX:DX ≥ `80000000h`
+  reaches `seek_file` (`src/disk.rs:2644-2672`) as a negative offset:
+  host files fail in `file.seek(SeekFrom::Start(offset as u64))` and the
+  other backends in `seek_in` (`:2631`), both with `19h`. DOS treats
+  CX:DX as unsigned for AL=0.
+  Fix: in `int21.rs`, pass `((cx << 16) | dx) as i64` for origin 0 and
+  keep the sign extension for origins 1 and 2.
 
 - **Low.** `src/disk.rs:2606-2629` `write_file` and `read_file` (`:2564`)
   issue a single `write()`/`read()`, not a loop. On the libretro
@@ -337,10 +362,14 @@ indices, `idle.rs` block copies; the `expect`/`unwrap` calls in
   from `FatLayout::bpb()` and zero-filling the rest.
 
 - **Medium.** `src/interrupts/int21.rs:1562-1566` AH=44h "stub other
-  subfunctions as success": AL=01h, 02h–05h (non-EMM), 0Ah, 0Bh, 0Eh, 0Fh
-  return AX=0, CF clear. For 0Ah programs read DX bit 15 to decide "remote",
-  and DX is left untouched. DOS returns `01h` (invalid function) for
-  unknown subfunctions; 0Ah and 0Eh deserve explicit implementations.
+  subfunctions as success": AL=01h, 02h–05h (non-EMM), 06h (non-EMM),
+  07h (non-EMM, non-PRN), 0Ah, 0Bh, 0Eh, 0Fh return AX=0, CF clear. For
+  06h/07h that is AL=00h, "not ready", so a program that polls input or
+  output status on a file or CON before reading or writing can wait
+  forever. For 0Ah programs read DX bit 15 to decide "remote", and DX is
+  left untouched. DOS returns `01h` (invalid function) for unknown
+  subfunctions; 06h/07h (AL=FFh when ready, 00h at the end of an input
+  file), 0Ah and 0Eh deserve explicit implementations.
 
 - **Low.** `src/interrupts/int21.rs:2153` AH=68h/6Ah commit and `:1883`
   AH=0Dh disk reset do nothing: host files are never `sync_all()`ed and
@@ -365,8 +394,11 @@ indices, `idle.rs` block copies; the `expect`/`unwrap` calls in
   names for all entries. Every open/exists/attribute/delete/rename is
   O(depth × dir_size) with heavy allocation, and callers chain them
   (`create_new_file` calls `exists` then `create_file`).
-  Fix: per-directory `(long, short)` cache keyed by path + mtime, or try
-  `metadata(dir.join(target))` first as a fast path.
+  Fix: per-directory `(long, short)` cache keyed by path + mtime. A
+  `metadata(dir.join(target))` fast path is not safe for short names: on
+  Windows, NTFS resolves its own 8.3 aliases, which need not match the
+  ones `short_names` assigns (`PROGRA~1` can name another directory), so
+  it would only do for targets the host name matches exactly.
 
 - **Medium.** `src/fat.rs:1058-1097` `FatVolume::read`, `:1124-1162`
   `write`, `:503-517` `chain`, plus `disk.rs:2583, 2652` reloading the
@@ -381,7 +413,11 @@ indices, `idle.rs` block copies; the `expect`/`unwrap` calls in
   `search_handles.insert(unique_id, dir)` (`bus.rs:257`) is never removed
   from. A program polling FindFirst in a loop grows the map without bound,
   and it is serialised into save states (`bus/state.rs`).
-  Fix: drop the entry when FindNext returns `12h`, plus an LRU cap.
+  Fix: drop the entry when FindNext returns `12h`, plus an LRU cap well
+  above any real nesting depth. First make an unknown search id return
+  `12h`: today FindNext falls back to `unwrap_or_default()`
+  (`int21.rs:1777-1782`), the current directory, so a FindNext after the
+  entry is gone would list files from another directory.
 
 - **Low.** `src/interrupts/mscdex.rs:383-399` `read_long` writes CD
   sectors to guest memory one byte at a time via `guest_write_8`, and
@@ -452,8 +488,13 @@ is masked or `get()`-guarded throughout.
   frame. The 256-colour path has a per-row compare and VBE has
   `Vbe::frame_rows`; planar has neither, so one sprite costs 640×480 pixels
   of re-conversion per frame.
-  Fix: compute the affected row from `plane_offset / bytes_per_row` in
-  `write_graphics` and honour `y_min..y_max` in `render_planar`.
+  Fix: in `write_graphics`, map the written offset to a screen row the
+  way `render_planar` reads VRAM (subtract `planar_base_offset`, divide
+  by `bytes_per_row`, rows past `split_row` from address 0), mark nothing
+  for writes to a hidden page, and mark everything when the start
+  address, offset, split or panning changes; then honour `y_min..y_max`
+  in `render_planar`. `plane_offset / bytes_per_row` alone is wrong as
+  soon as a game scrolls or flips pages.
 
 - **Medium.** `src/voodoo/gl.rs:774-786` `composite`, called every
   presented frame while the 3dfx picture is shown: a full-frame memcmp of
@@ -618,11 +659,12 @@ H8/sub-MCU/PCM cores instruction by instruction.
   > 1200-byte frames (normal 1514-byte Ethernet) are dropped relay-wide.
   Fix: per-member reassembler or per-member cap, evict only the offender's.
 
-- **Medium (overflow).** `src/autoinput.rs:182, 191` `(WAIT:n)` from a
-  game profile or `.dosz` `run_input` is parsed as any `u64`;
+- **Medium (overflow).** `src/autoinput.rs:191` `wait`, reached from
+  `(WAIT:n)` (`:177`) and `(DELAY:n)` (`:185`, then `:148, 153`) in a
+  game profile or `.dosz` `run_input`, both parsed as any `u64` (`:48`):
   `now + ms * 1_000_000` overflows for `ms > ~1.8e13`, panicking in debug
-  and wrapping to a past time in release. Input text comes from downloaded
-  packages, so it is untrusted.
+  and wrapping to a past time in release. Input text comes from
+  downloaded packages, so it is untrusted.
   Fix: clamp at parse time (≤ 1 h) or saturating arithmetic.
 
 - **Medium (security, medium confidence).** `src/net/tunnel/client.rs:
