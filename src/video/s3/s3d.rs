@@ -356,8 +356,8 @@ impl<'a, 'b> Context<'a, 'b> {
         self.t.vram.get((addr & self.memmask) as usize).copied().unwrap_or(0) as u32
     }
 
-    #[inline]
     fn packed<const N: usize>(&self, addr: u32) -> u32 {
+        const { assert!(N <= 4) };
         let start = (addr & self.memmask) as usize;
         // The physical memory fits within the rounded address mask. A
         // whole slice therefore cannot cross that mask's wrap boundary.
@@ -715,11 +715,7 @@ impl<'a, 'b> Context<'a, 'b> {
             1 => self.t.vram[d] = b as u8,
             // ZRGB1555: bit 15, MUX buffering's Z flag, is written 0.
             2 => self.write_word(dest, (b >> 3 | (g >> 3) << 5 | (r >> 3) << 10) as u16),
-            _ => {
-                self.t.vram[d] = b as u8;
-                self.t.vram[d + 1] = g as u8;
-                self.t.vram[d + 2] = r as u8;
-            }
+            _ => self.t.vram[d..d + 3].copy_from_slice(&[b as u8, g as u8, r as u8]),
         }
         if ztest && self.zup {
             self.write_word(z_addr, zs as u16);
