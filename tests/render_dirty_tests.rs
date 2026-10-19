@@ -30,10 +30,10 @@ fn rendered_shell(name: &str) -> (Cpu, Frame) {
 
 /// True if any pixel in text row `row` is lit.
 fn row_has_pixels(frame: &Frame, row: usize) -> bool {
-    let row_bytes = SCREEN_WIDTH as usize * 3;
-    frame.rgb[row * CELL_H * row_bytes..(row + 1) * CELL_H * row_bytes]
-        .iter()
-        .any(|&b| b != 0)
+    let row_bytes = SCREEN_WIDTH as usize * 4;
+    frame.rgba[row * CELL_H * row_bytes..(row + 1) * CELL_H * row_bytes]
+        .as_chunks::<4>().0.iter()
+        .any(|p| p[..3].iter().any(|&b| b != 0))
 }
 
 #[test]
@@ -143,10 +143,10 @@ fn planar_steps(mode: u8, patterned: bool) {
         // 2x2, which the window may show at half the size.
         assert_eq!(frame.doubled, mode == 0x0D, "mode {mode:02X} over {what}: {step}");
         if frame.doubled {
-            let row = 3 * w as usize;
-            for (y, line) in frame.rgb.chunks_exact(row).enumerate() {
-                let above = &frame.rgb[(y & !1) * row..][..row];
-                let pairs = line.as_chunks::<6>().0.iter().all(|p| p[..3] == p[3..]);
+            let row = 4 * w as usize;
+            for (y, line) in frame.rgba.chunks_exact(row).enumerate() {
+                let above = &frame.rgba[(y & !1) * row..][..row];
+                let pairs = line.as_chunks::<8>().0.iter().all(|p| p[..4] == p[4..]);
                 assert!(pairs && line == above, "mode {mode:02X} over {what}: {step}, row {y} not doubled");
             }
         }

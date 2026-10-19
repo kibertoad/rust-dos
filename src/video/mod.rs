@@ -25,6 +25,9 @@ pub mod vga;
 pub const SCREEN_WIDTH: u32 = 640;
 pub const SCREEN_HEIGHT: u32 = 400;
 
+#[cfg(test)]
+mod frame_tests;
+
 /// Code page 437 → Unicode: the characters of the VGA font, for text-mode
 /// screen dumps and for typing characters of other keyboard layouts.
 pub const CP437: [char; 256] = [
@@ -163,12 +166,12 @@ impl VideoMode {
     }
 }
 
-/// A picture as the screen shows it: RGB24 pixels, row by row.
+/// A picture as the screen shows it: RGBA8 pixels, row by row.
 #[derive(Debug)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub rgb: Vec<u8>,
+    pub rgba: Vec<u8>,
     /// Every pixel of the picture is one of a block of 2x2 the same, as
     /// the 256-color renderer draws 320x200: the picture is all there at
     /// half the size (which the window may show instead, `display`).
@@ -182,12 +185,15 @@ pub struct Frame {
 /// frame the renderer draws into, as anything may be drawn over a copy.
 impl Clone for Frame {
     fn clone(&self) -> Self {
-        Self { doubled: self.doubled, ..Self::from_rgb(self.width, self.height, self.rgb.clone()) }
+        Self {
+            doubled: self.doubled,
+            ..Self::from_rgba(self.width, self.height, self.rgba.clone())
+        }
     }
 
     fn clone_from(&mut self, source: &Self) {
         (self.width, self.height, self.doubled) = (source.width, source.height, source.doubled);
-        self.rgb.clone_from(&source.rgb);
+        self.rgba.clone_from(&source.rgba);
         self.drawn_from = DrawnFrom::default();
     }
 }
@@ -195,7 +201,7 @@ impl Clone for Frame {
 /// Frames are the same picture if their pixels are.
 impl PartialEq for Frame {
     fn eq(&self, other: &Self) -> bool {
-        (self.width, self.height) == (other.width, other.height) && self.rgb == other.rgb
+        (self.width, self.height) == (other.width, other.height) && self.rgba == other.rgba
     }
 }
 
@@ -233,12 +239,37 @@ impl DrawnFrom {
 
 impl Frame {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, rgb: vec![0; (width * height * 3) as usize], doubled: false, drawn_from: DrawnFrom::default() }
+        Self::from_rgba(width, height, [0, 0, 0, 255].repeat((width * height) as usize))
     }
 
     /// A frame of `width` x `height` pixels `rgb`.
     pub fn from_rgb(width: u32, height: u32, rgb: Vec<u8>) -> Self {
-        Self { width, height, rgb, doubled: false, drawn_from: DrawnFrom::default() }
+        assert_eq!(rgb.len(), (width * height) as usize * 3);
+        let rgba = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
+            .collect();
+        Self::from_rgba(width, height, rgba)
+    }
+
+    /// A frame of `width` x `height` pixels `rgba`.
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        assert_eq!(rgba.len(), (width * height) as usize * 4);
+        Self {
+            width,
+            height,
+            rgba,
+            doubled: false,
+            drawn_from: DrawnFrom::default(),
+        }
+    }
+
+    /// Paint the whole picture an opaque colour.
+    pub fn clear(&mut self, [r, g, b]: [u8; 3]) {
+        self.rgba.as_chunks_mut::<4>().0.fill([r, g, b, 255]);
+        self.drawn_from = DrawnFrom::default();
     }
 
     /// Make the frame `width` x `height`. True if that changed its size;
@@ -303,7 +334,7 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
         if v.picture_wanted() {
             frame.drawn_from = DrawnFrom::default();
             frame.doubled = false;
-            v.render(&mut frame.rgb, frame.width as usize);
+            v.render(&mut frame.rgba, frame.width as usize);
         }
         return;
     }
@@ -325,19 +356,25 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
     {
         frame.drawn_from = DrawnFrom::default();
         frame.doubled = false;
-        render_hicolor(&mut frame.rgb, width, &bus.vga.vram_graphics, bus, bpp);
+        render_hicolor(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, bpp);
         return;
     }
     if bus.video_mode == VideoMode::Graphics320x200 && !bus.vga.adapter.gate_array() {
         let (w, rows) = bus.vga.graphics_size();
-        render_graphics_mode(&mut frame.rgb, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
+        render_graphics_mode(
+            &mut frame.rgba,
+            width,
+            &bus.vga.vram_graphics,
+            bus,
+            &mut frame.drawn_from,
+        );
         frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
         return;
     }
     // So does the 16-color one.
     if bus.video_mode.is_planar() && !bus.vga.adapter.gate_array() {
         let (w, rows) = bus.vga.graphics_size();
-        render_planar(&mut frame.rgb, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
+        render_planar(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
         frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
         return;
     }
@@ -351,9 +388,9 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
         frame.doubled = false;
         let vram = &bus.vga.vram_text;
         if bus.video_mode == VideoMode::Cga640x200 {
-            render_cga_mode6(&mut frame.rgb, vram, bus, &mut frame.drawn_from);
+            render_cga_mode6(&mut frame.rgba, vram, bus, &mut frame.drawn_from);
         } else {
-            render_cga_mode4(&mut frame.rgb, vram, bus, &mut frame.drawn_from);
+            render_cga_mode4(&mut frame.rgba, vram, bus, &mut frame.drawn_from);
         }
         return;
     }
@@ -362,9 +399,10 @@ pub fn render_screen(frame: &mut Frame, bus: &Bus) {
 
     // Black-fill just the dirty band. Renderers either fully cover this band
     // or leave a sub-row gap that we want to appear black.
-    let row_bytes = width * 3;
-    frame.rgb[y_min * row_bytes..y_max * row_bytes].fill(0);
-    let canvas = &mut frame.rgb[..];
+    let row_bytes = width * 4;
+    frame.rgba[y_min * row_bytes..y_max * row_bytes]
+        .as_chunks_mut::<4>().0.fill([0, 0, 0, 255]);
+    let canvas = &mut frame.rgba[..];
 
     // The Tandy's and PCjr's video shows system memory.
     if bus.vga.adapter.gate_array() {
@@ -441,7 +479,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
     };
     let scale = vbe.scale() as usize;
     let bytes = mode.bytes_per_pixel();
-    let row_bytes = canvas_w * 3;
+    let row_bytes = canvas_w * 4;
     // A ViRGE's streams processor: in full streams mode the primary stream
     // is shown from its own frame buffer address (S3D Toolkit programs flip
     // pages with it), and the secondary stream goes over it.
@@ -497,7 +535,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
         }
         let overlaid = over.is_some() || ati_over.is_some();
         let src_len = mode.width as usize * bytes;
-        let out_len = mode.width as usize * scale * 3;
+        let out_len = mode.width as usize * scale * 4;
         if !overlaid
             && row + src_len <= wrap + 1
             && wrap < vram.len()
@@ -537,7 +575,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
                     pixel(row + x * bytes)
                 };
                 for dx in 0..scale {
-                    let i = dst + (x * scale + dx) * 3;
+                    let i = dst + (x * scale + dx) * 4;
                     canvas[i] = rgb.0;
                     canvas[i + 1] = rgb.1;
                     canvas[i + 2] = rgb.2;
@@ -559,7 +597,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
                 if x >= mode.width as usize || x >= canvas_w {
                     break;
                 }
-                let i = dst + x * 3;
+                let i = dst + x * 4;
                 let rgb = match dac.cursor_pixel(cx, cy) {
                     crate::verite::ramdac::CursorPixel::Transparent => continue,
                     crate::verite::ramdac::CursorPixel::Colour(n) => dac.cursor_colour(n),
@@ -586,7 +624,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
                     if x >= mode.width as usize || x >= canvas_w {
                         break;
                     }
-                    let i = dst + x * 3;
+                    let i = dst + x * 4;
                     let rgb = match cursor.pixel(vram, cx, cy as u32) {
                         crate::mach64::CursorPixel::Transparent => continue,
                         crate::mach64::CursorPixel::Colour(n) => colour[n as usize],
@@ -628,7 +666,7 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
                 if x >= mode.width as usize || x >= canvas_w {
                     break;
                 }
-                let i = dst + x * 3;
+                let i = dst + x * 4;
                 let rgb = match cursor.pixel(vram, cx, cy) {
                     s3::CursorPixel::Transparent => continue,
                     s3::CursorPixel::Foreground => fg,
@@ -650,15 +688,15 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
 fn vbe_row<const B: usize>(src: &[u8], out: &mut [u8], scale: usize, rgb: impl Fn(&[u8; B]) -> (u8, u8, u8)) {
     let pixels = src.as_chunks::<B>().0;
     if scale == 1 {
-        for (o, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+        for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
             let (r, g, b) = rgb(p);
-            *o = [r, g, b];
+            *o = [r, g, b, 255];
         }
     } else {
-        for (o, p) in out.chunks_exact_mut(3 * scale).zip(pixels) {
+        for (o, p) in out.chunks_exact_mut(4 * scale).zip(pixels) {
             let (r, g, b) = rgb(p);
-            for px in o.as_chunks_mut::<3>().0 {
-                *px = [r, g, b];
+            for px in o.as_chunks_mut::<4>().0 {
+                *px = [r, g, b, 255];
             }
         }
     }
@@ -689,8 +727,8 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
     let pan = bus.vga.pixel_panning();
     let split_pan = if bus.vga.attribute_regs[0x10] & 0x20 != 0 { 0 } else { pan };
 
-    let canvas_h = canvas.len() / (canvas_w * 3);
-    let row_bytes = canvas_w * 3;
+    let canvas_h = canvas.len() / (canvas_w * 4);
+    let row_bytes = canvas_w * 4;
     let plane_size = vram.len() / 4;
     // The source pixel of each canvas column, and a row's pixels as
     // values.
@@ -769,14 +807,14 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
         planar_row(vram, plane_size, start, pan, width, &mut line);
         let out = &mut canvas[dst..dst + row_bytes];
         if canvas_w == 2 * width {
-            for (px, &v) in out.as_chunks_mut::<6>().0.iter_mut().zip(&line[..width]) {
+            for (px, &v) in out.as_chunks_mut::<8>().0.iter_mut().zip(&line[..width]) {
                 let (r, g, b) = colors[v as usize];
-                *px = [r, g, b, r, g, b];
+                *px = [r, g, b, 255, r, g, b, 255];
             }
         } else {
-            for (px, &x) in out.as_chunks_mut::<3>().0.iter_mut().zip(&columns) {
+            for (px, &x) in out.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
                 let (r, g, b) = colors[line[x] as usize];
-                *px = [r, g, b];
+                *px = [r, g, b, 255];
             }
         }
     }
@@ -832,8 +870,8 @@ fn render_hicolor(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, bp
     let start = bus.vga.latched_start_addr * 4;
     let pitch = bus.vga.offset_words() * 8;
     let five = |v: u16| ((v << 3) | (v >> 2)) as u8;
-    let canvas_h = canvas.len() / (canvas_w * 3);
-    let row_bytes = canvas_w * 3;
+    let canvas_h = canvas.len() / (canvas_w * 4);
+    let row_bytes = canvas_w * 4;
     let mut line = vec![[0u8; 3]; width];
     for y in 0..rows {
         let (first, end) = ((y * canvas_h).div_ceil(rows), ((y + 1) * canvas_h).div_ceil(rows).min(canvas_h));
@@ -851,8 +889,9 @@ fn render_hicolor(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, bp
             };
         }
         let dst = &mut canvas[first * row_bytes..(first + 1) * row_bytes];
-        for (tx, pixel) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-            *pixel = line[tx * width / canvas_w];
+        for (tx, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let [r, g, b] = line[tx * width / canvas_w];
+            *pixel = [r, g, b, 255];
         }
         for ty in first + 1..end {
             canvas.copy_within(first * row_bytes..(first + 1) * row_bytes, ty * row_bytes);
@@ -910,8 +949,8 @@ fn render_graphics_mode(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &B
         let (r, g, b) = bus.vga.get_rgb(i as u8 & bus.vga.dac_mask);
         [r, g, b]
     });
-    let canvas_h = canvas.len() / (canvas_w * 3);
-    let row_bytes = canvas_w * 3;
+    let canvas_h = canvas.len() / (canvas_w * 4);
+    let row_bytes = canvas_w * 4;
 
     // The rows drawn before are still there if the colors and the shape
     // are the same.
@@ -948,13 +987,14 @@ fn render_graphics_mode(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &B
         let dst = &mut canvas[first * row_bytes..(first + 1) * row_bytes];
         if canvas_w == 2 * width {
             // Each pixel twice: its color looked up once.
-            for (pair, &index) in dst.as_chunks_mut::<6>().0.iter_mut().zip(&line) {
+            for (pair, &index) in dst.as_chunks_mut::<8>().0.iter_mut().zip(&line) {
                 let [r, g, b] = colors[index as usize];
-                *pair = [r, g, b, r, g, b];
+                *pair = [r, g, b, 255, r, g, b, 255];
             }
         } else {
-            for (pixel, &x) in dst.as_chunks_mut::<3>().0.iter_mut().zip(&columns) {
-                pixel.copy_from_slice(&colors[line[x] as usize]);
+            for (pixel, &x) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
+                let [r, g, b] = colors[line[x] as usize];
+                *pixel = [r, g, b, 255];
             }
         }
         for ty in first + 1..end {
@@ -1001,18 +1041,18 @@ fn render_cga_mode4(canvas: &mut [u8], vram: &[u8], bus: &Bus, drawn_from: &mut 
     };
 
     // Each line's 320 pixels doubled to 640, on two rows.
-    let mut line = [0u8; SCREEN_WIDTH as usize * 3];
+    let mut line = [0u8; SCREEN_WIDTH as usize * 4];
     for y in 0..200 {
         // Determine memory offset based on interleave
         let bank_offset = if y % 2 == 0 { 0 } else { 0x2000 };
         let line_offset = bank_offset + ((y / 2) * 80);
 
-        for (byte_idx, out) in line.as_chunks_mut::<24>().0.iter_mut().enumerate().take(80) {
+        for (byte_idx, out) in line.as_chunks_mut::<32>().0.iter_mut().enumerate().take(80) {
             let byte = vram[bank_offset + ((line_offset - bank_offset + start + byte_idx) & 0x1FFF)];
             // 4 pixels per byte (2 bits each), the high bits leftmost.
-            for (p, px) in out.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            for (p, px) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let (r, g, b) = colors[((byte >> (6 - p * 2)) & 0x03) as usize];
-                *px = [r, g, b, r, g, b];
+                *px = [r, g, b, 255, r, g, b, 255];
             }
         }
         cga_rows(canvas, &line, y);
@@ -1022,7 +1062,7 @@ fn render_cga_mode4(canvas: &mut [u8], vram: &[u8], bus: &Bus, drawn_from: &mut 
 /// Line `y` of a CGA graphics mode, 640 pixels, on its two rows of the
 /// canvas, those of it that fit.
 fn cga_rows(canvas: &mut [u8], line: &[u8], y: usize) {
-    let row_bytes = SCREEN_WIDTH as usize * 3;
+    let row_bytes = SCREEN_WIDTH as usize * 4;
     for target_y in [y * 2, y * 2 + 1] {
         if let Some(row) = canvas.get_mut(target_y * row_bytes..(target_y + 1) * row_bytes) {
             row.copy_from_slice(line);
@@ -1052,17 +1092,17 @@ fn render_cga_mode6(canvas: &mut [u8], vram: &[u8], bus: &Bus, drawn_from: &mut 
         _ => [bus.vga.attribute_rgb(0), bus.vga.attribute_rgb(1)],
     };
 
-    let mut line = [0u8; SCREEN_WIDTH as usize * 3];
+    let mut line = [0u8; SCREEN_WIDTH as usize * 4];
     for y in 0..200 {
         let bank_offset = if y % 2 == 0 { 0 } else { 0x2000 };
         let line_offset = bank_offset + ((y / 2) * 80);
 
-        for (byte_idx, out) in line.as_chunks_mut::<24>().0.iter_mut().enumerate().take(80) {
+        for (byte_idx, out) in line.as_chunks_mut::<32>().0.iter_mut().enumerate().take(80) {
             let byte = vram[bank_offset + ((line_offset - bank_offset + start + byte_idx) & 0x1FFF)];
             // 8 pixels per byte (1 bit each), on two rows (640x400).
-            for (p, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            for (p, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (r, g, b) = if (byte >> (7 - p)) & 0x01 == 1 { fg } else { bg };
-                *px = [r, g, b];
+                *px = [r, g, b, 255];
             }
         }
         cga_rows(canvas, &line, y);
@@ -1099,7 +1139,7 @@ fn render_cga_composite(
     let known = drawn_from.reuse(&key[..end + 4], 200 * 80);
     let mut bytes = [0u8; 80];
     let mut line = [0u8; 640];
-    let mut rgb = [0u8; 640 * 3];
+    let mut rgb = [0u8; 640 * 4];
     for y in 0..200 {
         let bank_offset = if y % 2 == 0 { 0 } else { 0x2000 };
         for (byte_idx, byte) in bytes.iter_mut().enumerate() {
@@ -1115,7 +1155,7 @@ fn render_cga_composite(
         }
         decoder.decode_line(&line, border, &mut rgb);
         for dy in 0..2 {
-            let row = (y * 2 + dy) * width * 3;
+            let row = (y * 2 + dy) * width * 4;
             if row + rgb.len() <= canvas.len() {
                 canvas[row..row + rgb.len()].copy_from_slice(&rgb);
             }
@@ -1449,8 +1489,8 @@ mod planar_tests {
         let Some(start) = cga_start(&bus) else { return };
         for (mode, bits) in [(4u8, 2usize), (6, 1)] {
             for rows in [400usize, 350] {
-                let mut new = vec![0u8; 640 * rows * 3];
-                let mut old = new.clone();
+                let mut new = [0, 0, 0, 255].repeat(640 * rows);
+                let mut old = vec![0u8; 640 * rows * 3];
                 let vram = bus.vga.vram_text.clone();
                 let colors: Vec<(u8, u8, u8)> = if mode == 4 {
                     std::array::from_fn::<_, 4, _>(|pixel| bus.vga.attribute_rgb(pixel as u8)).to_vec()
@@ -1463,6 +1503,9 @@ mod planar_tests {
                     render_cga_mode6(&mut new, &vram, &bus, &mut DrawnFrom::default());
                 }
                 cga_reference(&mut old, &vram, start, &colors, bits);
+                assert!(new.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                let new: Vec<_> = new.as_chunks::<4>().0.iter()
+                    .flat_map(|&[r, g, b, _]| [r, g, b]).collect();
                 let first = new.iter().zip(&old).position(|(a, b)| a != b);
                 assert!(new == old, "mode {} rows {} first {:?} adapter {:?} composite {}", mode, rows, first, bus.vga.adapter, bus.vga.composite_decoder().is_some());
             }

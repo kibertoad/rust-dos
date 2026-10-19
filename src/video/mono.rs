@@ -76,9 +76,10 @@ pub fn apply(frame: &mut Frame, mono: Monochrome) {
         return;
     };
     let ramp = ramp(phosphor);
-    for pixel in frame.rgb.as_chunks_mut::<3>().0 {
-        let [r, g, b] = *pixel;
-        *pixel = ramp[luma(r, g, b) as usize];
+    for pixel in frame.rgba.as_chunks_mut::<4>().0 {
+        let [r, g, b, _] = *pixel;
+        let [r, g, b] = ramp[luma(r, g, b) as usize];
+        *pixel = [r, g, b, 255];
     }
 }
 
@@ -87,10 +88,9 @@ mod tests {
     use super::*;
 
     fn tinted(mono: Monochrome, pixels: &[[u8; 3]]) -> Vec<[u8; 3]> {
-        let mut frame = Frame::new(pixels.len() as u32, 1);
-        frame.rgb = pixels.concat();
+        let mut frame = Frame::from_rgb(pixels.len() as u32, 1, pixels.concat());
         apply(&mut frame, mono);
-        frame.rgb.as_chunks::<3>().0.to_vec()
+        frame.rgba.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect()
     }
 
     #[test]

@@ -2149,11 +2149,11 @@ fn draw_recording_indicator(screen: &mut video::Frame, frame_w: usize) {
             let dx = x as isize - center_x as isize;
             let dy = y as isize - center_y as isize;
             if dx * dx + dy * dy <= (radius * radius) as isize {
-                let idx = (y * frame_w + x) * 3;
-                if idx + 2 < screen.rgb.len() {
-                    screen.rgb[idx] = 0xFF; // R
-                    screen.rgb[idx + 1] = 0x00; // G
-                    screen.rgb[idx + 2] = 0x00; // B
+                let idx = (y * frame_w + x) * 4;
+                if idx + 2 < screen.rgba.len() {
+                    screen.rgba[idx] = 0xFF; // R
+                    screen.rgba[idx + 1] = 0x00; // G
+                    screen.rgba[idx + 2] = 0x00; // B
                 }
             }
         }

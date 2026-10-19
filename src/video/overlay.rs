@@ -14,7 +14,7 @@ pub fn draw_cursors(frame: &mut Frame, bus: &Bus, cursor_visible: bool) {
         return;
     }
     let (width, height) = (frame.width, frame.height);
-    let buffer = &mut frame.rgb[..];
+    let buffer = &mut frame.rgba[..];
     let frame_w = width as usize;
 
     // The text mode cursor, at the active page's cursor position (BDA
@@ -45,7 +45,7 @@ pub fn draw_cursors(frame: &mut Frame, bus: &Bus, cursor_visible: bool) {
             for y in scan_start * geometry.y_scale..(scan_end + 1) * geometry.y_scale {
                 let draw_y = cursor_row * cell_h + y;
                 for draw_x in x0..x0 + cell_w {
-                    let idx = (draw_y * frame_w + draw_x) * 3;
+                    let idx = (draw_y * frame_w + draw_x) * 4;
                     if draw_x < frame_w && idx + 2 < buffer.len() {
                         buffer[idx..idx + 3].fill(0xDD);
                     }
@@ -178,15 +178,15 @@ fn draw_default_mouse_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32) {
             if x < 0 || y < 0 || x >= w || y >= h {
                 continue;
             }
-            let idx = (y * w + x) as usize * 3;
+            let idx = (y * w + x) as usize * 4;
             let (r, g, b) = if cell == 1 {
                 (0xFF, 0xFF, 0xFF)
             } else {
                 (0x00, 0x00, 0x00)
             };
-            frame.rgb[idx] = r;
-            frame.rgb[idx + 1] = g;
-            frame.rgb[idx + 2] = b;
+            frame.rgba[idx] = r;
+            frame.rgba[idx + 1] = g;
+            frame.rgba[idx + 2] = b;
         }
     }
 }
