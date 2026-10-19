@@ -78,6 +78,10 @@ fn foreign_state(gl: &glow::Context) {
         gl.color_mask(false, true, false, false);
         gl.enable(glow::SCISSOR_TEST);
         gl.scissor(0, 0, 1, 1);
+        gl.enable(glow::STENCIL_TEST);
+        gl.stencil_func(glow::NEVER, 0, 0xFF);
+        gl.enable(glow::CULL_FACE);
+        gl.cull_face(glow::FRONT_AND_BACK);
     }
 }
 
@@ -138,6 +142,9 @@ fn cached_replay_matches_rebinding_each_command() {
     for samples in [1, 4] {
         let mut cached = VoodooGl::new(&gl, Glsl::Gl150, 1, samples, 1).unwrap();
         let mut rebound = VoodooGl::new(&gl, Glsl::Gl150, 1, samples, 1).unwrap();
+        // The baseline sends every state call, so a wrongly skipped one
+        // in the cached replay shows up as a difference.
+        rebound.state.bypass = true;
         for frame in 0..4 {
             let mut commands = if frame % 2 == 0 {
                 vec![snapshot()]
@@ -186,6 +193,13 @@ fn cached_replay_matches_rebinding_each_command() {
                             color: Some(0x2040C0),
                             aux: Some(0xFFFF),
                             alpha_planes: false,
+                        }),
+                        Command::Fill(Fill {
+                            dest: 0,
+                            rect: [0, 3, 5, 8],
+                            color: None,
+                            aux: Some(0x80 + n as u16),
+                            alpha_planes: true,
                         }),
                     ]);
                 }

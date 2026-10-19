@@ -313,6 +313,10 @@ impl VoodooGl {
     /// Draw `recording`; whether the picture may have changed with it.
     pub fn run(&mut self, gl: &glow::Context, recording: Recording) -> bool {
         self.state.invalidate();
+        // A frontend can leave face culling on, and the card draws both
+        // windings.
+        // SAFETY: see `VoodooGl`.
+        unsafe { gl.disable(glow::CULL_FACE) };
         let changed = !recording.commands.is_empty() || self.front != recording.front || self.clut != recording.clut;
         for command in &recording.commands {
             match command {
@@ -476,6 +480,7 @@ impl VoodooGl {
             self.state.viewport(gl, [0, 0, sw, sh]);
             self.state.blend(gl, false);
             self.state.scissor(gl, None);
+            self.state.stencil(gl, false);
             if key.is_some() {
                 self.state.depth(gl, false);
                 self.state.color_mask(gl, [true, true, true, false]);
@@ -776,7 +781,6 @@ impl VoodooGl {
     /// they differ from `base` (the settings window, messages): a texture
     /// and its size, or None if the card shows nothing.
     pub fn composite(&mut self, gl: &glow::Context, screen: &Frame, base: &Frame) -> Option<(glow::Texture, (u32, u32))> {
-        self.state.invalidate();
         let (w, h) = self.scaled();
         let front = self.targets.get(&self.front?)?;
         front.resolve(gl, (w, h));
