@@ -18,6 +18,8 @@
 //! (LeonG-ZA's `verite` branch) names them, for the fields VLIB alone
 //! doesn't.
 
+mod coverage;
+
 /// RRedline's pixel formats (`V_PIXFMT_*`), as the library numbers them.
 pub mod fmt {
     pub const P332: u32 = 1;
@@ -380,6 +382,15 @@ fn argb(colour: u32) -> Rgba {
     [(colour >> 16 & 0xFF) as f32, (colour >> 8 & 0xFF) as f32, (colour & 0xFF) as f32, (colour >> 24) as f32]
 }
 
+#[inline]
+fn wrapped_coordinate(value: i32, last: u32) -> u32 {
+    if last < i32::MAX as u32 && (last + 1).is_power_of_two() {
+        value as u32 & last
+    } else {
+        value.rem_euclid(last as i32 + 1) as u32
+    }
+}
+
 fn mix(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -394,8 +405,8 @@ impl DrawState {
             v = v.clamp(0, self.tex_last_v as i32);
         }
         // Wrapped around the size, which is a mask for powers of two.
-        let u = u.rem_euclid(self.tex_last_u as i32 + 1) as u32;
-        let v = v.rem_euclid(self.tex_last_v as i32 + 1) as u32;
+        let u = wrapped_coordinate(u, self.tex_last_u);
+        let v = wrapped_coordinate(v, self.tex_last_v);
         let line = self.tex_base.wrapping_add(v * self.tex_stride);
         match bits(self.src_format) {
             // The even texel in the low nibble.
@@ -483,15 +494,47 @@ impl DrawState {
 
     /// A triangle.
     pub fn triangle(&self, vram: &mut [u8], a: &Vertex, b: &Vertex, c: &Vertex) {
+        let Some((area, bounds)) = self.triangle_bounds(a, b, c) else {
+            return;
+        };
+        // Tiny triangles keep the bounding-box loop without edge setup.
+        if bounds[1] - bounds[0] <= 8 {
+            self.triangle_in::<false>(vram, [a, b, c], area, bounds);
+        } else {
+            self.triangle_in::<true>(vram, [a, b, c], area, bounds);
+        }
+    }
+
+    /// A triangle's signed area and its bounding box in the scissors, as
+    /// `[x0, x1, y0, y1]`; `None` when it has no area or no pixels.
+    fn triangle_bounds(&self, a: &Vertex, b: &Vertex, c: &Vertex) -> Option<(f32, [i32; 4])> {
         let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
         if area == 0.0 || !area.is_finite() {
-            return;
+            return None;
         }
         let ((left, right), (top, bottom)) = (scissor(self.scissor_x), scissor(self.scissor_y));
         let x0 = (a.x.min(b.x).min(c.x).floor() as i32).max(left);
         let x1 = (a.x.max(b.x).max(c.x).ceil() as i32).min(right);
         let y0 = (a.y.min(b.y).min(c.y).floor() as i32).max(top);
         let y1 = (a.y.max(b.y).max(c.y).ceil() as i32).min(bottom);
+        (x0 < x1 && y0 < y1).then_some((area, [x0, x1, y0, y1]))
+    }
+
+    #[inline(always)]
+    fn triangle_in<const EDGES: bool>(
+        &self,
+        vram: &mut [u8],
+        vertices: [&Vertex; 3],
+        area: f32,
+        bounds: [i32; 4],
+    ) {
+        let [a, b, c] = vertices;
+        let [x0, x1, y0, y1] = bounds;
+        let mut coverage = if EDGES {
+            coverage::Coverage::new([a, b, c], area, x0..x1, y0)
+        } else {
+            None
+        };
         let textured = self.src_mode != 0;
         let z_on = self.z_mode != 0 || self.z_write;
         // Attributes the vertices lack take the state's defaults.
@@ -506,10 +549,11 @@ impl DrawState {
         let z_of = |v: &Vertex| if v.has_z { v.z } else { z };
         for py in y0..y1 {
             let fy = py as f32 + 0.5;
-            for px in x0..x1 {
+            let span = coverage.as_mut().map_or(x0..x1, coverage::Coverage::next);
+            for px in span {
                 let fx = px as f32 + 0.5;
-                // Barycentric weights, with the top-left rule's ties to
-                // the edges that have area on the inside.
+                // Barycentric weights. A pixel centre on an edge counts as
+                // inside, so a shared edge is drawn by both triangles.
                 let w0 = ((b.x - fx) * (c.y - fy) - (c.x - fx) * (b.y - fy)) / area;
                 let w1 = ((c.x - fx) * (a.y - fy) - (a.x - fx) * (c.y - fy)) / area;
                 let w2 = 1.0 - w0 - w1;
@@ -973,3 +1017,6 @@ mod tests {
         assert_eq!(s.texel(&vram, 1, 0), 2);
     }
 }
+
+#[cfg(test)]
+mod triangle_tests;
