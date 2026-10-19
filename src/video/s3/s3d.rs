@@ -292,6 +292,26 @@ impl<'a, 'b> Context<'a, 'b> {
         })
     }
 
+    /// The shading and texture state of triangle command `cmd`; false if
+    /// `cmd` isn't a triangle.
+    fn setup_triangle(&mut self, cmd: u32, tri: &[u32; 0x80]) -> bool {
+        match cmd_command(cmd) {
+            GOURAUD_TRI => {}
+            LIT_TEX_TRI | LIT_TEX_TRI_PERSP => {
+                self.textured = true;
+                self.lit = true;
+            }
+            UNLIT_TEX_TRI | UNLIT_TEX_TRI_PERSP => self.textured = true,
+            _ => return false,
+        }
+        if self.textured {
+            self.tex_blend = cmd_tex_blend(cmd);
+            self.setup_texture(cmd, tri);
+            self.fog = cmd & CMD_FE != 0;
+        }
+        true
+    }
+
     fn setup_texture(&mut self, cmd: u32, tri: &[u32; 0x80]) {
         const TEX_BYTES: [u32; 8] = [4, 2, 2, 1, 1, 1, 1, 2];
         let reg = |off: usize| tri[off >> 2];
@@ -567,8 +587,26 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    /// One pixel through the pipeline of the databook's figure 15-7.
+    /// One pixel through the pipeline of the databook's figure 15-7, with
+    /// Z test, texturing and pixel depth read from the context.
     fn pixel(&mut self, x: i32, y: i32, at: &Attr) {
+        self.pixel_in::<false, false, 0>(x, y, at);
+    }
+
+    /// `pixel` with Z test, texturing and pixel depth fixed at compile time
+    /// for the triangle spans. `BYPP` 0 is the dynamic `pixel`: it reads all
+    /// three from the context and ignores `ZTEST` and `TEXTURED`.
+    #[inline(always)]
+    fn pixel_in<const ZTEST: bool, const TEXTURED: bool, const BYPP: u32>(
+        &mut self,
+        x: i32,
+        y: i32,
+        at: &Attr,
+    ) {
+        // BYPP zero retains the dynamic path used by line commands.
+        let ztest = if BYPP == 0 { self.ztest } else { ZTEST };
+        let textured = if BYPP == 0 { self.textured } else { TEXTURED };
+        let bypp = if BYPP == 0 { self.bypp } else { BYPP };
         // 11-bit unsigned coordinates; anything outside is dropped.
         if x as u32 > 2047 || y as u32 > 2047 {
             return;
@@ -576,14 +614,15 @@ impl<'a, 'b> Context<'a, 'b> {
         if self.hc && (x < self.clip_l || x > self.clip_r || y < self.clip_t || y > self.clip_b) {
             return;
         }
-        let dest = self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * self.bypp as u64;
-        if dest + self.bypp as u64 > self.memsize as u64 {
+        let dest =
+            self.dest_base as u64 + y as u64 * self.dest_stride as u64 + x as u64 * bypp as u64;
+        if dest + bypp as u64 > self.memsize as u64 {
             return;
         }
         let dest = dest as u32;
         let zs = z16(at.z);
         let mut z_addr = 0;
-        if self.ztest {
+        if ztest {
             let za = self.z_base as u64 + y as u64 * self.z_stride as u64 + x as u64 * 2;
             if za + 2 > self.memsize as u64 {
                 return;
@@ -611,7 +650,7 @@ impl<'a, 'b> Context<'a, 'b> {
         // The vertex colour.
         let src = Color { r: clamp8(at.r >> 7), g: clamp8(at.g >> 7), b: clamp8(at.b >> 7), a: clamp8(at.a >> 7) };
         let mut col = src;
-        if self.textured {
+        if textured {
             col = self.sample_texture(at);
             if self.lit && !self.palettized {
                 match self.tex_blend {
@@ -641,10 +680,10 @@ impl<'a, 'b> Context<'a, 'b> {
                 col.g = (col.g * a + fg * (255 - a)) / 255;
                 col.b = (col.b * a + fb * (255 - a)) / 255;
             }
-            if (self.abc == 2 || self.abc == 3) && self.bypp != 1 {
+            if (self.abc == 2 || self.abc == 3) && bypp != 1 {
                 // 10b: the alpha at this stage; 11b: the source alpha.
                 let a = if self.abc == 3 { src.a } else { clamp8(col.a) };
-                let d = if self.bypp == 2 {
+                let d = if bypp == 2 {
                     rgb1555(self.word(dest), 0)
                 } else {
                     let value = self.packed::<3>(dest);
@@ -662,13 +701,13 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         let (r, g, b) = (clamp8(col.r) as u32, clamp8(col.g) as u32, clamp8(col.b) as u32);
         let d = dest as usize;
-        match self.bypp {
+        match bypp {
             1 => self.t.vram[d] = b as u8,
             // ZRGB1555: bit 15, MUX buffering's Z flag, is written 0.
             2 => self.write_word(dest, (b >> 3 | (g >> 3) << 5 | (r >> 3) << 10) as u16),
             _ => self.t.vram[d..d + 3].copy_from_slice(&[b as u8, g as u8, r as u8]),
         }
-        if self.ztest && self.zup {
+        if ztest && self.zup {
             self.write_word(z_addr, zs as u16);
         }
     }
@@ -676,7 +715,20 @@ impl<'a, 'b> Context<'a, 'b> {
     /// One of a triangle's two parts, walking up from `y` (15.4.5.2): the
     /// first along side 01, the second along 12. `x1` runs along side 02.
     #[allow(clippy::too_many_arguments)]
-    fn tri_part(&mut self, dx_: &Attr, dy_: &Attr, xdir: i32, y: &mut i32, x1: &mut i32, mut x2: i32, dx1: i32, dx2: i32, ycount: i32, base: &mut Attr) {
+    fn tri_part(
+        &mut self,
+        span: spans::Span<'a, 'b>,
+        dx_: &Attr,
+        dy_: &Attr,
+        xdir: i32,
+        y: &mut i32,
+        x1: &mut i32,
+        mut x2: i32,
+        dx1: i32,
+        dx2: i32,
+        ycount: i32,
+        base: &mut Attr,
+    ) {
         for _ in 0..ycount.min(2048) {
             let visible = *y as u32 <= 2047 && (!self.hc || (*y >= self.clip_t && *y <= self.clip_b));
             if visible {
@@ -720,11 +772,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     }
                     if draw {
                         let count = if xdir > 0 { xe - x } else { x - xe }.min(4096);
-                        for _ in 0..count {
-                            self.pixel(x, *y, &at);
-                            at.add(dx_);
-                            x += xdir;
-                        }
+                        span(self, x, *y, count, xdir, &mut at, dx_);
                     }
                 }
             }
@@ -855,19 +903,8 @@ impl S3d {
         let reg = |off: usize| tri[off >> 2];
         let cmd = reg(0x100);
         let Some(mut c) = Context::new(t, cmd, tri) else { return };
-        match cmd_command(cmd) {
-            GOURAUD_TRI => {}
-            LIT_TEX_TRI | LIT_TEX_TRI_PERSP => {
-                c.textured = true;
-                c.lit = true;
-            }
-            UNLIT_TEX_TRI | UNLIT_TEX_TRI_PERSP => c.textured = true,
-            _ => return,
-        }
-        if c.textured {
-            c.tex_blend = cmd_tex_blend(cmd);
-            c.setup_texture(cmd, tri);
-            c.fog = cmd & CMD_FE != 0;
+        if !c.setup_triangle(cmd, tri) {
+            return;
         }
         let dx = Attr {
             b: lo16s(reg(0x13C)),
@@ -902,6 +939,7 @@ impl S3d {
             u: reg(0x138) as i32,
             z: reg(0x15C) as i32,
         };
+        let span = c.select_span();
         let ycnt = reg(0x17C);
         let ty12 = (ycnt & 0x7FF) as i32;
         let ty01 = (ycnt >> 16 & 0x7FF) as i32;
@@ -909,8 +947,32 @@ impl S3d {
         let mut y = (reg(0x178) & 0x7FF) as i32;
         let mut x1 = reg(0x174) as i32;
         let dx02 = reg(0x170) as i32;
-        c.tri_part(&dx, &dy, xdir, &mut y, &mut x1, reg(0x16C) as i32, dx02, reg(0x168) as i32, ty01, &mut base);
-        c.tri_part(&dx, &dy, xdir, &mut y, &mut x1, reg(0x164) as i32, dx02, reg(0x160) as i32, ty12, &mut base);
+        c.tri_part(
+            span,
+            &dx,
+            &dy,
+            xdir,
+            &mut y,
+            &mut x1,
+            reg(0x16C) as i32,
+            dx02,
+            reg(0x168) as i32,
+            ty01,
+            &mut base,
+        );
+        c.tri_part(
+            span,
+            &dx,
+            &dy,
+            xdir,
+            &mut y,
+            &mut x1,
+            reg(0x164) as i32,
+            dx02,
+            reg(0x160) as i32,
+            ty12,
+            &mut base,
+        );
     }
 
     /// A 3D line: 2D line drawing's X start, delta and ends, bottom up,
@@ -1170,3 +1232,6 @@ mod tests {
 #[cfg(test)]
 #[path = "s3d_memory_tests.rs"]
 mod memory_tests;
+
+#[path = "s3d_spans.rs"]
+mod spans;
