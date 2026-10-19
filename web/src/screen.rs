@@ -17,6 +17,7 @@ impl Rows {
         current: &[u8],
         width: usize,
         height: usize,
+        candidates: Range<usize>,
     ) -> bool {
         let row_bytes = width * 4;
         assert_eq!(current.len(), row_bytes * height);
@@ -27,13 +28,15 @@ impl Rows {
         } else if row_bytes == 0 {
             0..0
         } else {
-            let mut rows = previous
+            let band = candidates.start * row_bytes..candidates.end * row_bytes;
+            let mut rows = previous[band.clone()]
                 .chunks_exact(row_bytes)
-                .zip(current.chunks_exact(row_bytes));
+                .zip(current[band].chunks_exact(row_bytes));
             match rows.position(|(a, b)| a != b) {
                 Some(first) => {
                     let last = rows.rposition(|(a, b)| a != b);
-                    first..last.map_or(first + 1, |last| first + last + 2)
+                    let end = last.map_or(first + 1, |last| first + last + 2);
+                    candidates.start + first..candidates.start + end
                 }
                 None => 0..0,
             }
@@ -50,9 +53,9 @@ mod tests {
     fn the_first_blank_picture_is_uploaded_and_an_unchanged_one_is_not() {
         let mut rows = Rows::default();
         let rgba = vec![0; 4 * 5 * 4];
-        assert!(rows.update(&rgba, &rgba, 4, 5));
+        assert!(rows.update(&rgba, &rgba, 4, 5, 0..5));
         assert_eq!(rows.rows, 0..5);
-        assert!(!rows.update(&rgba, &rgba, 4, 5));
+        assert!(!rows.update(&rgba, &rgba, 4, 5, 0..5));
         assert_eq!(rows.rows, 0..0);
     }
 
@@ -60,12 +63,12 @@ mod tests {
     fn changes_at_either_edge_and_in_separate_rows_bound_the_upload() {
         let mut rows = Rows::default();
         let mut previous = vec![0; 4 * 5 * 4];
-        rows.update(&[], &previous, 4, 5);
+        rows.update(&[], &previous, 4, 5, 0..5);
         for expected in [0..1, 4..5, 1..4, 2..3] {
             let mut current = previous.clone();
             current[expected.start * 16] ^= 0x53;
             current[expected.end * 16 - 1] ^= 0x19;
-            assert!(rows.update(&previous, &current, 4, 5));
+            assert!(rows.update(&previous, &current, 4, 5, 0..5));
             assert_eq!(rows.rows, expected);
             previous = current;
         }
@@ -75,10 +78,10 @@ mod tests {
     fn a_mode_change_uploads_every_row_even_with_the_same_byte_count() {
         let mut rows = Rows::default();
         let rgba = vec![23; 4 * 5 * 4];
-        rows.update(&[], &rgba, 4, 5);
-        assert!(rows.update(&rgba, &rgba, 5, 4));
+        rows.update(&[], &rgba, 4, 5, 0..5);
+        assert!(rows.update(&rgba, &rgba, 5, 4, 0..4));
         assert_eq!(rows.rows, 0..4);
-        assert!(rows.update(&rgba, &rgba[..4], 1, 1));
+        assert!(rows.update(&rgba, &rgba[..4], 1, 1, 0..1));
         assert_eq!(rows.rows, 0..1);
     }
 
@@ -87,7 +90,7 @@ mod tests {
         let (width, height) = (37, 29);
         let mut previous = vec![0; width * height * 4];
         let mut rows = Rows::default();
-        rows.update(&[], &previous, width, height);
+        rows.update(&[], &previous, width, height, 0..height);
         for frame in 1..200 {
             let mut current = previous.clone();
             let a = frame % height;
@@ -95,9 +98,24 @@ mod tests {
             for row in [a, b] {
                 current[row * width * 4..(row + 1) * width * 4].fill(frame as u8);
             }
-            assert!(rows.update(&previous, &current, width, height));
+            assert!(rows.update(&previous, &current, width, height, a.min(b)..a.max(b) + 1));
             assert_eq!(rows.rows, a.min(b)..a.max(b) + 1);
             previous = current;
         }
+    }
+
+    #[test]
+    fn bounded_changes_keep_their_frame_row_offsets() {
+        let mut rows = Rows::default();
+        let old = vec![0; 4 * 5 * 4];
+        rows.update(&[], &old, 4, 5, 0..0);
+        let mut new = old.clone();
+        new[2 * 16] = 9;
+        new[4 * 16 - 1] = 7;
+        assert!(rows.update(&old, &new, 4, 5, 1..5));
+        assert_eq!(rows.rows, 2..4);
+        assert!(!rows.update(&new, &new, 4, 5, 2..4));
+        assert_eq!(rows.rows, 0..0);
+        assert!(!rows.update(&new, &new, 4, 5, 0..0));
     }
 }

@@ -28,7 +28,7 @@ use crate::host::{self, Machine};
 use crate::keys;
 use crate::memmap::Published;
 use crate::options::{self, Values};
-use crate::present::{self, Pixels};
+use crate::present::Pixels;
 use crate::{Callbacks, KeyEvent};
 
 /// The frames the core hands over a second.
@@ -101,6 +101,10 @@ pub struct Core {
     /// and what they were drawn from (`cursors_key`, the monitor).
     filtered: Frame,
     composition: Option<(u64, video::mono::Monochrome)>,
+    restoration: video::compose::Composition,
+    /// No context received the last picture: the next one must include
+    /// all changes since its older texture, not just this frame's rows.
+    gpu_missed: bool,
     /// The picture last handed over in software, XRGB8888.
     xrgb: Pixels<u32>,
     /// Whether the frontend takes a null picture for the last one again.
@@ -287,6 +291,8 @@ impl Core {
             filtered: blank.clone(),
             screen: blank,
             composition: None,
+            restoration: video::compose::Composition::default(),
+            gpu_missed: true,
             xrgb: Pixels::default(),
             can_dupe,
             frame_shown: false,
@@ -566,27 +572,39 @@ impl Core {
             bus.vga.mark_dirty_full();
         }
         let rendered = bus.vga.dirty;
-        if rendered {
-            video::render_screen(&mut self.picture, bus);
+        let changed = if rendered {
+            let rows = video::render_screen_rows(&mut self.picture, bus);
             bus.vga.clear_dirty();
-        }
+            rows
+        } else {
+            0..0
+        };
         let composition = (
             video::overlay::cursors_key(bus, self.cursor_visible),
             self.m.settings.monochrome,
         );
         let composed = rendered || self.composition != Some(composition);
-        if composed {
-            self.filtered.clone_from(&self.picture);
+        let filtered_rows = if composed {
+            let overlay = video::overlay::cursor_rows(&self.picture, bus, self.cursor_visible);
+            let rows = self.restoration.restore(
+                &mut self.filtered,
+                &self.picture,
+                changed,
+                overlay,
+                composition.1,
+            );
             video::overlay::draw_cursors(&mut self.filtered, bus, self.cursor_visible);
-            video::mono::apply(&mut self.filtered, composition.1);
+            video::mono::apply_rows(&mut self.filtered, composition.1, rows.clone());
             self.composition = Some(composition);
-        }
+            rows
+        } else {
+            0..0
+        };
         // `screen` is `filtered` already when neither changed since the
         // last frame and nothing was drawn over it.
         let overlaid = self.ui.is_open() || self.ui.overlay_shown() || self.wheel_view.is_some();
-        if composed || overlaid || self.overlaid {
-            present::restore(&mut self.screen, &self.filtered);
-        }
+        let rows = if overlaid || self.overlaid { 0..height as usize } else { filtered_rows };
+        let rows = self.screen.copy_rows_from(&self.filtered, rows);
         self.overlaid = overlaid;
         if self.ui.is_open() {
             self.ui.set_mixer_status(bus.mixer.muted, bus.mixer.take_peaks());
@@ -613,15 +631,18 @@ impl Core {
         // framebuffer; before it made a context, the last one stays.
         if crate::gl::granted() {
             let voodoo = voodoo_gl.then_some(&self.picture);
+            let candidates = if self.gpu_missed { 0..height as usize } else { rows };
             let Some((w, h, refresh)) =
-                crate::gl::with_screen(|s| s.present(&self.screen, voodoo, can_dupe))
+                crate::gl::with_screen(|s| s.present(&self.screen, voodoo, can_dupe, candidates))
             else {
+                self.gpu_missed = true;
                 let (w, h) = self
                     .shown
                     .unwrap_or((self.screen.width, self.screen.height));
                 cb.video_dupe(w, h);
                 return;
             };
+            self.gpu_missed = false;
             self.shown = Some((w, h));
             self.set_geometry(cb);
             let video_start = Instant::now();
@@ -633,9 +654,11 @@ impl Core {
             self.frontend += video_start.elapsed();
             return;
         }
-        let changed = self
-            .xrgb
-            .update(&self.screen, |[r, g, b, _]| u32::from_be_bytes([0, r, g, b]));
+        self.gpu_missed = true;
+        let candidates = if self.shown.is_some() { 0..height as usize } else { rows };
+        let changed = self.xrgb.update(&self.screen, candidates, |[r, g, b, _]| {
+            u32::from_be_bytes([0, r, g, b])
+        });
         let duplicate = changed.is_none() && self.shown.is_none() && can_dupe;
         self.shown = None;
         self.set_geometry(cb);

@@ -229,6 +229,7 @@ impl Screen {
         screen: &Frame,
         voodoo: Option<&Frame>,
         can_dupe: bool,
+        candidates: std::ops::Range<usize>,
     ) -> (u32, u32, bool) {
         let Screen {
             gl,
@@ -249,7 +250,14 @@ impl Screen {
             let (texture, (w, h)) = match composite {
                 Some(picture) => picture,
                 None => {
-                    let rows = crate::present::changed_rows(upload, screen);
+                    // The owned VGA texture was not updated while the
+                    // 3dfx composite was shown. Restore all of it then.
+                    let candidates = if was_composite {
+                        0..screen.height as usize
+                    } else {
+                        candidates
+                    };
+                    let rows = crate::present::changed_rows(upload, screen, candidates);
                     if rows.is_none() && !was_composite && can_dupe {
                         return (screen.width, screen.height, false);
                     }
@@ -392,11 +400,11 @@ mod tests {
         };
         let mut screen = Screen::new(gl, default_framebuffer).unwrap();
         let mut frame = Frame::from_rgb(3, 2, vec![17; 18]);
-        assert_eq!(screen.present(&frame, None, true), (3, 2, true));
-        assert_eq!(screen.present(&frame, None, true), (3, 2, false));
+        assert_eq!(screen.present(&frame, None, true, 0..0), (3, 2, true));
+        assert_eq!(screen.present(&frame, None, true, 0..0), (3, 2, false));
         frame.rgba[12..].as_chunks_mut::<4>().0.fill([37, 37, 37, 255]);
-        assert_eq!(screen.present(&frame, None, true), (3, 2, true));
-        assert_eq!(screen.present(&frame, None, false), (3, 2, true));
+        assert_eq!(screen.present(&frame, None, true, 1..2), (3, 2, true));
+        assert_eq!(screen.present(&frame, None, false, 0..0), (3, 2, true));
         let read = |screen: &Screen, frame: &Frame| {
             let mut pixels = vec![0; (frame.width * frame.height * 4) as usize];
             // SAFETY: the texture and context belong to this thread.
@@ -418,9 +426,9 @@ mod tests {
         read(&screen, &frame);
         // Same pixel count, different geometry: storage must be resized.
         frame = Frame::from_rgb(2, 3, vec![73; 18]);
-        assert_eq!(screen.present(&frame, None, true), (2, 3, true));
+        assert_eq!(screen.present(&frame, None, true, 0..0), (2, 3, true));
         read(&screen, &frame);
-        assert_eq!(screen.present(&frame, None, true), (2, 3, false));
+        assert_eq!(screen.present(&frame, None, true, 0..0), (2, 3, false));
         screen.destroy();
     }
 }

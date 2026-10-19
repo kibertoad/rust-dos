@@ -378,8 +378,7 @@ impl<'a> Display<'a> {
 
     /// Show `frame`, which must be as big as the last `set_frame_size`,
     /// if it differs from the one shown or the window needs drawing. The
-    /// display keeps the picture to compare the next one with, and leaves
-    /// the one it showed before in `frame` instead, which saves copying it.
+    /// display keeps the changed rows to compare the next picture with.
     /// With `voodoo`, the machine's picture without what is drawn over it,
     /// OpenGL shows the 3dfx card's picture it drew instead
     /// (`run_voodoo`), with what `frame` has over it.
@@ -387,6 +386,19 @@ impl<'a> Display<'a> {
     /// `layer` goes over the picture, at as many of the window's pixels as
     /// it has (`output_scale`).
     pub fn present(&mut self, frame: &mut Frame, voodoo: Option<&Frame>, layer: Option<&Layer>) -> Result<(), String> {
+        self.present_rows(frame, voodoo, layer, 0..frame.height as usize)
+    }
+
+    /// Present a persistent composition, comparing only rows that may
+    /// have changed since the last presentation. Keep its pixels in place
+    /// so the next composition can restore just its dirty rows.
+    pub fn present_rows(
+        &mut self,
+        frame: &Frame,
+        voodoo: Option<&Frame>,
+        layer: Option<&Layer>,
+        candidates: std::ops::Range<usize>,
+    ) -> Result<(), String> {
         let row_bytes = frame.width as usize * 4;
         // The layer covers the 3dfx card's picture.
         let voodoo = voodoo.filter(|_| layer.is_none());
@@ -399,7 +411,7 @@ impl<'a> Display<'a> {
         {
             0..frame.height as usize
         } else {
-            match video::changed_rows(&self.shown, &frame.rgba, row_bytes) {
+            match video::changed_rows_in(&self.shown, &frame.rgba, row_bytes, candidates) {
                 Some(rows) => rows,
                 None => {
                     // The 3D scene is drawn every frame all the same.
@@ -412,6 +424,7 @@ impl<'a> Display<'a> {
             }
         };
         self.redraw = false;
+        let updated = rows.start * row_bytes..rows.end * row_bytes;
         let display = display_size(frame.width, frame.height, self.aspect);
         let shown = match &mut self.out {
             Output::Gl(gl) => {
@@ -457,7 +470,7 @@ impl<'a> Display<'a> {
             }
         };
         if self.shown.len() == frame.rgba.len() {
-            std::mem::swap(&mut self.shown, &mut frame.rgba);
+            self.shown[updated.clone()].copy_from_slice(&frame.rgba[updated]);
         } else {
             self.shown.clone_from(&frame.rgba);
         }

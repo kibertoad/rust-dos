@@ -154,12 +154,13 @@ pub struct Machine {
     sound: Rc<RefCell<Sound>>,
     /// The video card's picture, rendered where it changed.
     picture: Frame,
-    /// The picture with the cursors on top, as last shown and as it is
-    /// being put together.
+    /// The composed picture last handed to the browser, and the next
+    /// composition, whose unchanged rows stay in place between frames.
     screen: Frame,
     next: Frame,
     /// The changed rows of the composed RGBA picture.
     rows: screen::Rows,
+    composition: video::compose::Composition,
     /// What the hotkeys did, over the picture, and whether the machine is
     /// paused (Alt+Pause).
     osd: Osd,
@@ -231,6 +232,7 @@ impl Machine {
             screen: blank.clone(),
             next: blank,
             rows: screen::Rows::default(),
+            composition: video::compose::Composition::default(),
             osd: Osd::new(),
             paused: false,
             shaders: false,
@@ -1068,13 +1070,27 @@ impl Machine {
         if self.picture.resize(width, height) {
             bus.vga.mark_dirty_full();
         }
-        if bus.vga.dirty {
-            video::render_screen(&mut self.picture, bus);
+        let changed = if bus.vga.dirty {
+            let rows = video::render_screen_rows(&mut self.picture, bus);
             bus.vga.clear_dirty();
-        }
-        self.next.clone_from(&self.picture);
+            rows
+        } else {
+            0..0
+        };
+        let overlay = if self.ui.is_open() || self.ui.overlay_shown() || !self.osd.is_empty() {
+            0..height as usize
+        } else {
+            video::overlay::cursor_rows(&self.picture, bus, self.cursor_visible)
+        };
+        let rows = self.composition.restore(
+            &mut self.next,
+            &self.picture,
+            changed,
+            overlay,
+            self.settings.monochrome,
+        );
         video::overlay::draw_cursors(&mut self.next, bus, self.cursor_visible);
-        video::mono::apply(&mut self.next, self.settings.monochrome);
+        video::mono::apply_rows(&mut self.next, self.settings.monochrome, rows.clone());
         if self.ui.is_open() {
             self.ui.set_mixer_status(bus.mixer.muted, bus.mixer.take_peaks());
         }
@@ -1089,10 +1105,11 @@ impl Machine {
             &self.next.rgba,
             width as usize,
             height as usize,
+            rows,
         ) {
             return false;
         }
-        std::mem::swap(&mut self.next, &mut self.screen);
+        self.screen.copy_rows_from(&self.next, self.rows.rows.clone());
         true
     }
 }
