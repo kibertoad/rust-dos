@@ -240,12 +240,12 @@ mod tests {
                                                         (sx as i32 + dx * col) as u32,
                                                         (sy as i32 + dy * row) as u32,
                                                     );
-                                                    let mode = if select == 3 {
-                                                        engine.screen_mix(pixel)
-                                                    } else {
-                                                        engine.fore_mix
-                                                    };
-                                                    let src = engine.source(mode, pixel);
+                                                    let mode = engine.pixel_mix(
+                                                        select,
+                                                        pixel,
+                                                        engine.pixel_mixes(),
+                                                    );
+                                                    let src = engine.source(mode.mode, pixel);
                                                     let write = misc & 0x100 == 0
                                                         || ((src != compare) as u16
                                                             ^ (misc >> 7 & 1))
