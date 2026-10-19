@@ -232,7 +232,7 @@ pub struct IdleStats {
     pub cut: u64,
     /// The failures by why, in the order the reasons first came up (an
     /// empty one is a free slot).
-    pub failed_by: [(&'static str, u64); 16],
+    pub failed_by: [(&'static str, u64); 24],
     /// The same counts by head, for the first heads armed.
     pub heads: [HeadStats; 16],
 }
@@ -537,23 +537,20 @@ impl Observe {
         // (A loop that changes something every pass, as DOS 7's keyboard
         // poll counts down, is looked at about once in 64K arms.)
         let Some(head) = head else { return };
-        let at = match self.backoffs.iter().position(|b| b.head == head) {
-            Some(at) => at,
-            None => {
-                if self.backoffs.len() == BACKOFF_HEADS {
-                    self.backoffs.remove(0);
-                }
-                self.backoffs.push(Backoff {
-                    head,
-                    left: 0,
-                    in_row: 0,
-                });
-                self.backoffs.len() - 1
-            }
+        let mut b = match self.backoffs.iter().position(|b| b.head == head) {
+            Some(at) => self.backoffs.remove(at),
+            None => Backoff {
+                head,
+                left: 0,
+                in_row: 0,
+            },
         };
-        let b = &mut self.backoffs[at];
+        if self.backoffs.len() == BACKOFF_HEADS {
+            self.backoffs.remove(0);
+        }
         b.in_row = (b.in_row + 1).min(16);
         b.left = 1 << b.in_row;
+        self.backoffs.push(b);
     }
 
     /// A proof at `head` came through: it is armed as often as it comes up
@@ -692,12 +689,8 @@ fn visit(cpu: &mut Cpu, now: u64) {
         return o.fail(why);
     }
     if matches!(o.phase, Phase::ArmHere) {
-        if o.backs_off(here) {
-            return o.stop();
-        }
-        o.stats.arms += 1;
-        o.tally(Some(here), |h| h.arms += 1);
-        o.phase = Phase::Armed { head: here, until: now + ARM_LIMIT };
+        o.phase = Phase::Off;
+        o.arm(here, now);
     }
     let (head, until) = match &o.phase {
         Phase::Off | Phase::ArmHere => return,
@@ -1042,8 +1035,11 @@ fn rflags(bits: u32) -> u32 {
 fn count(cpu: &mut Cpu, visit: Visit) {
     let chunks = cpu.bus.observe.take_chunks();
     let o = &mut cpu.bus.observe;
-    let Phase::Count { base, copies, pass, .. } = std::mem::take(&mut o.phase) else { return };
-    o.phase = Phase::Off;
+    let Phase::Count { head, base, copies, pass, until } = std::mem::take(&mut o.phase) else {
+        return;
+    };
+    // (The head stays, for `fail` and `finish`, which end the phase.)
+    o.phase = Phase::Armed { head, until };
     let ram = cpu.bus.ram();
     let fail = |cpu: &mut Cpu, why| {
         cpu.bus.observe.on = true;
