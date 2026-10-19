@@ -109,6 +109,9 @@ pub struct Engine {
     bres_error_0: i32,
     pub rop: u32,
     rops: [u8; 4],
+    /// Host dispatch derived from `rops`: refreshed wherever `rops` is
+    /// written and rebuilt after a state load, which doesn't keep it.
+    rop_functions: [crate::rasterop::Ternary; 4],
     pub command_extra: u32,
     pub line_stipple: u32,
     pub line_style: u32,
@@ -187,6 +190,7 @@ impl Default for Engine {
             bres_error_0: 0,
             rop: 0,
             rops: [0; 4],
+            rop_functions: [crate::rasterop::ternary(0); 4],
             command_extra: 0,
             line_stipple: 0,
             line_style: 0,
@@ -247,6 +251,7 @@ crate::state_fields!(Engine {
     src_size_y, src_x, src_y, dst_size_x, dst_size_y, dst_x, dst_y, launch_pending, patoff_x,
     patoff_y, cur_y, src_stride_src, src_stride_dest, host_data_size_src, host_data_size_dest,
     host_data, host_data_count, lx, ly, rx, ry, dx, dy, x_inc, error, lx_cur, rx_cur, drawn,
+    rop_functions,
 });
 
 /// The signed 13-bit x and y of an XY register.
@@ -360,7 +365,7 @@ impl Engine {
         if self.colorkey(dest, false, dst_key) {
             n |= 1;
         }
-        rop3(self.rops[n], dest, src, pattern)
+        (self.rop_functions[n])(dest, src, pattern)
     }
 
     /// The byte address of byte `x` of row `y` of the destination or the
@@ -474,6 +479,7 @@ impl Engine {
                 self.rops[1] = val as u8;
                 self.rops[2] = (val >> 8) as u8;
                 self.rops[3] = (val >> 16) as u8;
+                self.rop_functions = self.rops.map(crate::rasterop::ternary);
             }
             0x34 => {
                 self.src_base = val & 0xFF_FFFF;
@@ -582,6 +588,7 @@ impl Engine {
     /// After a load: what writing the registers works out from them,
     /// which a save doesn't keep; a command under way starts over.
     pub fn after_load(&mut self) {
+        self.rop_functions = self.rops.map(crate::rasterop::ternary);
         self.bres_error_0 = (self.bres_error0 & 0xFFFF) as i32;
         let style = self.line_style;
         self.line_rep_cnt = style & 0xFF;
@@ -652,6 +659,7 @@ impl Engine {
     fn launch(&mut self) {
         self.launch_pending = false;
         self.rops[0] = (self.command >> 24) as u8;
+        self.rop_functions[0] = crate::rasterop::ternary(self.rops[0]);
         self.patoff_x = ((self.command >> 17) & 7) as i32;
         self.patoff_y = ((self.command >> 20) & 7) as i32;
         self.cur_y = 0;
@@ -1335,17 +1343,9 @@ impl Engine {
 /// A ternary raster operation: each of the eight bits of `rop` says
 /// whether a combination of pattern, source and destination bits makes
 /// a 1.
+#[cfg(test)]
 pub fn rop3(rop: u8, dest: u32, src: u32, pattern: u32) -> u32 {
-    let mut result = 0;
-    for bit in 0..8 {
-        if rop & (1 << bit) != 0 {
-            let p = if bit & 4 != 0 { pattern } else { !pattern };
-            let s = if bit & 2 != 0 { src } else { !src };
-            let d = if bit & 1 != 0 { dest } else { !dest };
-            result |= p & s & d;
-        }
-    }
-    result
+    crate::rasterop::ternary(rop)(dest, src, pattern)
 }
 
 /// `bytes` (1-4) of the memory at byte address `addr`, little-endian.
@@ -1405,6 +1405,50 @@ mod tests {
         assert_eq!(rop3(0xAA, 0x12, 0x34, 0x56), 0x12, "destination");
         assert_eq!(rop3(0x66, 0x0F, 0xFF, 0), 0xF0, "source xor destination");
         assert_eq!(rop3(0x00, 0x12, 0x34, 0x56), 0);
+    }
+
+    #[test]
+    fn rop_dispatch_tracks_register_writes_and_loaded_state() {
+        use crate::savestate::{Reader, State, Writer};
+        let (mut e, ram) = engine();
+        e.command = 0xCC00_0000;
+        e.launch();
+        e.command_extra = CMDEXTRA_SRC_COLORKEY | CMDEXTRA_DST_COLORKEY;
+        e.src_colorkey_min = 0x10;
+        e.src_colorkey_max = 0x10;
+        e.dst_colorkey_min = 0x20;
+        e.dst_colorkey_max = 0x20;
+        let check = |e: &Engine| {
+            for (n, dest, src) in [
+                (0, 0x21, 0x11),
+                (1, 0x20, 0x11),
+                (2, 0x21, 0x10),
+                (3, 0x20, 0x10),
+            ] {
+                assert_eq!(
+                    e.mix(dest, src, 0xA5, Key::K8, Key::K8),
+                    rop3(e.rops[n], dest, src, 0xA5),
+                    "key combination {n}"
+                );
+            }
+        };
+        e.write(&ram, 0x30, 0x00E2_B866);
+        check(&e);
+        // Updating key ROPs during a host transfer takes effect without
+        // starting a new command or changing its primary ROP.
+        e.write(&ram, 0x30, 0x00CC_F055);
+        check(&e);
+        assert_eq!(e.mix(0x21, 0x11, 0xA5, Key::K8, Key::K8), 0x11);
+        // A state load restores register bytes, not host function pointers.
+        e.rops = [0xF0, 0x66, 0xB8, 0xE2];
+        let mut writer = Writer::new();
+        e.save(&mut writer);
+        let mut loaded = Engine::default();
+        let mut reader = Reader::new(&writer.buf);
+        loaded.load(&mut reader).unwrap();
+        assert!(reader.is_empty());
+        loaded.after_load();
+        check(&loaded);
     }
 
     #[test]

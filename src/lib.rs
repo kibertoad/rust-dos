@@ -101,6 +101,7 @@ pub mod post;
 pub mod profile;
 pub mod powervr;
 pub mod printer;
+mod rasterop;
 pub mod rc_command;
 pub mod recorder;
 pub mod savestate;
