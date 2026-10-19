@@ -18,7 +18,6 @@
 //! (LeonG-ZA's `verite` branch) names them, for the fields VLIB alone
 //! doesn't.
 
-#[path = "draw/coverage.rs"]
 mod coverage;
 
 /// RRedline's pixel formats (`V_PIXFMT_*`), as the library numbers them.
@@ -495,24 +494,30 @@ impl DrawState {
 
     /// A triangle.
     pub fn triangle(&self, vram: &mut [u8], a: &Vertex, b: &Vertex, c: &Vertex) {
+        let Some((area, bounds)) = self.triangle_bounds(a, b, c) else {
+            return;
+        };
+        // Tiny triangles keep the bounding-box loop without edge setup.
+        if bounds[1] - bounds[0] <= 8 {
+            self.triangle_in::<false>(vram, [a, b, c], area, bounds);
+        } else {
+            self.triangle_in::<true>(vram, [a, b, c], area, bounds);
+        }
+    }
+
+    /// A triangle's signed area and its bounding box in the scissors, as
+    /// `[x0, x1, y0, y1]`; `None` when it has no area or no pixels.
+    fn triangle_bounds(&self, a: &Vertex, b: &Vertex, c: &Vertex) -> Option<(f32, [i32; 4])> {
         let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
         if area == 0.0 || !area.is_finite() {
-            return;
+            return None;
         }
         let ((left, right), (top, bottom)) = (scissor(self.scissor_x), scissor(self.scissor_y));
         let x0 = (a.x.min(b.x).min(c.x).floor() as i32).max(left);
         let x1 = (a.x.max(b.x).max(c.x).ceil() as i32).min(right);
         let y0 = (a.y.min(b.y).min(c.y).floor() as i32).max(top);
         let y1 = (a.y.max(b.y).max(c.y).ceil() as i32).min(bottom);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        // Tiny triangles keep the bounding-box loop without edge setup.
-        if x1 - x0 <= 8 {
-            self.triangle_in::<false>(vram, [a, b, c], area, [x0, x1, y0, y1]);
-        } else {
-            self.triangle_in::<true>(vram, [a, b, c], area, [x0, x1, y0, y1]);
-        }
+        (x0 < x1 && y0 < y1).then_some((area, [x0, x1, y0, y1]))
     }
 
     #[inline(always)]
@@ -547,8 +552,8 @@ impl DrawState {
             let span = coverage.as_mut().map_or(x0..x1, coverage::Coverage::next);
             for px in span {
                 let fx = px as f32 + 0.5;
-                // Retain the original barycentric arithmetic and its
-                // inclusive edges at the candidate pixels.
+                // Barycentric weights. A pixel centre on an edge counts as
+                // inside, so a shared edge is drawn by both triangles.
                 let w0 = ((b.x - fx) * (c.y - fy) - (c.x - fx) * (b.y - fy)) / area;
                 let w1 = ((c.x - fx) * (a.y - fy) - (a.x - fx) * (c.y - fy)) / area;
                 let w2 = 1.0 - w0 - w1;
@@ -558,11 +563,7 @@ impl DrawState {
                 let blend3 = |pa: f32, pb: f32, pc: f32| w0 * pa + w1 * pb + w2 * pc;
                 let lerp = |f: &dyn Fn(&Vertex) -> f32| blend3(f(a), f(b), f(c));
                 // Depth: linear across the screen, kept 16.0.
-                let depth = if z_on {
-                    lerp(&z_of).clamp(0.0, 65535.0) as u32
-                } else {
-                    0
-                };
+                let depth = if z_on { lerp(&z_of).clamp(0.0, 65535.0) as u32 } else { 0 };
                 if !self.z_test(vram, px, py, depth) {
                     continue;
                 }
@@ -572,10 +573,7 @@ impl DrawState {
                 if textured {
                     let q = lerp(&|v| v.q);
                     let (u, v) = if q != 0.0 {
-                        (
-                            lerp(&|v| v.u * v.q) / q,
-                            lerp(&|v| v.v * v.q) / q,
-                        )
+                        (lerp(&|v| v.u * v.q) / q, lerp(&|v| v.v * v.q) / q)
                     } else {
                         (lerp(&|v| v.u), lerp(&|v| v.v))
                     };
@@ -1021,9 +1019,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "draw/triangle_reference.rs"]
-mod triangle_reference;
-
-#[cfg(test)]
-#[path = "draw/triangle_tests.rs"]
 mod triangle_tests;

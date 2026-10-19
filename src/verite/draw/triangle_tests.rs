@@ -1,5 +1,15 @@
 use super::*;
 
+impl DrawState {
+    /// A triangle tested at every pixel of its bounding box, without the
+    /// edge bounds that `triangle` narrows its rows to.
+    fn triangle_reference(&self, vram: &mut [u8], a: &Vertex, b: &Vertex, c: &Vertex) {
+        if let Some((area, bounds)) = self.triangle_bounds(a, b, c) {
+            self.triangle_in::<false>(vram, [a, b, c], area, bounds);
+        }
+    }
+}
+
 fn bounds(vertices: &[Vertex; 3]) -> (i32, i32, i32, i32) {
     let [a, b, c] = vertices;
     (

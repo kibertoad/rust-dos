@@ -18,9 +18,6 @@ impl Coverage {
         columns: Range<i32>,
         y: i32,
     ) -> Option<Self> {
-        if columns.end - columns.start <= 8 {
-            return None;
-        }
         let [a, b, c] = vertices.map(|v| [v.x as f64, v.y as f64]);
         let extent = vertices.iter().fold(1.0f64, |m, v| {
             m.max((v.x as f64).abs()).max((v.y as f64).abs())
