@@ -16,9 +16,7 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
-#[path = "engine/mix.rs"]
 mod mix;
-#[path = "engine/rows.rs"]
 mod rows;
 use mix::Mix;
 
