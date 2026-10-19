@@ -16,6 +16,8 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
+mod rows;
+
 /// What a register write started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -606,7 +608,13 @@ impl Rect {
         if self.col < self.width {
             return false;
         }
-        // The end of a row.
+        self.end_row()
+    }
+
+    fn end_row(&mut self) -> bool {
+        let s = &self.setup;
+        let linear = s.src_cntl & SRC_LINEAR != 0;
+        let rotating = s.src_cntl & (SRC_PATTERN_ON | SRC_ROTATE) == SRC_PATTERN_ON | SRC_ROTATE;
         self.col = 0;
         self.row += 1;
         self.rot = self.rot0;
@@ -1058,7 +1066,17 @@ impl Engine {
                 if rect.setup.function == 1 && scaler.is_none() {
                     return false;
                 }
-                while !rect.pixel(&mut mem, &palettes, scaler.as_ref(), 0) {}
+                if let Some(scaler) = &scaler {
+                    while !rect.pixel(&mut mem, &palettes, Some(scaler), 0) {}
+                } else {
+                    while !rect.empty() {
+                        if rows::draw(&mut rect, &mut mem).is_none() {
+                            for _ in rect.col..rect.width {
+                                rect.pixel(&mut mem, &palettes, None, 0);
+                            }
+                        }
+                    }
+                }
                 rect.tile(card);
                 true
             }
