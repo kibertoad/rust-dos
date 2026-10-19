@@ -63,13 +63,7 @@ mod tests {
         regs[0xF8 >> 2] = 0xAABBCC;
         regs[0xFC >> 2] = 0x112233;
         let mut c = Context::new(&mut target, cmd, &regs).unwrap();
-        c.textured = cmd_command(cmd) != GOURAUD_TRI;
-        if c.textured {
-            c.lit = cmd_command(cmd) == LIT_TEX_TRI;
-            c.tex_blend = cmd_tex_blend(cmd);
-            c.setup_texture(cmd, &regs);
-            c.fog = cmd & CMD_FE != 0;
-        }
+        assert!(c.setup_triangle(cmd, &regs));
         let mut at = Attr {
             r: 200 << 7,
             g: 40 << 7,
@@ -107,26 +101,40 @@ mod tests {
 
     #[test]
     fn every_span_variant_matches_dynamic_pixels() {
+        // A xorshift stream, so that each command field varies on its own
+        // and texture format, filter, Z compare and the flags combine freely.
+        let mut seed = 0x2545_F491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
         for format in 0..3 {
-            for command in [GOURAUD_TRI, LIT_TEX_TRI, UNLIT_TEX_TRI_PERSP] {
+            for command in [
+                GOURAUD_TRI,
+                LIT_TEX_TRI,
+                LIT_TEX_TRI_PERSP,
+                UNLIT_TEX_TRI,
+                UNLIT_TEX_TRI_PERSP,
+            ] {
                 for mode in 0..4 {
-                    for options in 0..32 {
+                    for _ in 0..32 {
+                        let r = next();
                         let cmd = CMD_3D
                             | format << 2
-                            | (options & 7) << 5
+                            | (r & 7) << 5
                             | 1 << 8
-                            | (options & 7) << 12
-                            | (options % 3) << 15
-                            | (options & 3) << 18
-                            | (options & 7) << 20
+                            | (r >> 3 & 7) << 12
+                            | ((r >> 6 & 3) % 3) << 15
+                            | (r >> 8 & 3) << 18
+                            | (r >> 10 & 7) << 20
                             | mode << 24
                             | command << 27
-                            | if options & 8 != 0 { CMD_HC | CMD_FE } else { 0 }
-                            | if options & 16 != 0 {
-                                CMD_ZUP | CMD_TWE
-                            } else {
-                                0
-                            };
+                            | if r & 1 << 13 != 0 { CMD_HC } else { 0 }
+                            | if r & 1 << 14 != 0 { CMD_FE } else { 0 }
+                            | if r & 1 << 15 != 0 { CMD_ZUP } else { 0 }
+                            | if r & 1 << 16 != 0 { CMD_TWE } else { 0 };
                         for reverse in [false, true] {
                             let mut expected: Vec<_> =
                                 (0..2048).map(|i| (i * 73 + 19) as u8).collect();
