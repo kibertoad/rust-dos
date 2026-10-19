@@ -14,6 +14,8 @@ use super::Mach64;
 use super::engine::{Memory, Size};
 use super::regs::*;
 
+mod lod;
+
 /// An 8-bit colour with alpha, as the pipe works on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Argb {
@@ -443,6 +445,7 @@ pub struct Pipe {
     span_s: (i64, i64),
     span_t: (i64, i64),
     span_dy: (i64, i64),
+    lod: lod::Lod,
     dir: i32,
 }
 
@@ -454,10 +457,26 @@ impl Pipe {
         for (i, offset) in tex_offsets.iter_mut().enumerate() {
             *offset = card.reg(TEX_0_OFF + i) & 0x7F_FFFF;
         }
+        let cntl = card.reg(SCALE_3D_CNTL);
+        let tex_size = card.reg(TEX_SIZE_PITCH);
+        let s = Coord::load(
+            card,
+            S_START,
+            S_XINC_START,
+            S_Y_INC,
+            [S_X_INC2, S_Y_INC2, S_XY_INC2],
+        );
+        let t = Coord::load(
+            card,
+            T_START,
+            T_XINC_START,
+            T_Y_INC,
+            [T_X_INC2, T_Y_INC2, T_XY_INC2],
+        );
         Pipe {
-            cntl: card.reg(SCALE_3D_CNTL),
+            cntl,
             pix_width: card.reg(DP_PIX_WIDTH),
-            tex_size: card.reg(TEX_SIZE_PITCH),
+            tex_size,
             tex_offsets,
             z_cntl: card.reg(Z_CNTL),
             z_off_pitch: card.reg(Z_OFF_PITCH),
@@ -471,25 +490,14 @@ impl Pipe {
             // light) saturate rather than wrap.
             colour: COLOURS.map(|reg| Linear::load(card, reg, (26, 25))),
             z: Linear::load(card, Z_START, (29, 29)),
-            s: Coord::load(
-                card,
-                S_START,
-                S_XINC_START,
-                S_Y_INC,
-                [S_X_INC2, S_Y_INC2, S_XY_INC2],
-            ),
-            t: Coord::load(
-                card,
-                T_START,
-                T_XINC_START,
-                T_Y_INC,
-                [T_X_INC2, T_Y_INC2, T_XY_INC2],
-            ),
+            s,
+            t,
             span_colour: [(0, 0); 4],
             span_z: (0, 0),
             span_s: (0, 0),
             span_t: (0, 0),
             span_dy: (0, 0),
+            lod: lod::Lod::new(cntl, tex_size, [s.dxx, t.dxx, s.dxy, t.dxy]),
             dir: 1,
         }
     }
@@ -526,6 +534,7 @@ impl Pipe {
         self.span_s = self.s.across(n, dir);
         self.span_t = self.t.across(n, dir);
         self.span_dy = (self.s.dy + n * self.s.dxy, self.t.dy + n * self.t.dxy);
+        self.lod.start(self.lod_steps());
     }
 
     /// On to the span's next pixel.
@@ -568,6 +577,10 @@ impl Pipe {
         }
     }
 
+    fn lod_steps(&self) -> [i64; 4] {
+        [self.span_s.1, self.span_t.1, self.span_dy.0, self.span_dy.1]
+    }
+
     /// The texture sampled at the pixel: the level of detail from the
     /// largest step of S or T a pixel makes, in texels of the largest
     /// map; the largest map, filtered with BILINEAR_TEX_EN, when it
@@ -576,18 +589,7 @@ impl Pipe {
     /// larger.
     fn sample(&self, texels: &TexelSource) -> Argb {
         let largest = self.tex_size >> 4 & 0xF;
-        let mut lod = 0.0;
-        if self.cntl & 1 << 24 == 0 && largest > 0 {
-            let scale = (1u64 << largest) as f64 / 1024.0 / 65536.0;
-            let steps = [self.span_s.1, self.span_t.1, self.span_dy.0, self.span_dy.1];
-            let rho = steps
-                .iter()
-                .map(|&d| (d as f64).abs() * scale)
-                .fold(0.0, f64::max);
-            if rho > 1.0 {
-                lod = rho.log2();
-            }
-        }
+        let lod = self.lod.value(self.lod_steps());
         let (s, t) = (self.span_s.0, self.span_t.0);
         if lod <= 0.0 {
             return self.sample_level(texels, largest, s, t, self.cntl & 1 << 25 != 0);
@@ -946,3 +948,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod lod_tests;
