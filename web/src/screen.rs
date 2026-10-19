@@ -21,9 +21,7 @@ impl Pixels {
     ) -> bool {
         let row_bytes = width * 3;
         assert_eq!(current.len(), row_bytes * height);
-        let full = self.size != (width, height)
-            || self.rgba.len() != width * height * 4
-            || previous.len() != current.len();
+        let full = self.size != (width, height) || previous.len() != current.len();
         self.size = (width, height);
         self.rgba.resize(width * height * 4, 0);
         self.rows = if full {

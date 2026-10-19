@@ -1,6 +1,6 @@
 // Run with: node web/tests/screen.mjs /path/to/chrome-headless-shell
 // Uses the page's actual upload and draw functions in a real browser.
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,9 +11,17 @@ if (!browser) {
   throw new Error('Pass the headless Chromium executable as the argument.');
 }
 const source = readFileSync(new URL('../www/main.js', import.meta.url), 'utf8');
-const draw = source.slice(source.indexOf('function draw() {'), source.indexOf('/// The screen drawn with WebGL 2:'));
-const start = source.indexOf('function makeGlScreen() {');
-const make = source.slice(start, source.indexOf('// The machine\'s frames', start));
+/// The text of main.js from `from` up to `to`, which must both be there.
+function excerpt(from, to) {
+  const start = source.indexOf(from);
+  const end = source.indexOf(to, start);
+  if (start < 0 || end < 0) {
+    throw new Error(`main.js no longer has ${start < 0 ? from : to}`);
+  }
+  return source.slice(start, end);
+}
+const draw = excerpt('function draw() {', '/// The screen drawn with WebGL 2:');
+const make = excerpt('function makeGlScreen() {', "// The machine's frames");
 const probe = `
 let canvas = document.createElement('canvas');
 document.body.append(canvas);
@@ -21,6 +29,7 @@ let machine = null;
 let screenGl = null;
 let screen2d = null;
 let shownLook;
+let repaint2d = true;
 const wasm = { memory: { buffer: new ArrayBuffer(4096) } };
 function layout() {}
 function toast(message) { throw new Error(message); }
@@ -140,4 +149,5 @@ const status = result.stdout?.match(/<pre id="result">([\s\S]*?)<\/pre>/)?.[1];
 if (result.error || result.status !== 0 || !status?.startsWith('PASS:')) {
   throw new Error((result.error?.message ?? status ?? result.stderr) + '\nProbe: ' + html);
 }
+rmSync(directory, { recursive: true, force: true });
 console.log(status);
