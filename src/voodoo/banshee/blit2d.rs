@@ -10,7 +10,6 @@
 
 use crate::voodoo::mem::Vram;
 
-#[path = "blit2d/rows.rs"]
 mod rows;
 
 const CMD_NOP: u32 = 0;
@@ -760,7 +759,10 @@ impl Engine {
             step(self.command & COMMAND_DY != 0),
         );
         for _ in 0..self.dst_size_y {
-            if dst_y >= clip.y_min && dst_y < clip.y_max && !rows::fill(self, ram, mask, dst_y) {
+            if dst_y >= clip.y_min
+                && dst_y < clip.y_max
+                && !rows::fill(self, ram, mask, dst_y, pat_y)
+            {
                 let mut dst_x = self.dst_x;
                 let mut pat_x = self.patoff_x + self.dst_x;
                 let pattern_mask = self.mono_pattern(pat_y);

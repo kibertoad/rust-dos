@@ -1,5 +1,6 @@
-//! Unkeyed SRCCOPY rows. VRAM remains atomic: aligned word stores replace
-//! pairs of byte read/modify/writes without borrowing its memory mutably.
+//! Unkeyed SRCCOPY copies and solid fills. VRAM remains atomic: aligned
+//! word stores replace pairs of byte read/modify/writes without borrowing
+//! its memory mutably.
 
 use super::*;
 use std::ops::Range;
@@ -7,7 +8,6 @@ use std::ops::Range;
 fn bytes(e: &Engine) -> Option<usize> {
     if e.dst_tiled
         || e.command_extra & (CMDEXTRA_SRC_COLORKEY | CMDEXTRA_DST_COLORKEY) != 0
-        || e.rops[0] != 0xCC
         || e.use_pattern_trans()
     {
         return None;
@@ -21,25 +21,41 @@ fn bytes(e: &Engine) -> Option<usize> {
     }
 }
 
-fn destination(e: &Engine, mask: u32, bytes: usize, y: i32, dx: i32) -> Option<Range<usize>> {
+/// The destination bytes of row `y`, trimmed to the clip window, and the
+/// leftmost destination pixel they start at. An empty range means the clip
+/// hides the whole row, which the pixel path would leave untouched too.
+fn destination(
+    e: &Engine,
+    mask: u32,
+    bytes: usize,
+    y: i32,
+    dx: i32,
+) -> Option<(Range<usize>, i32)> {
     if e.dst_size_x <= 0 || y < 0 || !mask.checked_add(1)?.is_power_of_two() {
         return None;
     }
     let last = e.dst_x.checked_add((e.dst_size_x - 1).checked_mul(dx)?)?;
-    let (left, right) = (e.dst_x.min(last), e.dst_x.max(last));
     let clip = e.clip_of_command();
-    if left < 0 || left < clip.x_min || right >= clip.x_max || y < clip.y_min || y >= clip.y_max {
+    if y < clip.y_min || y >= clip.y_max {
         return None;
+    }
+    let left = e.dst_x.min(last).max(clip.x_min);
+    let right = e.dst_x.max(last).min(clip.x_max - 1);
+    if left < 0 {
+        return None;
+    }
+    if left > right {
+        return Some((0..0, left));
     }
     let start = e
         .dst_base
         .checked_add((y as u32).checked_mul(e.dst_stride)?)?
         .checked_add((left as u32).checked_mul(bytes as u32)?)?;
-    let end = start.checked_add((e.dst_size_x as u32).checked_mul(bytes as u32)?)?;
+    let end = start.checked_add(((right - left + 1) as u32).checked_mul(bytes as u32)?)?;
     if end - 1 > mask {
         return None;
     }
-    Some(start as usize..end as usize)
+    Some((start as usize..end as usize, left))
 }
 
 fn load_word(e: &Engine, ram: &Vram, src: Source, offset: usize) -> u16 {
@@ -68,22 +84,30 @@ pub(super) fn copy(
     src_tiled: bool,
 ) -> bool {
     let Some(bytes) = bytes(e) else { return false };
-    if src_tiled
+    if e.rops[0] != 0xCC
+        || src_tiled
         || e.src_format & COL_MASK != e.dst_format & COL_MASK
         || e.src_bpp != bytes as u32 * 8
     {
         return false;
     }
-    let Some(dest) = destination(e, mask, bytes, e.dst_y, dx) else {
+    let Some((dest, left)) = destination(e, mask, bytes, e.dst_y, dx) else {
         return false;
     };
+    if dest.is_empty() {
+        return true;
+    }
     if dest.end > ram.bytes() {
         return false;
     }
-    let Some(last) = src_x.checked_add((e.dst_size_x - 1) * dx) else {
+    // Destination pixel `x` copies source pixel `x - dst_x + src_x` in
+    // either direction, so the clipped row starts that far into the source.
+    let Some(left) = left
+        .checked_sub(e.dst_x)
+        .and_then(|shift| shift.checked_add(src_x))
+    else {
         return false;
     };
-    let left = src_x.min(last);
     if left < 0 {
         return false;
     }
@@ -156,16 +180,50 @@ pub(super) fn copy(
     true
 }
 
-pub(super) fn fill(e: &mut Engine, ram: &Vram, mask: u32, y: i32) -> bool {
+/// The one colour a fill row of pattern row `pat_y` writes, when the ROP
+/// ignores the destination and the pattern is solid across the row or
+/// unused (SRCCOPY and PATCOPY of a solid brush, BLACKNESS, WHITENESS).
+fn solid(e: &Engine, pat_y: i32) -> Option<u32> {
+    let rop = e.rops[0];
+    // A ternary ROP's bit index is pattern << 2 | source << 1 | dest.
+    if (rop >> 1) & 0x55 != rop & 0x55 {
+        return None;
+    }
+    let pattern = if rop >> 4 == rop & 0x0F {
+        0
+    } else if e.command & COMMAND_PATTERN_MONO != 0 {
+        match e.mono_pattern(pat_y) {
+            0xFF => e.color_fore,
+            0 => e.color_back,
+            _ => return None,
+        }
+    } else {
+        let row = ((pat_y & 7) * 8) as usize;
+        let first = e.pattern_pixel(row);
+        if (row + 1..row + 8).any(|i| e.pattern_pixel(i) != first) {
+            return None;
+        }
+        first
+    };
+    Some((e.rop_functions[0])(0, e.color_fore, pattern))
+}
+
+pub(super) fn fill(e: &mut Engine, ram: &Vram, mask: u32, y: i32, pat_y: i32) -> bool {
     let Some(bytes) = bytes(e) else { return false };
-    let dx = step(e.command & COMMAND_DX != 0);
-    let Some(dest) = destination(e, mask, bytes, y, dx) else {
+    let Some(color) = solid(e, pat_y) else {
         return false;
     };
+    let dx = step(e.command & COMMAND_DX != 0);
+    let Some((dest, _)) = destination(e, mask, bytes, y, dx) else {
+        return false;
+    };
+    if dest.is_empty() {
+        return true;
+    }
     if dest.end > ram.bytes() {
         return false;
     }
-    let pixel = e.color_fore.to_le_bytes();
+    let pixel = color.to_le_bytes();
     let mut at = dest.start;
     let mut phase = 0;
     if at & 1 != 0 {
@@ -277,6 +335,128 @@ mod tests {
                         assert!(copy(&mut e, &actual, 511, source, 8, dx, false));
                         assert_eq!(actual.to_bytes(), expected.to_bytes());
                         assert!(e.drawn);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_fills_preserve_odd_edges() {
+        for format in [COL_8BPP, COL_16BPP, COL_24BPP, COL_32BPP] {
+            for base in [0, 1] {
+                for x in [4, 5, 8] {
+                    for direction in [0, COMMAND_DX] {
+                        let mut e = engine(format);
+                        e.dst_base = base;
+                        e.dst_x = x;
+                        e.dst_size_y = 1;
+                        e.command = direction;
+                        let actual = memory();
+                        let expected = memory();
+                        let mut reference = scalar(&e);
+                        reference.rectfill(&expected, 511);
+                        let y = e.dst_y;
+                        assert!(fill(&mut e, &actual, 511, y, y));
+                        assert_eq!(actual.to_bytes(), expected.to_bytes());
+                        assert!(e.drawn);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solid_fills_cover_destination_free_rops_and_solid_brushes() {
+        // (ROP, mono pattern, pattern word, row takes the word path). A
+        // colour pattern that should miss gets one pixel of row 1 changed.
+        let cases = [
+            (0xF0, true, 0xFFFF_FFFF, true),
+            (0xF0, true, 0, true),
+            (0xF0, true, 0x0F0F_0F0F, false),
+            (0xF0, false, 0x5A5A_5A5A, true),
+            (0xF0, false, 0x5A5A_5A5A, false),
+            (0x0F, true, 0xFFFF_FFFF, true),
+            (0x00, false, 0x1234_5678, true),
+            (0xFF, false, 0x1234_5678, true),
+            (0x33, false, 0x1234_5678, true),
+            (0x5A, true, 0xFFFF_FFFF, false),
+        ];
+        for format in [COL_8BPP, COL_16BPP, COL_24BPP, COL_32BPP] {
+            for (rop, mono, word, fast) in cases {
+                for base in [0, 1] {
+                    let mut e = engine(format);
+                    e.dst_base = base;
+                    e.dst_size_y = 1;
+                    e.color_back = 0x1122_3344;
+                    e.rops = [rop; 4];
+                    e.rop_functions = [crate::rasterop::ternary(rop); 4];
+                    e.pattern = [word; 64];
+                    if !mono && !fast && rop == 0xF0 {
+                        // Words 2, 6 and 8 hold a pixel of row 1 at every
+                        // depth.
+                        for n in [2, 6, 8] {
+                            e.pattern[n] ^= 1;
+                        }
+                    }
+                    if mono {
+                        e.command |= COMMAND_PATTERN_MONO;
+                    }
+                    let actual = memory();
+                    let expected = memory();
+                    let mut reference = scalar(&e);
+                    reference.rectfill(&expected, 511);
+                    let y = e.dst_y;
+                    assert_eq!(fill(&mut e, &actual, 511, y, y), fast, "ROP {rop:02X}");
+                    if fast {
+                        assert_eq!(actual.to_bytes(), expected.to_bytes(), "ROP {rop:02X}");
+                    }
+                    let actual = memory();
+                    e.rectfill(&actual, 511);
+                    assert_eq!(actual.to_bytes(), expected.to_bytes(), "ROP {rop:02X}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_rows_trim_to_the_clip_window() {
+        // Windows that cut the row on the left, the right, both sides, or
+        // hide it, for a row covering x = 6 to 10 drawn in either direction.
+        let windows = [(8, 32), (0, 9), (7, 10), (11, 32), (0, 6)];
+        for format in [COL_8BPP, COL_16BPP, COL_24BPP, COL_32BPP] {
+            for base in [0, 1] {
+                for (x_min, x_max) in windows {
+                    for direction in [0, COMMAND_DX] {
+                        let mut e = engine(format);
+                        e.dst_base = base;
+                        let (dst_x, src_x) = if direction == 0 { (6, 3) } else { (10, 7) };
+                        e.dst_x = dst_x;
+                        e.dst_size_y = 1;
+                        e.command = direction;
+                        e.clip[0].x_min = x_min;
+                        e.clip[0].x_max = x_max;
+                        let hidden = x_min > 10 || x_max <= 6;
+                        let dx = step(direction != 0);
+                        for source in [Source::Vram(129), Source::Host(1)] {
+                            let actual = memory();
+                            let expected = memory();
+                            let mut reference = scalar(&e);
+                            reference.copy_line(&expected, 511, source, true, src_x, false);
+                            e.drawn = false;
+                            assert!(copy(&mut e, &actual, 511, source, src_x, dx, false));
+                            assert_eq!(actual.to_bytes(), expected.to_bytes());
+                            assert_eq!(e.drawn, !hidden);
+                        }
+                        let actual = memory();
+                        let expected = memory();
+                        let mut reference = scalar(&e);
+                        reference.rectfill(&expected, 511);
+                        e.drawn = false;
+                        let y = e.dst_y;
+                        assert!(fill(&mut e, &actual, 511, y, y));
+                        assert_eq!(actual.to_bytes(), expected.to_bytes());
+                        assert_eq!(e.drawn, !hidden);
                     }
                 }
             }
