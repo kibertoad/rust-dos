@@ -1,8 +1,11 @@
 //! The data-path mix selected when an operation snapshots its registers.
 
 use super::Setup;
+use std::fmt;
 
-#[derive(Clone, Copy, Debug)]
+/// A DP_MIX mode and the function that mixes source `s` and destination
+/// `d` for it.
+#[derive(Clone, Copy)]
 pub(super) struct Mix {
     pub(super) mode: u32,
     function: fn(&Setup, u32, u32) -> u32,
@@ -14,7 +17,18 @@ impl Default for Mix {
     }
 }
 
+/// Only the mode: the function's address says nothing and changes from
+/// build to build.
+impl fmt::Debug for Mix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mix").field("mode", &self.mode).finish()
+    }
+}
+
 impl Mix {
+    /// The 16 logical operations, and 17h the average of the two, its
+    /// carries broken where DP_CHAIN_MSK has a 1. The saturating mixes
+    /// (10h-16h, 18h-1Fh) take the source.
     pub(super) fn new(mode: u32) -> Self {
         let function: fn(&Setup, u32, u32) -> u32 = match mode {
             0x0 => |_, _, d| !d,
@@ -88,5 +102,19 @@ mod tests {
                 }
             }
         }
+        // Concrete results, so a broken average can't pass by comparing
+        // with itself: one 8-bit pixel, two 16-bit halves without a chain
+        // mask, and four bytes when DP_CHAIN_MSK breaks at bits 7 and 23.
+        let average = |dst_size, chain_mask| {
+            let setup = Setup {
+                dst_size,
+                chain_mask,
+                ..Setup::default()
+            };
+            Mix::new(0x17).apply(&setup, 0x1234_ABCD, 0xFEDC_5678)
+        };
+        assert_eq!(average(Size::Byte, 0), 0xA2);
+        assert_eq!(average(Size::Dword, 0), 0x8888_8122);
+        assert_eq!(average(Size::Dword, 0x0080), 0x8888_80A2);
     }
 }
