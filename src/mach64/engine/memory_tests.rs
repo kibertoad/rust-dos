@@ -1,4 +1,4 @@
-use super::{Memory, Size};
+use super::{Memory, Size, read_le};
 
 #[test]
 fn whole_word_access_matches_each_wrapped_byte() {
@@ -30,6 +30,29 @@ fn whole_word_access_matches_each_wrapped_byte() {
                     assert_eq!(memory.vram, expected, "len={len}, size={size:?}, at={at}");
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn byte_addressed_reads_match_each_wrapped_byte() {
+    for len in [1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 32, 128] {
+        let mut vram: Vec<u8> = (0..len).map(|at| (at * 73 + 19) as u8).collect();
+        let memory = Memory {
+            vram: &mut vram,
+            lsb_first: false,
+        };
+        for start in (0..64u32).chain([u32::MAX, u32::MAX - 2, 0xF000_0001, 0x1234_5677]) {
+            let expected = |bytes: usize| {
+                (0..bytes).fold(0, |word, i| {
+                    let at = (start as usize).wrapping_add(i) & (len - 1);
+                    word | (memory.vram[at] as u32) << (8 * i)
+                })
+            };
+            let at = format!("len={len}, start={start:#x}");
+            assert_eq!(memory.read_bytes::<2>(start), expected(2), "{at}");
+            assert_eq!(memory.read_bytes::<4>(start), expected(4), "{at}");
+            assert_eq!(read_le::<4>(memory.vram, start), expected(4), "{at}");
         }
     }
 }

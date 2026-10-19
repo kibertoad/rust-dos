@@ -16,10 +16,9 @@ use super::tri::{Palettes, Pipe, Scaler};
 use super::{Mach64, Target};
 use crate::savestate::{Reader, Result, State, Writer};
 
-mod mix;
 #[cfg(test)]
-#[path = "engine/memory_tests.rs"]
 mod memory_tests;
+mod mix;
 mod rows;
 use mix::Mix;
 
@@ -71,6 +70,26 @@ impl Size {
     }
 }
 
+/// `BYTES` (2 or 4) bytes of `vram` from byte `start`, little-endian,
+/// each byte's address masked with `vram.len() - 1` like a single byte's.
+#[inline]
+pub fn read_le<const BYTES: usize>(vram: &[u8], start: u32) -> u32 {
+    let wrap = vram.len() - 1;
+    let start = start as usize;
+    if start & (BYTES - 1) == 0 && wrap & (BYTES - 1) == BYTES - 1 {
+        // An aligned start under a mask that keeps the low bits: all the
+        // bytes stay contiguous after wrapping.
+        let start = start & wrap;
+        let mut bytes = [0; 4];
+        bytes[..BYTES].copy_from_slice(&vram[start..start + BYTES]);
+        u32::from_le_bytes(bytes)
+    } else {
+        (0..BYTES).fold(0, |value, i| {
+            value | (vram[(start + i) & wrap] as u32) << (8 * i)
+        })
+    }
+}
+
 /// The video memory as the engine addresses it: by pixel, in pixels of a
 /// size, wrapping at its end. Sub-byte pixels are taken from the high
 /// bits of a byte first, or from the low bits with `lsb_first`
@@ -111,20 +130,15 @@ impl Memory<'_> {
 
     #[inline]
     fn read_word<const BYTES: usize>(&self, at: u32) -> u32 {
-        let wrap = self.vram.len() - 1;
-        let start = (at << BYTES.trailing_zeros()) as usize;
-        if wrap & (BYTES - 1) == BYTES - 1 {
-            // A pixel starts on its size's boundary. If the mask keeps
-            // its low bits, all its bytes stay contiguous after wrapping.
-            let start = start & wrap;
-            let mut bytes = [0; 4];
-            bytes[..BYTES].copy_from_slice(&self.vram[start..start + BYTES]);
-            u32::from_le_bytes(bytes)
-        } else {
-            (0..BYTES).fold(0, |value, i| {
-                value | (self.vram[(start + i) & wrap] as u32) << (8 * i)
-            })
-        }
+        read_le::<BYTES>(self.vram, at << BYTES.trailing_zeros())
+    }
+
+    /// `BYTES` (2 or 4) bytes from byte address `start`, little-endian,
+    /// each byte wrapping at the end of the memory: a texel, which can
+    /// start on any byte.
+    #[inline]
+    pub fn read_bytes<const BYTES: usize>(&self, start: u32) -> u32 {
+        read_le::<BYTES>(self.vram, start)
     }
 
     #[inline]
