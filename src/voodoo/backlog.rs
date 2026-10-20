@@ -18,7 +18,7 @@
 
 use super::mem::Vram;
 use super::mirror::{pixel_at, span};
-use super::raster::{RasterState, Stride, screen_y};
+use super::raster::{RasterState, Stride, TmuRaster, screen_y};
 use super::setup::render_triangle;
 use super::workers::{Job, Word};
 
@@ -223,6 +223,9 @@ pub fn triangle(layout: &TileLayout, st: &RasterState, verts: &[(f32, f32); 3]) 
         return Access::PINNED;
     }
     let Some(slot) = layout.slot(st.dest) else { return Access::PINNED };
+    if elsewhere(layout, st) {
+        return Access::PINNED;
+    }
     // The pixels the scan conversion can reach: its rows and columns are
     // rounded vertex coordinates, with a pixel to spare.
     let bound = |f: fn(f32, f32) -> f32, c: fn(&(f32, f32)) -> f32| verts.iter().map(c).fold(c(&verts[0]), f);
@@ -258,7 +261,62 @@ pub fn triangle(layout: &TileLayout, st: &RasterState, verts: &[(f32, f32); 3]) 
             access.reads[AUX] = touched;
         }
     }
+    let textures = textures_read(layout, st);
+    for (slot, reads) in access.reads.iter_mut().enumerate() {
+        if textures & 1 << slot != 0 {
+            *reads = ALL;
+        }
+    }
     access
+}
+
+/// Whether `st` draws with rows or an auxiliary buffer other than the
+/// layout's, so that its pixels aren't where the tiles say.
+fn elsewhere(layout: &TileLayout, st: &RasterState) -> bool {
+    let aux = st.aux.is_some() && (st.aux != layout.bases[AUX] || st.aux_stride != layout.aux_stride);
+    st.stride != layout.stride || aux
+}
+
+/// The buffers (a bit for each slot) whose memory the texture units of
+/// `st` may read texels from. A Banshee's units read the frame buffer's
+/// memory, so a triangle can draw with a colour buffer's pixels: what
+/// was drawn there before it has to stay.
+fn textures_read(layout: &TileLayout, st: &RasterState) -> u8 {
+    let mut slots = 0;
+    for t in st.tmu.iter().flatten() {
+        if t.lodmin >= 8 << 8 || !t.ram.same(&st.fb) {
+            continue;
+        }
+        let (start, end) = texture_bytes(t);
+        for (slot, base) in layout.bases.iter().enumerate() {
+            let Some(base) = *base else { continue };
+            let stride = if slot == AUX { layout.aux_stride } else { layout.stride };
+            let first = 2 * base as u64;
+            let last = 2 * (base + span(stride, layout.height)) as u64;
+            if start < last && first < end {
+                slots |= 1 << slot;
+            }
+        }
+    }
+    slots
+}
+
+/// The bytes the texture `t` may take texels from, first to past the
+/// last: its levels, or all of the memory where they wrap around.
+fn texture_bytes(t: &TmuRaster) -> (u64, u64) {
+    let wide = ((t.mode >> 8) & 0xF >= 8) as u32;
+    let memory = t.mask as u64 + 1;
+    let (mut start, mut end) = (memory, 0);
+    for (level, &base) in t.lodoffset.iter().enumerate() {
+        let texels = ((t.wmask >> level) + 1) as u64 * ((t.hmask >> level) + 1) as u64;
+        let last = base as u64 + (texels << wide);
+        if last > memory {
+            return (0, memory);
+        }
+        start = start.min(base as u64);
+        end = end.max(last);
+    }
+    (start, end)
 }
 
 /// A fastfill of columns `x0..x1` and rows `y0..y1` with `st`.
@@ -277,6 +335,9 @@ pub fn fastfill(layout: &TileLayout, st: &RasterState, (x0, x1, y0, y1): (i32, i
         None if !rgb => AUX,
         None => return Access::PINNED,
     };
+    if elsewhere(layout, st) {
+        return Access::PINNED;
+    }
     let Some((r0, r1)) = buffer_rows(st, y0, y1) else { return Access::PINNED };
     let Some(rect) = inside(layout, x0, x1, r0, r1) else { return Access::PINNED };
     let (touched, whole) = (layout.tiles(rect, false), layout.tiles(rect, true));
@@ -477,6 +538,10 @@ impl Backlog {
                 self.cleared = Some(Cleared::new(self.numbered, &self.layout));
                 return;
             }
+            // Drawing with a colour buffer's pixels as its texture, it
+            // reads what was there before the clear wherever no triangle
+            // has drawn over it yet.
+            Job::Triangle { st, .. } if textures_read(&self.layout, st) & 7 != 0 => {}
             Job::Triangle { st, verts, .. } if !access.pinned => {
                 let Some(cleared) = &mut self.cleared else {
                     return;
@@ -527,8 +592,10 @@ fn clears_depth(st: &RasterState, access: &Access) -> bool {
 ///
 /// The pixels a triangle covers are the ones the rasterizer draws
 /// (`render_triangle`, then the clipping `raster::scanline` does). Any
-/// other job that writes the depth, or one that may write outside the
-/// tiles, ends the following.
+/// other job that writes the depth, one that may write outside the
+/// tiles, or a triangle whose texture is in a colour buffer's memory (a
+/// Banshee's, which reads what was there before the clear) ends the
+/// following.
 struct Cleared {
     /// The fill's job number.
     fill: u64,
@@ -575,13 +642,14 @@ impl Cleared {
         // Chroma key, stipple, alpha mask, alpha planes; alpha test and
         // blending.
         let tested = fbz & (1 << 1 | 1 << 2 | 1 << 13 | 1 << 18) != 0 || am & 0x11 != 0;
-        let depth_test = fbz & (1 << 4) != 0 && st.aux.is_some();
-        let func = if depth_test { (fbz >> 5) & 7 } else { 7 };
+        let func = if fbz & (1 << 4) != 0 { (fbz >> 5) & 7 } else { 7 };
         // Whether it draws over each pixel it covers, and whether only
-        // where the depth is still cleared.
+        // where the depth is still cleared. Without an auxiliary buffer
+        // every depth test but "never" passes (`Row::begin`).
         let over = match func {
             _ if fbz & (1 << 9) == 0 || tested => None,
             7 => Some(false),
+            1..=6 if st.aux.is_none() => Some(false),
             3 => Some(true),
             _ => None,
         };

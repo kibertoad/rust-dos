@@ -713,6 +713,88 @@ mod tests {
     }
 
     #[test]
+    fn triangles_textured_from_a_colour_buffer_keep_what_they_read() {
+        // A Banshee's texture units read the frame buffer's memory, so a
+        // triangle can draw with a colour buffer's pixels as its texture.
+        // Each frame clears the depth, covers the picture, then draws a
+        // small square over pixel (0, 0), in a tile of its own. Frame 8
+        // first draws with buffer A's own pixel (0, 0) as texture, before
+        // the background covers it; frame 9 draws into B with A's. A
+        // fastfill of A's first tile comes last. What these read has to
+        // be drawn, and stay what the software path draws.
+        let (a, b) = (0x10_0000u32, 0x20_0000u32);
+        let near = 1 | 1 << 4 | 3 << 5 | 1 << 9 | 1 << 10;
+        let decal = 10 << 8 | 1 << 12 | 1 << 18 | 1 << 21 | 1 << 27;
+        let textured = |v: &mut Voodoo, from: u32, x: f32| {
+            reg3d(v, TEX_BASE_ADDR, from);
+            reg3d(v, T_LOD, 0);
+            reg3d(v, TEXTURE_MODE, decal);
+            reg3d(v, FBZ_COLOR_PATH, 1 | 1 << 27);
+            reg3d(v, FBZ_MODE, near);
+            float(v, FSTART_Z, 0.0);
+            rectangle(v, (x, 20.0, x + 40.0, 40.0), (0.0, 0.0, 0.0));
+            reg3d(v, FBZ_COLOR_PATH, 0);
+        };
+        let run = |mirror: bool| {
+            // No workers: each draws its own rows, and a texture
+            // read from another's rows doesn't wait for it.
+            let mut v = mirrored();
+            v.set_mirror(mirror);
+            reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, AUX_BUFFER_ADDR, 0x40_0000);
+            reg3d(&mut v, AUX_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, CLIP_LEFT_RIGHT, 640);
+            reg3d(&mut v, CLIP_LOW_Y_HIGH_Y, 64);
+            reg3d(&mut v, ZA_COLOR, 0xFFFF);
+            for frame in 0..10u32 {
+                let draw = if frame % 2 == 0 { a } else { b };
+                reg3d(&mut v, COL_BUFFER_ADDR, draw);
+                reg3d(&mut v, FBZ_MODE, 1 << 10);
+                reg3d(&mut v, FASTFILL_CMD, 0);
+                if frame == 8 {
+                    textured(&mut v, a, 400.0);
+                }
+                reg3d(&mut v, FBZ_MODE, near);
+                float(&mut v, FSTART_Z, 1000.0);
+                let shade = (frame * 25) as f32;
+                let colour = (shade, 255.0 - shade, 60.0);
+                rectangle(&mut v, (0.0, 0.0, 640.0, 64.0), colour);
+                float(&mut v, FSTART_Z, 500.0);
+                rectangle(&mut v, (0.0, 0.0, 8.0, 4.0), (60.0, shade, 255.0));
+                if frame == 9 {
+                    textured(&mut v, a, 500.0);
+                }
+                reg3d(&mut v, LEFT_OVERLAY_BUF, draw);
+                reg3d(&mut v, SWAPBUFFER_CMD, 0);
+                if mirror {
+                    v.take_mirror();
+                }
+            }
+            reg3d(&mut v, COL_BUFFER_ADDR, a);
+            reg3d(&mut v, CLIP_LEFT_RIGHT, 80);
+            reg3d(&mut v, CLIP_LOW_Y_HIGH_Y, 8);
+            reg3d(&mut v, FBZ_MODE, 1 | 1 << 9);
+            reg3d(&mut v, COLOR1, 0xFF_FFFF);
+            reg3d(&mut v, FASTFILL_CMD, 0);
+            let memory = v.frame_buffer().to_bytes();
+            (v.backlog.borrow().pruned, memory)
+        };
+        let (pruned, recorded) = run(true);
+        assert!(pruned > 0, "the frames drawn over are dropped");
+        let (_, software) = run(false);
+        // Pixel (420, 30) of A and (520, 30) of B, which the textured
+        // squares drew: row 30 of the first row of tiles.
+        let pixel = |memory: &[u8], base: u32, x: u32| {
+            let at = (base / 2 + (x / 64) * 2048 + 30 * 64 + x % 64) as usize * 2;
+            u16::from_le_bytes([memory[at], memory[at + 1]])
+        };
+        for (base, x) in [(a, 420), (b, 520)] {
+            assert_eq!(pixel(&recorded, base, x), pixel(&software, base, x));
+        }
+        assert!(recorded == software, "the memory ends up the same");
+    }
+
+    #[test]
     fn half_mode_buffers_are_half_the_desktop() {
         let mut v = mirrored();
         let cfg = VIDPROC_ENABLE | 1 << 18 | VIDPROC_HALF_MODE;
