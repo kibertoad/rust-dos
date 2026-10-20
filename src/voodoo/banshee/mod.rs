@@ -788,8 +788,16 @@ impl Voodoo {
         if std::mem::take(&mut b.engine.drawn) {
             self.display_dirty = true;
         }
-        if let Some((start, end)) = b.engine.touched.take() {
+        if b.engine.touched.is_empty() {
+            return;
+        }
+        let mut runs = std::mem::take(&mut b.engine.touched);
+        for &(start, end) in &runs {
             self.mirror_memory(start, end);
+        }
+        runs.clear();
+        if let Some(b) = &mut self.banshee {
+            b.engine.touched = runs;
         }
     }
 

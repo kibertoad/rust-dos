@@ -1643,15 +1643,30 @@ impl Voodoo {
         };
         let ram = &self.fbi.ram;
         let word = |at: usize| if at < ram.len() { ram.get(at) } else { 0 };
-        if end.saturating_sub(start) <= 16 {
+        let by_word = |mirror: &mut mirror::Mirror| {
             for at in start / 2..end.div_ceil(2) {
                 if let Some((dest, x, y)) = key.locate(at) {
                     mirror.pixel(dest, x, y, word(at as usize), key.width);
                 }
             }
+        };
+        if end.saturating_sub(start) <= 16 {
+            by_word(mirror);
             return;
         }
-        for (dest, first, last) in key.rows_in(start, end) {
+        // The rows the bytes may touch, or the words themselves if they
+        // are fewer: a tiled buffer's rows come in bands of 32, which a
+        // burst into one tile would push whole.
+        let rows = key.rows_in(start, end);
+        let pixels: u64 = rows
+            .iter()
+            .map(|&(_, first, last)| (last - first) as u64 * key.width as u64)
+            .sum();
+        if (end - start).div_ceil(2) as u64 <= pixels {
+            by_word(mirror);
+            return;
+        }
+        for (dest, first, last) in rows {
             let (base, stride) = match dest {
                 Some(offs) => (offs, key.stride),
                 None => (key.aux / 2, key.aux_stride),
@@ -1672,14 +1687,18 @@ impl Voodoo {
     pub(crate) fn mirror_pixel(&mut self, dest: usize, x: i32, y: i32, color: Option<u16>, aux: Option<u16>) {
         let Some(mirror) = &mut self.mirror else { return };
         let fbi = &self.fbi;
-        if x < 0 || y < 0 || x as u32 >= fbi.width || y as u32 >= fbi.height {
+        // The recorded buffers' size: on a Banshee the 3D engine reaches
+        // further down than they go (`banshee_buffers`).
+        let (width, height) =
+            mirror.layout().map_or((fbi.width, fbi.height), |k| (k.width, k.height));
+        if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
             return;
         }
         if let Some(value) = color {
-            mirror.pixel(Some(dest as u32), x as u32, y as u32, value, fbi.width);
+            mirror.pixel(Some(dest as u32), x as u32, y as u32, value, width);
         }
         if let Some(value) = aux {
-            mirror.pixel(None, x as u32, y as u32, value, fbi.width);
+            mirror.pixel(None, x as u32, y as u32, value, width);
         }
     }
 
