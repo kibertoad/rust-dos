@@ -562,6 +562,45 @@ mod tests {
     }
 
     #[test]
+    fn textures_written_through_bar1_are_decoded_again() {
+        use super::super::LINEAR;
+        let decoded = |frame: &Frame| -> Vec<(u32, u32)> {
+            let textures = frame.commands.iter().filter_map(|c| match c {
+                Command::Texture(t) => Some((t.id, t.levels[0].argb[0])),
+                _ => None,
+            });
+            textures.collect()
+        };
+        let mut v = mirrored();
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x10_0000);
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1280);
+        // Level 5 (8x8) of a 5-6-5 texture at 5 MB, as its colour.
+        reg3d(&mut v, TEX_BASE_ADDR, 0x50_0000);
+        reg3d(&mut v, T_LOD, 20 | 20 << 6);
+        let decal = 10 << 8 | 1 << 12 | 1 << 18 | 1 << 21 | 1 << 27;
+        reg3d(&mut v, TEXTURE_MODE, decal);
+        reg3d(&mut v, FBZ_COLOR_PATH, 1 | 1 << 27);
+        rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (0.0, 0.0, 0.0));
+        // A Voodoo3's two units draw with it.
+        let [(first, _), (second, _)] = decoded(&v.take_mirror().unwrap())[..] else {
+            panic!("a texture for each unit")
+        };
+        // Drawn with again, nothing to decode; its first texel written by
+        // the CPU, which a Banshee's texture units share memory with, it
+        // is decoded again as it is now.
+        rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (0.0, 0.0, 0.0));
+        assert!(decoded(&v.take_mirror().unwrap()).is_empty());
+        let level5 = 2 * (65536 + 16384 + 4096 + 1024 + 256);
+        v.write(LINEAR + 0x50_0000 + level5, 0xF800, 0xFFFF, Now::default());
+        rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (0.0, 0.0, 0.0));
+        let red = 0xFFFF_0000;
+        assert_eq!(
+            decoded(&v.take_mirror().unwrap()),
+            [(first, red), (second, red)]
+        );
+    }
+
+    #[test]
     fn half_mode_buffers_are_half_the_desktop() {
         let mut v = mirrored();
         let cfg = VIDPROC_ENABLE | 1 << 18 | VIDPROC_HALF_MODE;
