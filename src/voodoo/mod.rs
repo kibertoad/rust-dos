@@ -906,6 +906,27 @@ impl Voodoo {
         self.tmu_in_use.set(0);
     }
 
+    /// Make two words current without releasing later jobs that cannot
+    /// write them. Outstanding worker batches still finish in order.
+    pub(crate) fn catch_up_read(&self, words: [usize; 2]) {
+        if self.banshee.is_some() || !self.deferring() || !self.words.borrow().is_empty() {
+            self.catch_up();
+            return;
+        }
+        let jobs = self.backlog.borrow_mut().take_for_read(words);
+        if !jobs.is_empty() {
+            self.catch_ups.set(self.catch_ups.get() + 1);
+            self.hand_over(jobs);
+        }
+        self.pool.flush();
+        self.outstanding.set(false);
+        // Held triangles still read texture memory. Keep their usage
+        // mask until a later full flush or the backlog becomes empty.
+        if self.backlog.borrow().is_empty() {
+            self.tmu_in_use.set(0);
+        }
+    }
+
     /// Whether the workers are still drawing, with everything queued
     /// given to them first but without waiting for them: a Banshee's busy
     /// bits, which a program polls until they clear.

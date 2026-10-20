@@ -270,7 +270,6 @@ impl Voodoo {
     /// A read of the frame buffer at dword `offset` of the window: two
     /// 16-bit pixels of the buffer lfbMode selects (`lfb_r`).
     pub(crate) fn lfb_read(&self, offset: u32) -> u32 {
-        self.catch_up();
         let lfb_mode = self.reg[LFB_MODE];
         let (x, y) = if self.banshee.is_some() {
             (((offset << 1) & 0x7FE) as usize, ((offset >> 10) & 0x7FF) as i32)
@@ -284,6 +283,7 @@ impl Voodoo {
             _ => (NONE, self.fbi.stride),
         };
         if offs == NONE {
+            self.catch_up();
             return 0xFFFF_FFFF;
         }
         let scry = if lfb_mode & (1 << 13) != 0 {
@@ -292,17 +292,20 @@ impl Voodoo {
             y
         };
         if scry < 0 {
+            self.catch_up();
             return 0xFFFF_FFFF;
         }
         let row = offs as usize / 2 + stride.row(scry as usize);
         let ram = &self.fbi.ram;
+        if row + stride.col(x) >= ram.len() {
+            self.catch_up();
+            return 0xFFFF_FFFF;
+        }
+        self.catch_up_read([row + stride.col(x), row + stride.col(x + 1)]);
         let word = |x: usize| {
             let at = row + stride.col(x);
             if at < ram.len() { ram.get(at) as u32 } else { 0xFFFF }
         };
-        if row + stride.col(x) >= ram.len() {
-            return 0xFFFF_FFFF;
-        }
         let mut data = word(x) | word(x + 1) << 16;
         if lfb_mode & (1 << 15) != 0 {
             data = data.rotate_left(16);
