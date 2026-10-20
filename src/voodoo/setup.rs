@@ -151,10 +151,9 @@ impl Voodoo {
             tmu: Default::default(),
         };
         let verts = [(f.ax, f.ay), (f.bx, f.by), (f.cx, f.cy)].map(|(x, y)| (x as f32 / 16.0, y as f32 / 16.0));
-        let reg = self.reg.clone();
-        for unit in 0..texcount {
-            let t = &mut self.tmu[unit];
-            let lodbase = t.prepare(&reg[..]);
+        let reg = &self.reg[..];
+        for (unit, t) in self.tmu.iter_mut().enumerate().take(texcount) {
+            let lodbase = t.prepare(reg);
             p.tmu[unit] = TmuParams {
                 starts: t.starts,
                 startt: t.startt,
