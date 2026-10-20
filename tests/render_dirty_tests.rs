@@ -293,8 +293,14 @@ fn cga_composite_frames_drawn_line_by_line_match_full_renders() {
 fn check_untouched_rows(previous: &[u8], frame: &Frame, rows: std::ops::Range<usize>) {
     let bytes = frame.width as usize * 4;
     assert!(rows.start <= rows.end && rows.end <= frame.height as usize);
-    assert_eq!(&previous[..rows.start * bytes], &frame.rgba[..rows.start * bytes]);
-    assert_eq!(&previous[rows.end * bytes..], &frame.rgba[rows.end * bytes..]);
+    assert_eq!(
+        &previous[..rows.start * bytes],
+        &frame.rgba[..rows.start * bytes]
+    );
+    assert_eq!(
+        &previous[rows.end * bytes..],
+        &frame.rgba[rows.end * bytes..]
+    );
 }
 
 #[test]
@@ -304,7 +310,10 @@ fn indexed_dirty_rows_include_scaled_copies_and_skip_unchanged_sources() {
     int10::set_mode(&mut cpu, 0x13);
     let (w, h) = video::frame_size(&cpu.bus);
     let mut frame = Frame::new(w, h);
-    assert_eq!(video::render_screen_rows(&mut frame, &cpu.bus), 0..h as usize);
+    assert_eq!(
+        video::render_screen_rows(&mut frame, &cpu.bus),
+        0..h as usize
+    );
     cpu.bus.vga.mark_dirty_full();
     assert!(video::render_screen_rows(&mut frame, &cpu.bus).is_empty());
 
@@ -325,7 +334,10 @@ fn indexed_dirty_rows_include_scaled_copies_and_skip_unchanged_sources() {
     for component in [63, 0, 0] {
         cpu.bus.io_write(0x3C9, component);
     }
-    assert_eq!(video::render_screen_rows(&mut frame, &cpu.bus), 0..h as usize);
+    assert_eq!(
+        video::render_screen_rows(&mut frame, &cpu.bus),
+        0..h as usize
+    );
 }
 
 #[test]
@@ -358,7 +370,11 @@ fn moving_and_blinking_cursors_match_full_composition_in_text_and_graphics() {
             cpu.bus.mouse.hide_counter = i32::from(step % 4 == 0);
             let (vw, vh) = cpu.bus.mouse.virtual_screen(&cpu.bus);
             cpu.bus.mouse.x = if step % 7 == 0 { -3 } else { step * 29 % vw };
-            cpu.bus.mouse.y = if step % 9 == 0 { vh - 1 } else { step * 13 % vh };
+            cpu.bus.mouse.y = if step % 9 == 0 {
+                vh - 1
+            } else {
+                step * 13 % vh
+            };
             let changed = if cpu.bus.vga.dirty {
                 let rows = video::render_screen_rows(&mut base, &cpu.bus);
                 cpu.bus.vga.clear_dirty();

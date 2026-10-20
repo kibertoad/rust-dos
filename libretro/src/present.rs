@@ -1,4 +1,4 @@
-//! Cached pixel conversion and restoration of temporary overlays.
+//! Cached pixel conversion and bounded comparison of frontend pictures.
 
 use rust_dos::video::{self, Frame};
 use std::ops::Range;
@@ -62,7 +62,10 @@ mod tests {
         let mut cache = Pixels::<u32>::default();
         let mut frame = Frame::new(3, 4);
         let convert = |[r, g, b, _]: [u8; 4]| u32::from_be_bytes([0, r, g, b]);
-        assert_eq!(cache.update(&frame, 0..frame.height as usize, convert), Some(0..4));
+        assert_eq!(
+            cache.update(&frame, 0..frame.height as usize, convert),
+            Some(0..4)
+        );
         assert_eq!(
             cache.update(&frame, 0..0, |_| panic!("unchanged pixels converted")),
             None
@@ -83,7 +86,10 @@ mod tests {
         // The same pixel count with different geometry still invalidates
         // the whole texture, even though all pixels are black.
         frame = Frame::new(4, 3);
-        assert_eq!(cache.update(&frame, 0..frame.height as usize, convert), Some(0..3));
+        assert_eq!(
+            cache.update(&frame, 0..frame.height as usize, convert),
+            Some(0..3)
+        );
         assert_eq!(cache.data, vec![0; 12]);
     }
 

@@ -70,7 +70,7 @@ pub(crate) fn power_off(
             let mut frame = last.clone();
             video::power::apply(&mut frame, &look);
             display.redraw();
-            display.present(&mut frame, None, None)?;
+            display.present(&frame, None, None)?;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
     }

@@ -1,5 +1,6 @@
 //! Changed-row metadata for the canonical RGBA picture.
 
+use rust_dos::video;
 use std::ops::Range;
 
 #[derive(Default)]
@@ -25,21 +26,8 @@ impl Rows {
         self.size = (width, height);
         self.rows = if full {
             0..height
-        } else if row_bytes == 0 {
-            0..0
         } else {
-            let band = candidates.start * row_bytes..candidates.end * row_bytes;
-            let mut rows = previous[band.clone()]
-                .chunks_exact(row_bytes)
-                .zip(current[band].chunks_exact(row_bytes));
-            match rows.position(|(a, b)| a != b) {
-                Some(first) => {
-                    let last = rows.rposition(|(a, b)| a != b);
-                    let end = last.map_or(first + 1, |last| first + last + 2);
-                    candidates.start + first..candidates.start + end
-                }
-                None => 0..0,
-            }
+            video::changed_rows_in(previous, current, row_bytes, candidates).unwrap_or(0..0)
         };
         !self.rows.is_empty()
     }

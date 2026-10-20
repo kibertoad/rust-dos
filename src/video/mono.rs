@@ -83,7 +83,10 @@ pub fn apply_rows(frame: &mut Frame, mono: Monochrome, rows: std::ops::Range<usi
     };
     let ramp = ramp(phosphor);
     let bytes = frame.width as usize * 4;
-    for pixel in frame.rgba[rows.start * bytes..rows.end * bytes].as_chunks_mut::<4>().0 {
+    for pixel in frame.rgba[rows.start * bytes..rows.end * bytes]
+        .as_chunks_mut::<4>()
+        .0
+    {
         let [r, g, b, _] = *pixel;
         let [r, g, b] = ramp[luma(r, g, b) as usize];
         *pixel = [r, g, b, 255];

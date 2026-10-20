@@ -385,7 +385,7 @@ impl<'a> Display<'a> {
     ///
     /// `layer` goes over the picture, at as many of the window's pixels as
     /// it has (`output_scale`).
-    pub fn present(&mut self, frame: &mut Frame, voodoo: Option<&Frame>, layer: Option<&Layer>) -> Result<(), String> {
+    pub fn present(&mut self, frame: &Frame, voodoo: Option<&Frame>, layer: Option<&Layer>) -> Result<(), String> {
         self.present_rows(frame, voodoo, layer, 0..frame.height as usize)
     }
 
@@ -428,8 +428,17 @@ impl<'a> Display<'a> {
         let display = display_size(frame.width, frame.height, self.aspect);
         let shown = match &mut self.out {
             Output::Gl(gl) => {
+                let was_voodoo = self.voodoo_shown;
                 self.voodoo_shown = voodoo.is_some_and(|base| gl.present_voodoo(frame, base, display));
                 if !self.voodoo_shown {
+                    // The texture was not updated while the 3dfx card's
+                    // picture was shown, also when the card stays on but
+                    // its composite now fails.
+                    let rows = if was_voodoo {
+                        0..frame.height as usize
+                    } else {
+                        rows
+                    };
                     gl.present(frame, rows, display, layer);
                 }
                 Ok(())

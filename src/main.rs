@@ -1875,7 +1875,7 @@ fn main() -> Result<(), String> {
             // Restore the affected base and overlay rows. A monochrome
             // monitor shows the cursors in its phosphor's colour, but not
             // the settings window.
-            let overlay = if clipboard.draws(&cpu.bus)
+            let drawn_over = clipboard.draws(&cpu.bus)
                 || ui.is_open()
                 || ui.overlay_shown()
                 || ui.sound_viz_shown()
@@ -1884,8 +1884,8 @@ fn main() -> Result<(), String> {
                 || !osd.is_empty()
                 || recorder.is_active()
                 || sound_recording.is_some()
-                || video_recording.is_some()
-            {
+                || video_recording.is_some();
+            let overlay = if drawn_over {
                 0..height as usize
             } else {
                 video::overlay::cursor_rows(&cached_frame, &cpu.bus, cursor_visible)
@@ -1899,17 +1899,7 @@ fn main() -> Result<(), String> {
             );
             // (The picture stays all there at half the size, which the
             // window may show instead, only where nothing goes over it.)
-            screen.doubled &= !video::overlay::draws_cursors(&cpu.bus)
-                && !clipboard.draws(&cpu.bus)
-                && !ui.is_open()
-                && !ui.overlay_shown()
-                && !ui.sound_viz_shown()
-                && power_look.is_none()
-                && wheel_view.is_none()
-                && osd.is_empty()
-                && !recorder.is_active()
-                && sound_recording.is_none()
-                && video_recording.is_none();
+            screen.doubled &= !video::overlay::draws_cursors(&cpu.bus) && !drawn_over;
             video::overlay::draw_cursors(&mut screen, &cpu.bus, cursor_visible);
             video::mono::apply_rows(&mut screen, settings.monochrome, composed_rows.clone());
             if let Some(look) = &power_look {
@@ -1990,10 +1980,6 @@ fn main() -> Result<(), String> {
             if ui.is_open() || ui.overlay_shown() {
                 ui.set_stats(stats.view());
             }
-            if ui.is_open() || ui.overlay_shown() || ui.sound_viz_shown() {
-                composition.include_overlay(0..height as usize);
-                composed_rows = 0..height as usize;
-            }
             ui.draw(&mut screen);
             ui.draw_overlay(&mut screen);
             if ui.sound_viz_shown() {
@@ -2020,6 +2006,7 @@ fn main() -> Result<(), String> {
             if det.is_some() {
                 debug_frame!();
             }
+            // A capture may have shown a message since the restore.
             if !osd.is_empty() {
                 composition.include_overlay(0..height as usize);
                 composed_rows = 0..height as usize;

@@ -603,7 +603,11 @@ impl Core {
         // `screen` is `filtered` already when neither changed since the
         // last frame and nothing was drawn over it.
         let overlaid = self.ui.is_open() || self.ui.overlay_shown() || self.wheel_view.is_some();
-        let rows = if overlaid || self.overlaid { 0..height as usize } else { filtered_rows };
+        let rows = if overlaid || self.overlaid {
+            0..height as usize
+        } else {
+            filtered_rows
+        };
         let rows = self.screen.copy_rows_from(&self.filtered, rows);
         self.overlaid = overlaid;
         if self.ui.is_open() {
@@ -631,7 +635,11 @@ impl Core {
         // framebuffer; before it made a context, the last one stays.
         if crate::gl::granted() {
             let voodoo = voodoo_gl.then_some(&self.picture);
-            let candidates = if self.gpu_missed { 0..height as usize } else { rows };
+            let candidates = if self.gpu_missed {
+                0..height as usize
+            } else {
+                rows
+            };
             let Some((w, h, refresh)) =
                 crate::gl::with_screen(|s| s.present(&self.screen, voodoo, can_dupe, candidates))
             else {
@@ -655,7 +663,11 @@ impl Core {
             return;
         }
         self.gpu_missed = true;
-        let candidates = if self.shown.is_some() { 0..height as usize } else { rows };
+        let candidates = if self.shown.is_some() {
+            0..height as usize
+        } else {
+            rows
+        };
         let changed = self.xrgb.update(&self.screen, candidates, |[r, g, b, _]| {
             u32::from_be_bytes([0, r, g, b])
         });

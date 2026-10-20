@@ -240,12 +240,7 @@ impl DrawnFrom {
     }
 
     fn changed(&mut self, rows: std::ops::Range<usize>) {
-        if self.changed.is_empty() {
-            self.changed = rows;
-        } else if !rows.is_empty() {
-            self.changed.start = self.changed.start.min(rows.start);
-            self.changed.end = self.changed.end.max(rows.end);
-        }
+        self.changed = compose::union(self.changed.clone(), rows);
     }
 }
 
@@ -472,14 +467,15 @@ pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize
 
     // The Tandy's and PCjr's video shows system memory.
     if bus.vga.adapter.gate_array() {
-        match text::geometry(bus) {
-            Some(geometry) => text::render(canvas, width, bus, &geometry, y_min, y_max, bus.display_mem()),
-            None => tandy::render_graphics(canvas, bus),
-        }
-        return if text::geometry(bus).is_some() {
-            y_min..y_max
-        } else {
-            0..frame.height as usize
+        return match text::geometry(bus) {
+            Some(geometry) => {
+                text::render(canvas, width, bus, &geometry, y_min, y_max, bus.display_mem());
+                y_min..y_max
+            }
+            None => {
+                tandy::render_graphics(canvas, bus);
+                0..frame.height as usize
+            }
         };
     }
 
