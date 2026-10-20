@@ -260,6 +260,24 @@ pub fn fastfill(layout: &TileLayout, st: &RasterState, (x0, x1, y0, y1): (i32, i
     access
 }
 
+/// Rows `top..bottom` of the buffer at word `base` filled whole, every
+/// word of them. With rows wider than the picture, the words right of it
+/// are outside the tiles: kept, as any job that reaches there.
+pub fn rows(layout: &TileLayout, base: usize, (top, bottom): (u32, u32)) -> Access {
+    let slot = layout.bases.iter().position(|&b| b == Some(base));
+    let Some(slot) = slot.filter(|_| layout.prunable && layout.width == layout.rowpixels) else {
+        return Access::PINNED;
+    };
+    if bottom > layout.height {
+        return Access::PINNED;
+    }
+    let rect = (0, layout.width, top, bottom);
+    let mut access = Access::default();
+    access.writes[slot] = layout.tiles(rect, false);
+    access.kills[slot] = layout.tiles(rect, true);
+    access
+}
+
 /// Frame buffer words written.
 pub fn words(layout: &TileLayout, words: &[Word]) -> Access {
     if !layout.prunable {
@@ -482,6 +500,20 @@ mod tests {
         assert!(!l.prunable);
         let l = TileLayout::new([Some(0), None, None, None], 640, 480, 512, size);
         assert!(!l.prunable, "wider than a row");
+    }
+
+    #[test]
+    fn whole_rows_filled_kill_their_tiles() {
+        let l = layout();
+        assert_eq!(rows(&l, 640 * 480, (0, 480)), fill(1));
+        let top = rows(&l, 2 * 640 * 480, (0, 60));
+        assert_eq!((top.writes[AUX], top.kills[AUX]), (0xFF, 0xFF));
+        assert!(rows(&l, 1234, (0, 480)).pinned, "not a buffer");
+        let wide = TileLayout::new([Some(0), None, None, None], 600, 480, 640, 640 * 480);
+        assert!(
+            rows(&wide, 0, (0, 480)).pinned,
+            "words right of the picture"
+        );
     }
 
     #[test]
