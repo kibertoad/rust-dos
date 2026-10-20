@@ -688,6 +688,45 @@ mod tests {
     }
 
     #[test]
+    fn the_scanout_sends_memory_only_when_it_may_have_changed() {
+        use super::super::{LINEAR, VID_DESKTOP_OVERLAY_STRIDE};
+        let mut v = mirrored();
+        v.set_software_picture(false);
+        let now = Now::default();
+        v.write(VID_DESKTOP_OVERLAY_STRIDE, 1280, u32::MAX, now);
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x10_0000);
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+        let scanout = |v: &mut Voodoo| v.take_mirror().unwrap().scanout.unwrap();
+        // The desktop at 0 isn't a buffer the renderer draws: its memory
+        // goes the first time, and not again until something changes.
+        let first = scanout(&mut v);
+        assert_eq!(first.desktop.buffer, None);
+        assert!(first.desktop_memory.is_some());
+        assert!(scanout(&mut v).desktop_memory.is_none());
+        v.write(LINEAR + 4, 0x1234_5678, u32::MAX, now);
+        let memory = scanout(&mut v).desktop_memory.unwrap();
+        assert_eq!(memory[4..8], [0x78, 0x56, 0x34, 0x12]);
+        // Moved onto the colour buffer, it's drawn from there, and moved
+        // back, its memory goes again.
+        v.write(VID_DESKTOP_START_ADDR, 0x10_0000, u32::MAX, now);
+        v.write(
+            VID_PROC_CFG,
+            VIDPROC_ENABLE | 1 << 18 | 1 << 24,
+            u32::MAX,
+            now,
+        );
+        v.write(VID_DESKTOP_OVERLAY_STRIDE, 10, u32::MAX, now);
+        let on_buffer = scanout(&mut v);
+        assert_eq!(on_buffer.desktop.buffer, Some(0x10_0000 / 2));
+        assert!(on_buffer.desktop_memory.is_none());
+        v.write(VID_DESKTOP_START_ADDR, 0, u32::MAX, now);
+        v.write(VID_PROC_CFG, VIDPROC_ENABLE | 1 << 18, u32::MAX, now);
+        v.write(VID_DESKTOP_OVERLAY_STRIDE, 1280, u32::MAX, now);
+        assert!(scanout(&mut v).desktop_memory.is_some());
+        assert!(scanout(&mut v).desktop_memory.is_none());
+    }
+
+    #[test]
     fn texture_base_addresses_are_bytes() {
         let mut v = card();
         reg3d(&mut v, TEX_BASE_ADDR, 0x0050_0010);

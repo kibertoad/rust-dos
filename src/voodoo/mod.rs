@@ -570,6 +570,9 @@ pub struct Voodoo {
     software_picture: bool,
     /// The drawing recorded for the OpenGL renderer, while it draws.
     mirror: Option<Box<mirror::Mirror>>,
+    /// The first bytes of the memory a Banshee's desktop and overlay show
+    /// that the renderer has (`banshee_scanout`).
+    scanout_sent: [Option<u32>; 2],
     /// Messages already logged once.
     logged: u32,
     /// Where the card's accesses are recorded (`RUST_DOS_VOODOO_RECORD`),
@@ -645,6 +648,7 @@ impl Voodoo {
             catch_ups: Cell::new(0),
             software_picture: true,
             mirror: None,
+            scanout_sent: [None; 2],
             logged: 0,
             recorder: std::cell::RefCell::new(None),
             log: Vec::new(),
@@ -1201,6 +1205,14 @@ impl Voodoo {
         if !output {
             return switched;
         }
+        if !self.picture_wanted() {
+            // The OpenGL renderer draws it: nothing needs the memory. The
+            // change stays marked, and a Banshee's video processor's, for
+            // the renderer (`banshee_scanout`) or the next picture that
+            // does.
+            self.display_dirty |= changed;
+            return switched;
+        }
         if let Some(b) = &mut self.banshee {
             let dirty = std::mem::take(&mut b.dirty);
             let draw = changed || switched || dirty;
@@ -1210,11 +1222,6 @@ impl Voodoo {
                 self.flush();
             }
             return draw;
-        }
-        if !self.picture_wanted() {
-            // The OpenGL renderer draws it: nothing needs the memory.
-            self.display_dirty |= changed;
-            return switched;
         }
         // Jobs may still be drawing into the buffer shown.
         let front = self.fbi.rgboffs[self.fbi.frontbuf as usize];
@@ -1511,6 +1518,9 @@ impl Voodoo {
         if on != self.mirror.is_some() {
             self.mirror = on.then(|| Box::new(mirror::Mirror::new()));
             self.release_backlog();
+            // A renderer starting over has none of the picture.
+            self.scanout_sent = [None; 2];
+            self.display_dirty = true;
         }
     }
 
@@ -1601,6 +1611,11 @@ impl Voodoo {
             }
         };
         let output = self.output();
+        let scanout = if output && self.banshee.is_some() {
+            self.banshee_scanout(&key)
+        } else {
+            None
+        };
         let commands = self.mirror.as_mut()?.take();
         Some(mirror::Frame {
             commands,
@@ -1609,6 +1624,7 @@ impl Voodoo {
             width: key.width,
             height: key.height,
             clut: self.clut,
+            scanout,
         })
     }
 

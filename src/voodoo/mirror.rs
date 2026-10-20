@@ -177,6 +177,15 @@ impl LayoutKey {
         })
     }
 
+    /// Whether bytes `start..end` of the frame buffer hold any of the
+    /// buffers' memory.
+    pub fn overlaps(&self, start: u32, end: u32) -> bool {
+        self.buffers().any(|(base, _, stride)| {
+            let (base, span) = (base as u64 * 2, span(stride, self.height) as u64 * 2);
+            (start as u64) < base + span && base < end as u64
+        })
+    }
+
     /// The buffers' rows that bytes `start..end` of the frame buffer may
     /// hold pixels of: the buffer's key (`buffers`) and rows `first..last`.
     pub fn rows_in(&self, start: u32, end: u32) -> Vec<(Option<u32>, u32, u32)> {
@@ -275,6 +284,72 @@ pub struct Frame {
     pub height: u32,
     /// The gamma table (clutData): 33 entries of RGB.
     pub clut: [u32; 33],
+    /// A Banshee's or Voodoo3's picture, which its video processor
+    /// composes, while the card shows it.
+    pub scanout: Option<Box<Scanout>>,
+}
+
+/// A surface a Banshee's video processor shows: its first byte in the
+/// card's memory, its stride in bytes (a row's, or a row of tiles' when
+/// tiled), its pixel format (the vidProcCfg field), the CLUT half it goes
+/// through (0 or 256) unless it bypasses the CLUT, and the recording's
+/// colour buffer it is (a word offset), when the OpenGL renderer draws
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surface {
+    pub start: u32,
+    pub stride: u32,
+    pub tiled: bool,
+    pub format: u32,
+    pub clut: u32,
+    pub bypass: bool,
+    pub buffer: Option<u32>,
+}
+
+/// The overlay window: its surface, where it is on the screen (left,
+/// top, right, bottom, all inclusive) and its scaling: the source pixels
+/// a screen pixel steps across and down, and the first row's offset, in
+/// 20-bit fractions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    pub surface: Surface,
+    pub rect: [u32; 4],
+    pub dudx: u32,
+    pub dvdy: u32,
+    pub v_offset: u32,
+}
+
+/// The hardware cursor: its top left corner on the screen, whether it is
+/// in X11 mode, its two colours (RGB) and its two bit planes, 16 bytes a
+/// row of 64 pixels, 64 rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub x: i32,
+    pub y: i32,
+    pub x11: bool,
+    pub colors: [u32; 2],
+    pub pattern: Vec<u8>,
+}
+
+/// What a Banshee's or Voodoo3's video processor shows, for the OpenGL
+/// renderer to compose as `Banshee::render` draws it: the desktop of
+/// `width` by `height` pixels, each line twice in half mode, the overlay
+/// window over it and the cursor on top, through the CLUT (512 entries of
+/// RGB). The memory the desktop and the overlay show (bytes from their
+/// first on), where they aren't buffers the renderer draws, comes when
+/// the picture may have changed since the last frame; None keeps what
+/// came before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scanout {
+    pub width: u32,
+    pub height: u32,
+    pub half: bool,
+    pub desktop: Surface,
+    pub overlay: Option<Overlay>,
+    pub cursor: Option<Cursor>,
+    pub clut: Vec<u32>,
+    pub desktop_memory: Option<Vec<u8>>,
+    pub overlay_memory: Option<Vec<u8>>,
 }
 
 /// Frames a texture stays decoded without being drawn with.
