@@ -46,6 +46,9 @@ const MAX_BUSY_SHARE: f64 = 0.85;
 /// which a whole batch can fit: a batch measured to have taken no time
 /// would make the host infinitely fast.
 const HOST_SAMPLE: Duration = Duration::from_millis(10);
+/// Instructions a frame has to run for a measurement of the host's speed
+/// to take it: fewer, and the frame's time is mostly not theirs.
+const SAMPLE_INSTRUCTIONS: u64 = 10_000;
 
 /// Emulated time an I/O port access takes on the ISA bus, as in DOSBox.
 /// Delay loops made of port reads (AdLib detection polls the status port
@@ -759,7 +762,17 @@ impl Pacer {
             CpuSpeed::Fixed(_) => None,
             CpuSpeed::Max => {
                 // Move gradually so one unusual frame can't swing the speed.
-                let next = ideal?.clamp(current as f64 * 0.9, current as f64 * 1.1);
+                let a_frame = current as f64 * self.period.as_secs_f64() * 1000.0;
+                let next = match ideal {
+                    Some(ideal) => ideal.clamp(current as f64 * 0.9, current as f64 * 1.1),
+                    // Too slow for a frame to run enough instructions to
+                    // time, however busy the program is: nothing would
+                    // measure the host again, and a speed that a busy
+                    // host pushed down this far would stay. Go up until
+                    // frames can be timed.
+                    None if a_frame < SAMPLE_INSTRUCTIONS as f64 => current as f64 * 1.1,
+                    None => return None,
+                };
                 let next = (next as u32).clamp(MIN_CYCLES, MAX_CYCLES);
                 (next != current).then_some(next)
             }
@@ -831,7 +844,7 @@ impl HostSample {
     /// instruction took and a frame's other work, and start over. Frames
     /// that hardly ran anything (waiting for an interrupt) don't count.
     fn add(&mut self, executed: u64, exec: Duration, overhead: Duration) -> Option<(f64, f64)> {
-        if executed < 10_000 {
+        if executed < SAMPLE_INSTRUCTIONS {
             return None;
         }
         self.executed += executed;

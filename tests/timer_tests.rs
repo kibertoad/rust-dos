@@ -472,6 +472,51 @@ fn max_speed_tracks_host_throughput() {
 }
 
 #[test]
+fn max_speed_comes_back_from_a_speed_too_low_to_time() {
+    // A host busy elsewhere pushed the speed down to where a frame runs
+    // fewer instructions than a measurement takes (Oni after a state load
+    // with the OpenGL renderer, #204): no frame measures the host any
+    // more, so the speed has to climb back by itself.
+    let start = Instant::now();
+    let mut bus = bus_at(150);
+    let mut pacer = Pacer::new(CpuSpeed::Max, None, start);
+    // A frame (1/60 s) of instructions at the speed, all of them run, in
+    // 10 ms of the host's time.
+    let frame = |pacer: &mut Pacer, bus: &mut Bus| {
+        let executed = bus.clock.cycles_per_ms() as u64 * 50 / 3;
+        let ms = Duration::from_millis;
+        let next = pacer.end_frame(bus, true, executed, ms(10), ms(1));
+        if let Some(next) = next {
+            bus.set_cycles_per_ms(next);
+        }
+        next
+    };
+    let mut frames = 0;
+    while bus.clock.cycles_per_ms() * 50 / 3 < 10_000 {
+        let before = bus.clock.cycles_per_ms();
+        assert!(
+            frame(&mut pacer, &mut bus).is_some_and(|next| next > before),
+            "stuck at {}",
+            before
+        );
+        frames += 1;
+    }
+    assert!(frames < 20, "{} frames", frames);
+    // From there frames are timed again, and the host's speed takes it on
+    // up.
+    let speed = bus.clock.cycles_per_ms();
+    for _ in 0..20 {
+        frame(&mut pacer, &mut bus);
+    }
+    assert!(
+        bus.clock.cycles_per_ms() > speed * 2,
+        "{} from {}",
+        bus.clock.cycles_per_ms(),
+        speed
+    );
+}
+
+#[test]
 fn cpu_speed_parses_max_and_numbers() {
     assert_eq!(CpuSpeed::parse("max"), Ok(CpuSpeed::Max));
     assert_eq!(CpuSpeed::parse(" MAX "), Ok(CpuSpeed::Max));
