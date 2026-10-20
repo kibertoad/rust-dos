@@ -168,7 +168,9 @@ impl Screen {
             self.drop_voodoo();
             return false;
         };
-        if settings.renderer != Renderer::OpenGl || self.voodoo_failed.is_some() {
+        // A Banshee's or Voodoo3's picture is its whole desktop, which the
+        // core doesn't compose with OpenGL: it draws the card in software.
+        if settings.renderer != Renderer::OpenGl || card.banshee.is_some() || self.voodoo_failed.is_some() {
             card.set_mirror(false);
             self.drop_voodoo();
             return false;
