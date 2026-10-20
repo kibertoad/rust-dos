@@ -49,6 +49,11 @@ const HOST_SAMPLE: Duration = Duration::from_millis(10);
 /// Instructions a frame has to run for a measurement of the host's speed
 /// to take it: fewer, and the frame's time is mostly not theirs.
 const SAMPLE_INSTRUCTIONS: u64 = 10_000;
+/// How many times `SAMPLE_INSTRUCTIONS` a frame at the least speed `Max`
+/// and `Auto` go down to has room for (`Pacer::least_timed`). A frame
+/// doesn't run all of it: the guest halts or waits on a device for part
+/// of it, and a retrace-paced batch can end early.
+const TIMED_HEADROOM: f64 = 2.0;
 
 /// Emulated time an I/O port access takes on the ISA bus, as in DOSBox.
 /// Delay loops made of port reads (AdLib detection polls the status port
@@ -762,15 +767,21 @@ impl Pacer {
             CpuSpeed::Fixed(_) => None,
             CpuSpeed::Max => {
                 // Move gradually so one unusual frame can't swing the speed.
-                let a_frame = current as f64 * self.period.as_secs_f64() * 1000.0;
                 let next = match ideal {
                     Some(ideal) => ideal.clamp(current as f64 * 0.9, current as f64 * 1.1),
-                    // Too slow for a frame to run enough instructions to
-                    // time, however busy the program is: nothing would
-                    // measure the host again, and a speed that a busy
-                    // host pushed down this far would stay. Go up until
-                    // frames can be timed.
-                    None if a_frame < SAMPLE_INSTRUCTIONS as f64 => current as f64 * 1.1,
+                    // A frame that ran something (not one paused in the
+                    // settings window), too little for a measurement to
+                    // take it, at a speed too low for a frame to have
+                    // room for that: nothing would measure the host again,
+                    // and a speed that a busy host pushed down this far
+                    // would stay. Go up until frames can be timed. Frames
+                    // a measurement took and is still adding up don't
+                    // count: the measurement decides.
+                    None if (1..SAMPLE_INSTRUCTIONS).contains(&executed)
+                        && current < self.least_timed() =>
+                    {
+                        current as f64 * 1.1
+                    }
                     None => return None,
                 };
                 let next = (next as u32).clamp(MIN_CYCLES, MAX_CYCLES);
@@ -780,7 +791,13 @@ impl Pacer {
                 if let Some(ideal) = ideal {
                     self.host_max = Some(self.host_max.map_or(ideal, |max| max * 0.9 + ideal * 0.1));
                 }
-                let host_max = self.host_max.map_or(MAX_CYCLES, |max| (max as u32).clamp(MIN_CYCLES, MAX_CYCLES));
+                // No lower than frames can be timed at, or a busy host could
+                // cap the speed where nothing measures it again (with a base
+                // speed below that, as `auto 300` has in real mode).
+                let least = self.least_timed();
+                let host_max = self
+                    .host_max
+                    .map_or(MAX_CYCLES, |max| (max as u32).clamp(least, MAX_CYCLES));
                 if protected != self.protected {
                     self.protected = protected;
                     // A program switched to protected mode: the search
@@ -805,6 +822,16 @@ impl Pacer {
                 }
             }
         }
+    }
+
+    /// The least speed whose frames have room for `TIMED_HEADROOM` times
+    /// the instructions a measurement of the host takes
+    /// (`SAMPLE_INSTRUCTIONS`): about 1,200 instructions per ms at 60
+    /// frames a second. Below it, frames would hardly ever be timed.
+    fn least_timed(&self) -> u32 {
+        let frame_ms = self.period.as_secs_f64() * 1000.0;
+        let least = (SAMPLE_INSTRUCTIONS as f64 * TIMED_HEADROOM / frame_ms).ceil();
+        (least as u32).clamp(MIN_CYCLES, MAX_CYCLES)
     }
 
     /// Sleep until the next video frame is due; fast forwarding, or once
