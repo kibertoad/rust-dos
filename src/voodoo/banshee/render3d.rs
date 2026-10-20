@@ -17,7 +17,7 @@ use super::super::mirror::{LayoutKey, span};
 use super::super::raster::Stride;
 use super::super::regs::*;
 use super::super::{Effect, NONE, Now, PendingSwap, Voodoo};
-use super::{VID_DESKTOP_START_ADDR, VID_PROC_CFG, VIDPROC_OVERLAY_ENABLE};
+use super::{VID_DESKTOP_START_ADDR, VID_PROC_CFG, VIDPROC_HALF_MODE, VIDPROC_OVERLAY_ENABLE};
 
 // The card's registers where a Voodoo2 has its command FIFO's and some
 // of its init registers (dword numbers in the 3D space).
@@ -168,15 +168,19 @@ impl Voodoo {
     /// and stay apart from colBufferAddr's buffer and the auxiliary one.
     /// The buffers are as wide as their stride and as high as the
     /// desktop, which is as much as the video processor shows of them
-    /// unscaled; the card has no register for their height.
+    /// unscaled; in half mode with the overlay off, half as high, as it
+    /// shows each row of the desktop's buffer twice. The card has no
+    /// register for their height.
     pub(crate) fn banshee_mirror_key(&self, old: Option<&LayoutKey>) -> LayoutKey {
         let fbi = &self.fbi;
         let width = (fbi.stride.pixels() as u32).clamp(1, 2048);
-        let height = self
-            .banshee
-            .as_ref()
-            .map_or(1, |b| b.desktop_size().1)
-            .clamp(1, 2048);
+        let height = self.banshee.as_ref().map_or(1, |b| {
+            let cfg = b.reg(VID_PROC_CFG);
+            let rows = b.desktop_size().1;
+            let half = cfg & (VIDPROC_HALF_MODE | VIDPROC_OVERLAY_ENABLE) == VIDPROC_HALF_MODE;
+            if half { rows.div_ceil(2) } else { rows }
+        });
+        let height = height.clamp(1, 2048);
         let col = fbi.rgboffs[0];
         let key = LayoutKey {
             width,
@@ -558,6 +562,26 @@ mod tests {
     }
 
     #[test]
+    fn half_mode_buffers_are_half_the_desktop() {
+        let mut v = mirrored();
+        let cfg = VIDPROC_ENABLE | 1 << 18 | VIDPROC_HALF_MODE;
+        v.write(VID_PROC_CFG, cfg, u32::MAX, Now::default());
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1280);
+        // Two buffers of 32 rows back to back stay apart.
+        let (a, b) = (0x10_0000, 0x10_0000 + 32 * 1280);
+        for draw in [a, b] {
+            reg3d(&mut v, COL_BUFFER_ADDR, draw);
+            rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
+        }
+        let frame = v.take_mirror().unwrap();
+        let [snapshot] = snapshots(&frame)[..] else {
+            panic!("one snapshot")
+        };
+        assert_eq!(snapshot.layout.height, 32);
+        assert_eq!(snapshot.layout.color, [a / 2, b / 2]);
+    }
+
+    #[test]
     fn swapping_between_buffers_keeps_the_recording() {
         let mut v = mirrored();
         reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
@@ -646,8 +670,10 @@ mod tests {
         v.write(LINEAR + 0x30_0000, 1, u32::MAX, now);
         assert!(pixels(&v.take_mirror().unwrap()).is_empty());
 
-        // The 2D engine: a rectangle of 4x3 at (1, 2) in the colour
-        // buffer, whose rows go to the recording whole.
+        // The 2D engine: a rectangle of 12x3 at (1, 2) in the colour
+        // buffer. It reaches the recording as the pixels drawn, a run of
+        // them per row, not as the rows whole, which would overwrite
+        // what the OpenGL renderer drew beside it.
         let reg2d =
             |v: &mut Voodoo, reg: u32, data: u32| v.write(0x10_0000 + reg, data, u32::MAX, now);
         reg2d(&mut v, 0x14, 3 << 16 | 1280);
@@ -655,15 +681,14 @@ mod tests {
         reg2d(&mut v, 0x08, 0);
         reg2d(&mut v, 0x0C, 0x0FFF_0FFF);
         reg2d(&mut v, 0x64, 0x001F);
-        reg2d(&mut v, 0x68, 3 << 16 | 4);
+        reg2d(&mut v, 0x68, 3 << 16 | 12);
         reg2d(&mut v, 0x6C, 2 << 16 | 1);
         reg2d(&mut v, 0x70, 0xCC << 24 | 1 << 8 | 5);
         let frame = v.take_mirror().unwrap();
         let rows = pixels(&frame);
         let covered: Vec<u32> = rows.iter().map(|p| p.y).collect();
         assert_eq!(covered, [2, 3, 4]);
-        assert!(rows.iter().all(|p| p.x == 0 && p.values.len() == 640));
-        assert_eq!(rows[0].values[1..6], [0x001F, 0x001F, 0x001F, 0x001F, 0]);
+        assert!(rows.iter().all(|p| p.x == 1 && p.values == [0x001F; 12]));
     }
 
     #[test]
