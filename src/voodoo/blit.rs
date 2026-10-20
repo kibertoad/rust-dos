@@ -232,7 +232,7 @@ impl Voodoo {
         let Some((first, end)) = self.sgram_run() else {
             return false;
         };
-        let Some(rows) = self.buffer_rows(first, end) else {
+        let Some(rows) = self.whole_rows(first, end) else {
             return false;
         };
         let color = self.reg[BLT_COLOR] as u16;
@@ -256,21 +256,18 @@ impl Voodoo {
     }
 
     /// The words `first..end` as rows of the buffers (the colour buffers'
-    /// and the auxiliary buffer's, up to their heights): each buffer's
-    /// word offset and its rows. None if they aren't whole rows of them.
-    fn buffer_rows(&self, first: u32, end: u32) -> Option<Vec<(usize, u32, u32)>> {
-        let fbi = &self.fbi;
-        let row = fbi.rowpixels as usize;
-        let size = row * fbi.height as usize;
-        let offsets = fbi.rgboffs.iter().chain([&fbi.auxoffs]);
-        let bases: Vec<usize> = offsets
-            .filter(|&&o| o != NONE)
-            .map(|&o| o as usize / 2)
-            .collect();
+    /// and the auxiliary buffer's, up to their heights, where the
+    /// backlog's tiles have them): each buffer's word offset and its rows.
+    /// None if they aren't whole rows of them.
+    fn whole_rows(&self, first: u32, end: u32) -> Option<Vec<(usize, u32, u32)>> {
+        let layout = self.backlog.borrow().layout;
+        let row = layout.rowpixels as usize;
+        let size = row * layout.height as usize;
         let (mut at, end) = (first as usize, end as usize);
         let mut rows = Vec::new();
         while at < end {
-            let base = *bases.iter().find(|&&b| b <= at && at < b + size)?;
+            let mut bases = layout.bases.into_iter().flatten();
+            let base = bases.find(|&b| b <= at && at < b + size)?;
             let stop = end.min(base + size);
             if (at - base) % row != 0 || (stop - base) % row != 0 {
                 return None;

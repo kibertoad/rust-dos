@@ -99,10 +99,8 @@ impl Job {
             } => {
                 for row in rows.0..rows.1 {
                     if owns(row as i32) {
-                        let start = base + row as usize * rowpixels;
-                        for at in start..(start + rowpixels).min(fb.len()) {
-                            fb.set(at, *value);
-                        }
+                        let start = (base + row as usize * rowpixels).min(fb.len());
+                        fb.fill(start..(start + rowpixels).min(fb.len()), *value);
                     }
                 }
             }
