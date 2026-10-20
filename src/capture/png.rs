@@ -3,16 +3,24 @@
 use crate::video::Frame;
 use std::path::Path;
 
-/// `frame` as a PNG file's bytes.
+/// `frame` as a PNG file's bytes. The file is RGB: frames are opaque, and
+/// builds before RGBA frames read only RGB slot pictures.
 pub fn encode(frame: &Frame) -> Result<Vec<u8>, String> {
+    let rgb: Vec<u8> = frame
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, frame.width, frame.height);
-        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(&frame.rgba).map_err(|e| e.to_string())?;
+        writer.write_image_data(&rgb).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }
@@ -44,14 +52,16 @@ mod tests {
 
     #[test]
     fn a_frame_decodes_back() {
-        let frame = Frame::from_rgb(3, 2, (0..18).collect());
+        let rgb: Vec<u8> = (0..18).collect();
+        let frame = Frame::from_rgb(3, 2, rgb.clone());
         let bytes = encode(&frame).unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let mut reader = decoder.read_info().unwrap();
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut pixels).unwrap();
         assert_eq!((info.width, info.height), (3, 2));
-        assert_eq!(&pixels[..info.buffer_size()], &frame.rgba[..]);
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(&pixels[..info.buffer_size()], &rgb[..]);
         assert_eq!(decode(&encode(&frame).unwrap()), Some(frame));
     }
 

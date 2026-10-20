@@ -227,10 +227,15 @@ pub fn hash_frame(frame: &Frame) -> String {
     let mut h = Sha256::new();
     h.update(frame.width.to_le_bytes());
     h.update(frame.height.to_le_bytes());
-    // Keep the existing visual references independent of pixel padding.
-    for pixel in frame.rgba.as_chunks::<4>().0 {
-        h.update(&pixel[..3]);
-    }
+    // Hashed as RGB, which the existing references were made from.
+    let rgb: Vec<u8> = frame
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, _]| [r, g, b])
+        .collect();
+    h.update(&rgb);
     hex(&h.finalize()[..12])
 }
 

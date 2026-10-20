@@ -20,11 +20,17 @@ pub fn restore(screen: &mut Frame, base: &Frame) {
     if (screen.width, screen.height) != (base.width, base.height) {
         screen.clone_from(base);
     } else if let Some(rows) = changed_rows(screen, base) {
-        let bytes = base.width as usize * 4;
-        let range = rows.start * bytes..rows.end * bytes;
-        screen.rgba[range.clone()].copy_from_slice(&base.rgba[range]);
+        copy_rows(screen, base, rows);
     }
     screen.doubled = base.doubled;
+}
+
+/// Copy rows `rows` of `frame` into `copy`, made its size first.
+pub fn copy_rows(copy: &mut Frame, frame: &Frame, rows: Range<usize>) {
+    copy.resize(frame.width, frame.height);
+    let bytes = frame.width as usize * 4;
+    let range = rows.start * bytes..rows.end * bytes;
+    copy.rgba[range.clone()].copy_from_slice(&frame.rgba[range]);
 }
 
 /// The last picture converted into a frontend's pixel format. Each
@@ -50,16 +56,14 @@ impl<T: Copy + Default> Pixels<T> {
         convert: impl Fn([u8; 4]) -> T,
     ) -> Option<Range<usize>> {
         let rows = changed_rows(&self.frame, frame)?;
-        self.frame.resize(frame.width, frame.height);
         self.data
             .resize((frame.width * frame.height) as usize, T::default());
         let pixels = rows.start * frame.width as usize..rows.end * frame.width as usize;
-        let bytes = pixels.start * 4..pixels.end * 4;
-        let rgb = &frame.rgba[bytes.clone()];
-        for (out, &pixel) in self.data[pixels].iter_mut().zip(rgb.as_chunks::<4>().0) {
+        let rgba = &frame.rgba[pixels.start * 4..pixels.end * 4];
+        for (out, &pixel) in self.data[pixels].iter_mut().zip(rgba.as_chunks::<4>().0) {
             *out = convert(pixel);
         }
-        self.frame.rgba[bytes].copy_from_slice(rgb);
+        copy_rows(&mut self.frame, frame, rows.clone());
         Some(rows)
     }
 }
@@ -78,7 +82,10 @@ mod tests {
             cache.update(&frame, |_| panic!("unchanged pixels converted")),
             None
         );
-        frame.rgba[12..24].as_chunks_mut::<4>().0.fill([7, 7, 7, 255]);
+        frame.rgba[12..24]
+            .as_chunks_mut::<4>()
+            .0
+            .fill([7, 7, 7, 255]);
         let calls = std::cell::Cell::new(0);
         assert_eq!(
             cache.update(&frame, |p| {

@@ -175,7 +175,9 @@ pub fn render_area(grid: &Grid, layout: &Layout, frame: &mut Frame, alpha: u32, 
             for (gy, bits) in glyph.iter().enumerate() {
                 let y = layout.y + row * layout.cell_h + gy;
                 let start = (y * width + layout.x + col * 8) * 4;
-                let Some(pixels) = frame.rgba.get_mut(start..start + 32) else { continue };
+                let Some(pixels) = frame.rgba.get_mut(start..start + 32) else {
+                    continue;
+                };
                 for (gx, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let [r, g, b] = if bits & (0x80 >> gx) != 0 {
                         [cell.fg.0, cell.fg.1, cell.fg.2]

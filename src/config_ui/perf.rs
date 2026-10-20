@@ -319,8 +319,13 @@ mod tests {
         ui.draw_overlay(&mut frame);
         assert!(lit(&frame, 600, 380) && !lit(&frame, 400, 380) && !lit(&frame, 600, 300));
         let has = |frame: &Frame, c: Rgb| {
-        frame.rgba.as_chunks::<4>().0.iter().any(|px| px[..3] == [c.0, c.1, c.2])
-    };
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[..3] == [c.0, c.1, c.2])
+        };
         assert!(has(&frame, draw::GOOD) && has(&frame, draw::KEY) && has(&frame, draw::ERROR), "graphs, and the CPU use in red");
 
         // Half as opaque as the window: over white, its panel is lighter.

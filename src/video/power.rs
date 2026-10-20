@@ -257,19 +257,35 @@ mod tests {
     }
 
     fn lit(frame: &Frame, x: usize, y: usize) -> bool {
-        frame.rgba[(y * frame.width as usize + x) * 4..][..3].iter().any(|&c| c > 0)
+        frame.rgba[(y * frame.width as usize + x) * 4..][..3]
+            .iter()
+            .any(|&c| c > 0)
     }
 
     #[test]
     fn power_on_starts_dark_and_ends_as_the_picture() {
         let mut frame = white(64, 40);
         apply(&mut frame, &look_at(Effect::PowerOn, 0.05));
-        assert!(frame.rgba.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]));
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0, 0, 0, 255])
+        );
         assert_eq!(look_at(Effect::PowerOn, 1.59).brightness, 1.0);
         assert_eq!(look_at(Effect::PowerOn, 1.59).wobble, 0.0);
         let mut frame = white(64, 40);
         apply(&mut frame, &look_at(Effect::PowerOn, 1.59));
-        assert!(frame.rgba.as_chunks::<4>().0.iter().all(|p| *p == [200, 200, 200, 255]));
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [200, 200, 200, 255])
+        );
     }
 
     #[test]
@@ -288,7 +304,14 @@ mod tests {
     fn a_resync_blanks_then_brings_the_picture_back() {
         let mut frame = white(64, 40);
         apply(&mut frame, &look_at(Effect::Resync, 0.1));
-        assert!(frame.rgba.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]));
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0, 0, 0, 255])
+        );
         let look = look_at(Effect::Resync, 0.2);
         assert!(look.brightness > 0.0 && look.offset_y > 0.0);
         let mut fx = PowerFx::default();

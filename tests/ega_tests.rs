@@ -143,8 +143,12 @@ fn the_shell_runs_on_an_ega() {
     video::print_string(&mut cpu, "HELLO");
     assert_eq!(video::frame_size(&cpu.bus), (640, 350));
     let frame = picture(&mut cpu);
-    assert!(frame.rgba[..640 * 14 * 4]
-        .as_chunks::<4>().0.iter()
-        .any(|p| p[..3].iter().any(|&b| b != 0)));
+    assert!(
+        frame.rgba[..640 * 14 * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[..3].iter().any(|&b| b != 0))
+    );
     assert_eq!(cpu.bus.read_16(0x0485), 14);
 }

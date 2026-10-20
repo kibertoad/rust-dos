@@ -279,7 +279,7 @@ impl Screen {
                     }
                     if let Some(rows) = rows {
                         let bytes = rows.start * w as usize * 4..rows.end * w as usize * 4;
-                        let pixels = &screen.rgba[bytes.clone()];
+                        let pixels = &screen.rgba[bytes];
                         gl.tex_sub_image_2d(
                             glow::TEXTURE_2D,
                             0,
@@ -291,8 +291,7 @@ impl Screen {
                             glow::UNSIGNED_BYTE,
                             glow::PixelUnpackData::Slice(Some(pixels)),
                         );
-                        upload.resize(screen.width, screen.height);
-                        upload.rgba[bytes].copy_from_slice(pixels);
+                        crate::present::copy_rows(upload, screen, rows);
                     }
                     (*own, (screen.width, screen.height))
                 }
@@ -394,7 +393,10 @@ mod tests {
         let mut frame = Frame::from_rgb(3, 2, vec![17; 18]);
         assert_eq!(screen.present(&frame, None, true), (3, 2, true));
         assert_eq!(screen.present(&frame, None, true), (3, 2, false));
-        frame.rgba[12..].as_chunks_mut::<4>().0.fill([37, 37, 37, 255]);
+        frame.rgba[12..]
+            .as_chunks_mut::<4>()
+            .0
+            .fill([37, 37, 37, 255]);
         assert_eq!(screen.present(&frame, None, true), (3, 2, true));
         assert_eq!(screen.present(&frame, None, false), (3, 2, true));
         let read = |screen: &Screen, frame: &Frame| {

@@ -830,7 +830,11 @@ impl VoodooGl {
                     .iter()
                     .zip(base.rgba.as_chunks::<4>().0)
                     .flat_map(|(&[r, g, b, _], old)| {
-                        if [r, g, b] != old[..3] { [r, g, b, 255] } else { [0; 4] }
+                        if [r, g, b] != old[..3] {
+                            [r, g, b, 255]
+                        } else {
+                            [0; 4]
+                        }
                     })
                     .collect();
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.staging_texture));
@@ -1229,8 +1233,12 @@ mod tests {
                 card.prepare_display();
                 let mut rgba = vec![0; (w * h * 4) as usize];
                 card.render(&mut rgba, w as usize);
-                let reference: Vec<_> = rgba.as_chunks::<4>().0.iter()
-                    .flat_map(|&[r, g, b, _]| [r, g, b]).collect();
+                let reference: Vec<_> = rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|&[r, g, b, _]| [r, g, b])
+                    .collect();
                 save(&format!("glide-{frame}-software"), &reference, w, h);
                 let target = &renderer.targets[&renderer.front.unwrap()];
                 target.resolve(&gl, (w as i32, h as i32));

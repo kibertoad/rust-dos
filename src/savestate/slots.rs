@@ -432,7 +432,6 @@ mod tests {
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut pixels).unwrap();
         assert_eq!((reader.info().width, reader.info().height), THUMBNAIL);
-        assert_eq!(&pixels[..4], &[255; 4]);
-        assert_eq!(&pixels[pixels.len() - 4..], &[0, 0, 0, 255]);
+        assert_eq!((pixels[0], pixels[pixels.len() - 1]), (0xFF, 0));
     }
 }
