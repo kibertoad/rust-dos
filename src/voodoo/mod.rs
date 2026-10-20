@@ -1648,6 +1648,11 @@ impl Voodoo {
         let Some(mirror) = &mut self.mirror else {
             return;
         };
+        // The texture units read the same memory: what the recording
+        // decoded from there is out of date.
+        for tmu in &mut self.tmu {
+            tmu.note_written(start, end);
+        }
         // With no layout yet, the next snapshot reads the memory.
         let Some(key) = mirror.layout().copied() else {
             return;
