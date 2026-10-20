@@ -1579,7 +1579,11 @@ impl Voodoo {
             out
         };
         mirror::Snapshot {
-            color: layout.color.iter().map(|&offs| pixels(offs, layout.stride)).collect(),
+            color: layout
+                .color
+                .iter()
+                .map(|&offs| pixels(offs, layout.stride))
+                .collect(),
             aux: layout.aux.map(|offs| pixels(offs, layout.aux_stride)),
             layout,
         }
@@ -1614,9 +1618,13 @@ impl Voodoo {
     /// pixels of its buffers there, from memory, which has what the 3D
     /// engine drew before (the writers catch up first).
     pub(crate) fn mirror_memory(&mut self, start: u32, end: u32) {
-        let Some(mirror) = &mut self.mirror else { return };
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
         // With no layout yet, the next snapshot reads the memory.
-        let Some(key) = mirror.layout().copied() else { return };
+        let Some(key) = mirror.layout().copied() else {
+            return;
+        };
         let ram = &self.fbi.ram;
         let word = |at: usize| if at < ram.len() { ram.get(at) } else { 0 };
         if end.saturating_sub(start) <= 16 {

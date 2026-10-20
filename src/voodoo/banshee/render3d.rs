@@ -541,10 +541,14 @@ mod tests {
         reg3d(&mut v, AUX_BUFFER_ADDR, 0x20_0000);
         reg3d(&mut v, AUX_BUFFER_STRIDE, 1280);
         // Pixel (65, 33): tile 1 of the second row of tiles, row 1 in it.
-        v.fbi.ram.set(0x10_0000 / 2 + 10 * 2048 + 2048 + 64 + 1, 0xF800);
+        v.fbi
+            .ram
+            .set(0x10_0000 / 2 + 10 * 2048 + 2048 + 64 + 1, 0xF800);
         v.fbi.ram.set(0x20_0000 / 2 + 33 * 640 + 65, 0x1234);
         let frame = v.take_mirror().unwrap();
-        let [snapshot] = snapshots(&frame)[..] else { panic!("one snapshot") };
+        let [snapshot] = snapshots(&frame)[..] else {
+            panic!("one snapshot")
+        };
         let layout = &snapshot.layout;
         assert_eq!((layout.width, layout.height), (640, 64));
         assert_eq!(layout.color, [0x10_0000 / 2]);
@@ -581,10 +585,18 @@ mod tests {
         v.write(VID_PROC_CFG, cfg, u32::MAX, Now::default());
         assert_eq!(v.take_mirror().unwrap().front, Some(b / 2));
         v.write(VID_DESKTOP_START_ADDR, a, u32::MAX, Now::default());
-        v.write(VID_PROC_CFG, VIDPROC_ENABLE | 1 << 18, u32::MAX, Now::default());
+        v.write(
+            VID_PROC_CFG,
+            VIDPROC_ENABLE | 1 << 18,
+            u32::MAX,
+            Now::default(),
+        );
         assert_eq!(v.take_mirror().unwrap().front, Some(a / 2));
         // A third buffer joins, a fourth drops the oldest.
-        for (draw, expect) in [(0x30_0000, [a, b, 0x30_0000]), (0x50_0000, [b, 0x30_0000, 0x50_0000])] {
+        for (draw, expect) in [
+            (0x30_0000, [a, b, 0x30_0000]),
+            (0x50_0000, [b, 0x30_0000, 0x50_0000]),
+        ] {
             reg3d(&mut v, COL_BUFFER_ADDR, draw);
             rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
             let frame = v.take_mirror().unwrap();
@@ -594,7 +606,10 @@ mod tests {
         reg3d(&mut v, COL_BUFFER_ADDR, 0x30_0000 + 0x8000);
         rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
         let frame = v.take_mirror().unwrap();
-        assert_eq!(snapshots(&frame)[0].layout.color, [b / 2, 0x50_0000 / 2, 0x30_8000 / 2]);
+        assert_eq!(
+            snapshots(&frame)[0].layout.color,
+            [b / 2, 0x50_0000 / 2, 0x30_8000 / 2]
+        );
     }
 
     #[test]
@@ -609,13 +624,21 @@ mod tests {
         // The CPU through BAR1: pixels (2, 3) and (3, 3) of the colour
         // buffer, then (65, 33) of the tiled depth.
         let now = Now::default();
-        v.write(LINEAR + 0x10_0000 + 3 * 1280 + 4, 0x07E0_F800, u32::MAX, now);
+        v.write(
+            LINEAR + 0x10_0000 + 3 * 1280 + 4,
+            0x07E0_F800,
+            u32::MAX,
+            now,
+        );
         let depth = 0x20_0000 + 2 * (10 * 2048 + 2048 + 64);
         v.write(LINEAR + depth, 0x4321_FFFF, 0xFFFF_0000, now);
         let frame = v.take_mirror().unwrap();
         let rows = pixels(&frame);
         assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].dest, rows[0].x, rows[0].y), (Some(0x10_0000 / 2), 2, 3));
+        assert_eq!(
+            (rows[0].dest, rows[0].x, rows[0].y),
+            (Some(0x10_0000 / 2), 2, 3)
+        );
         assert_eq!(rows[0].values, [0xF800, 0x07E0]);
         assert_eq!((rows[1].dest, rows[1].x, rows[1].y), (None, 65, 33));
         assert_eq!(rows[1].values, [0x4321]);
@@ -625,7 +648,8 @@ mod tests {
 
         // The 2D engine: a rectangle of 4x3 at (1, 2) in the colour
         // buffer, whose rows go to the recording whole.
-        let reg2d = |v: &mut Voodoo, reg: u32, data: u32| v.write(0x10_0000 + reg, data, u32::MAX, now);
+        let reg2d =
+            |v: &mut Voodoo, reg: u32, data: u32| v.write(0x10_0000 + reg, data, u32::MAX, now);
         reg2d(&mut v, 0x14, 3 << 16 | 1280);
         reg2d(&mut v, 0x10, 0x10_0000);
         reg2d(&mut v, 0x08, 0);
@@ -656,7 +680,10 @@ mod tests {
         let frame = v.take_mirror().unwrap();
         let rows = pixels(&frame);
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].dest, rows[0].x, rows[0].y), (Some(0x10_0000 / 2), 64, 33));
+        assert_eq!(
+            (rows[0].dest, rows[0].x, rows[0].y),
+            (Some(0x10_0000 / 2), 64, 33)
+        );
         assert_eq!(rows[0].values, [0xF800]);
     }
 

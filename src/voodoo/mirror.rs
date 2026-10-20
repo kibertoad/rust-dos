@@ -147,7 +147,12 @@ impl LayoutKey {
             height: self.height,
             stride: self.stride,
             aux_stride: self.aux_stride,
-            color: self.color.iter().filter(|&&offs| offs != NONE).map(|&offs| offs / 2).collect(),
+            color: self
+                .color
+                .iter()
+                .filter(|&&offs| offs != NONE)
+                .map(|&offs| offs / 2)
+                .collect(),
             aux: (self.aux != NONE).then_some(self.aux / 2),
         }
     }
@@ -186,7 +191,11 @@ impl LayoutKey {
                 let (w0, w1) = ((start - base) / 2, (end - base).div_ceil(2));
                 // Rows, or with tiles bands of 32 rows.
                 let (r0, r1) = (w0 / words, (w1 - 1) / words + 1);
-                let (r0, r1) = if stride.tiled { (r0 * 32, r1 * 32) } else { (r0, r1) };
+                let (r0, r1) = if stride.tiled {
+                    (r0 * 32, r1 * 32)
+                } else {
+                    (r0, r1)
+                };
                 let r1 = r1.min(self.height as u64);
                 (r0 < r1).then_some((key, r0 as u32, r1 as u32))
             })
@@ -698,7 +707,10 @@ mod tests {
     /// two a row; depth at 256 KB, linear rows of 64 pixels.
     fn key(tiled: bool) -> LayoutKey {
         let stride = if tiled {
-            Stride { words: 2 * 2048, tiled: true }
+            Stride {
+                words: 2 * 2048,
+                tiled: true,
+            }
         } else {
             Stride::linear(100)
         };
@@ -733,15 +745,24 @@ mod tests {
         let linear = key(false);
         let base = 0x1_0000;
         // Bytes 10..12 of row 2 and the start of row 3.
-        assert_eq!(linear.rows_in(base + 410, base + 602), [(Some(base / 2), 2, 4)]);
+        assert_eq!(
+            linear.rows_in(base + 410, base + 602),
+            [(Some(base / 2), 2, 4)]
+        );
         // From before the buffer to past its end: all its rows.
         assert_eq!(linear.rows_in(0, 0x2_0000), [(Some(base / 2), 0, 40)]);
         // A tiled buffer's band of 32 rows, the second cut at the height.
         let tiled = key(true);
         let band = base + 2 * 4096;
-        assert_eq!(tiled.rows_in(band + 6, band + 8), [(Some(base / 2), 32, 40)]);
+        assert_eq!(
+            tiled.rows_in(band + 6, band + 8),
+            [(Some(base / 2), 32, 40)]
+        );
         assert_eq!(tiled.rows_in(band - 2, band + 2), [(Some(base / 2), 0, 40)]);
         assert!(tiled.rows_in(0x3_0000, 0x3_0010).is_empty());
-        assert_eq!(tiled.rows_in(0x4_0000 + 128, 0x4_0000 + 130), [(None, 1, 2)]);
+        assert_eq!(
+            tiled.rows_in(0x4_0000 + 128, 0x4_0000 + 130),
+            [(None, 1, 2)]
+        );
     }
 }

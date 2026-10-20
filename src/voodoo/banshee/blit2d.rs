@@ -439,7 +439,10 @@ impl Engine {
         write(ram, addr, bytes as u32, value, mask);
         self.drawn = true;
         let end = addr + bytes as u32;
-        self.touched = Some(self.touched.map_or((addr, end), |(a, b)| (a.min(addr), b.max(end))));
+        self.touched = Some(
+            self.touched
+                .map_or((addr, end), |(a, b)| (a.min(addr), b.max(end))),
+        );
     }
 
     /// A register of the 2D space written (at byte `addr & 1FCh`);
