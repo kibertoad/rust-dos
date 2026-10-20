@@ -12,6 +12,7 @@ use super::NONE;
 use super::raster::{RasterState, Stride, TmuRaster, TriParams, fetch_texel};
 use super::texture::{PAGE_SHIFT, Tmu};
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// A vertex: where it is in the buffer in pixels, rows counted from the
 /// top of the buffer (the Y origin applied), and the values the card
@@ -293,6 +294,7 @@ struct TexKey {
     lodmask: u32,
     first: i32,
     last: i32,
+    /// The colours of its palette or NCC table, hashed (`lookup_hash`).
     lookup: u64,
 }
 
@@ -331,6 +333,9 @@ pub struct Mirror {
     open: Vec<Pixels>,
     last_open: usize,
     last_texture: [Option<LastTexture>; 2],
+    /// Each unit's look-up table as hashed last: its change count
+    /// (`Tmu::lookup_key`) and the hash of its colours.
+    lookups: [(u64, u64); 2],
 }
 
 impl Default for Mirror {
@@ -350,6 +355,7 @@ impl Mirror {
             open: Vec::new(),
             last_open: 0,
             last_texture: [None; 2],
+            lookups: [(0, 0); 2],
         }
     }
 
@@ -381,6 +387,7 @@ impl Mirror {
     /// Forget the decoded textures: the TMUs start over.
     pub(crate) fn forget_textures(&mut self) {
         self.last_texture = [None; 2];
+        self.lookups = [(0, 0); 2];
         for (_, cached) in self.textures.drain() {
             self.commands.push(Command::FreeTexture(cached.id));
         }
@@ -550,7 +557,7 @@ impl Mirror {
             lodmask: t.lodmask,
             first,
             last,
-            lookup: tmu.lookup_key(t.mode),
+            lookup: self.lookup_hash(unit, t, tmu),
         };
         let frame = self.frame;
         let unit_info = |id: u32| TexUnit {
@@ -616,6 +623,29 @@ impl Mirror {
         };
         self.last_texture[unit] = Some(LastTexture { key, writes: tmu.writes, id, frame });
         unit_info(id)
+    }
+
+    /// The colours unit `unit`'s look-up table gives the texture `t`, as a
+    /// hash; 0 for a format without one. A program may load a texture's
+    /// palette each time before it draws with it. The table's change count
+    /// then goes up every time, while its colours are the ones the texture
+    /// was decoded with before.
+    fn lookup_hash(&mut self, unit: usize, t: &TmuRaster, tmu: &Tmu) -> u64 {
+        let changes = tmu.lookup_key(t.mode);
+        if changes == 0 {
+            return 0;
+        }
+        let (seen, hash) = self.lookups[unit];
+        if seen == changes {
+            return hash;
+        }
+        let mut hasher = DefaultHasher::new();
+        // The kind of table, as `lookup_key` gives it in bits 41:40.
+        (changes >> 40).hash(&mut hasher);
+        t.lookup.hash(&mut hasher);
+        let hash = hasher.finish() | 1;
+        self.lookups[unit] = (changes, hash);
+        hash
     }
 
     /// What was recorded since the last frame, the textures not drawn
