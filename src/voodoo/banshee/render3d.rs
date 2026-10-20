@@ -601,6 +601,118 @@ mod tests {
     }
 
     #[test]
+    fn double_buffered_frames_drop_what_is_drawn_over() {
+        use super::super::LINEAR;
+        // Eight frames as a game draws them, into two tiled buffers in
+        // turn: clear the buffer and the depth with a fastfill, draw,
+        // swap through the overlay, polling the busy bits on the way. The
+        // status register reads leave held jobs alone. The recording
+        // takes the second buffer's memory once, when it joins the
+        // layout; from then on nothing waits for the drawing.
+        let (a, b) = (0x10_0000, 0x20_0000);
+        let run = |mirror: bool| {
+            let mut v = mirrored();
+            v.pool = super::super::super::workers::Pool::new(2);
+            v.set_mirror(mirror);
+            reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, AUX_BUFFER_ADDR, 0x40_0000);
+            reg3d(&mut v, AUX_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, CLIP_LEFT_RIGHT, 640);
+            reg3d(&mut v, CLIP_LOW_Y_HIGH_Y, 64);
+            reg3d(&mut v, FBZ_MODE, 1 | 1 << 9 | 1 << 10);
+            let mut joined = 0;
+            for frame in 0..8u32 {
+                if frame == 2 {
+                    joined = v.catch_ups.get();
+                }
+                let draw = if frame % 2 == 0 { a } else { b };
+                reg3d(&mut v, COL_BUFFER_ADDR, draw);
+                reg3d(&mut v, COLOR1, frame * 0x10_1010);
+                reg3d(&mut v, FASTFILL_CMD, 0);
+                let x = frame as f32 * 8.0;
+                rectangle(&mut v, (x, 4.0, x + 30.0, 40.0), (255.0, 128.0, 0.0));
+                v.read(0x20_0000 + 4 * STATUS as u32, Now::default());
+                reg3d(&mut v, LEFT_OVERLAY_BUF, draw);
+                reg3d(&mut v, SWAPBUFFER_CMD, 0);
+                if mirror {
+                    v.take_mirror();
+                }
+            }
+            let held = (v.backlog.borrow().pruned, v.catch_ups.get() - joined);
+            // The CPU reads pixel (65, 5) of the last frame.
+            let pixel = v.read(LINEAR + b + 2 * (2048 + 5 * 64 + 1), Now::default());
+            (held, pixel, v.frame_buffer().to_bytes())
+        };
+        let ((pruned, catch_ups), pixel, recorded) = run(true);
+        assert!(pruned > 0, "the frames drawn over are dropped");
+        assert_eq!(catch_ups, 0, "nothing read the memory while they were held");
+        let (_, software_pixel, software) = run(false);
+        assert_eq!(pixel, software_pixel);
+        assert!(recorded == software, "the memory ends up the same");
+    }
+
+    #[test]
+    fn frames_drawn_over_after_a_depth_clear_drop_what_was_under_them() {
+        // A game that clears only the depth and draws over the whole
+        // picture each frame, double buffered. The background is drawn
+        // with "less than or equal"; from frame 4 on, a depth-only
+        // triangle nearer than it goes first in a corner, where the
+        // background then fails its test and the colour of two frames
+        // before stays. A blended triangle goes on top.
+        let (a, b) = (0x10_0000, 0x20_0000);
+        let depth_only = 1 | 1 << 10;
+        let background = 1 | 1 << 4 | 3 << 5 | 1 << 9 | 1 << 10;
+        let run = |mirror: bool| {
+            let mut v = mirrored();
+            v.pool = super::super::super::workers::Pool::new(2);
+            v.set_mirror(mirror);
+            reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, AUX_BUFFER_ADDR, 0x40_0000);
+            reg3d(&mut v, AUX_BUFFER_STRIDE, 1 << 15 | 10);
+            reg3d(&mut v, CLIP_LEFT_RIGHT, 640);
+            reg3d(&mut v, CLIP_LOW_Y_HIGH_Y, 64);
+            reg3d(&mut v, ZA_COLOR, 0xFFFF);
+            let mut joined = 0;
+            for frame in 0..10u32 {
+                if frame == 2 {
+                    joined = v.catch_ups.get();
+                }
+                let draw = if frame % 2 == 0 { a } else { b };
+                reg3d(&mut v, COL_BUFFER_ADDR, draw);
+                reg3d(&mut v, ALPHA_MODE, 0);
+                reg3d(&mut v, FBZ_MODE, 1 << 10);
+                reg3d(&mut v, FASTFILL_CMD, 0);
+                if frame >= 4 {
+                    reg3d(&mut v, FBZ_MODE, depth_only);
+                    float(&mut v, FSTART_Z, 0.0);
+                    rectangle(&mut v, (0.0, 0.0, 20.0, 12.0), (0.0, 0.0, 0.0));
+                }
+                reg3d(&mut v, FBZ_MODE, background);
+                float(&mut v, FSTART_Z, 1000.0);
+                let shade = (frame * 25) as f32;
+                let colour = (shade, 255.0 - shade, 60.0);
+                rectangle(&mut v, (0.0, 0.0, 640.0, 64.0), colour);
+                // Blended: source alpha and one minus it.
+                reg3d(&mut v, ALPHA_MODE, 1 << 4 | 1 << 8 | 5 << 12);
+                float(&mut v, FSTART_A, 128.0);
+                rectangle(&mut v, (100.0, 10.0, 200.0, 50.0), (255.0, 255.0, 255.0));
+                reg3d(&mut v, LEFT_OVERLAY_BUF, draw);
+                reg3d(&mut v, SWAPBUFFER_CMD, 0);
+                if mirror {
+                    v.take_mirror();
+                }
+            }
+            let held = (v.backlog.borrow().pruned, v.catch_ups.get() - joined);
+            (held, v.frame_buffer().to_bytes())
+        };
+        let ((pruned, catch_ups), recorded) = run(true);
+        assert!(pruned > 0, "the frames drawn over are dropped");
+        assert_eq!(catch_ups, 0);
+        let (_, software) = run(false);
+        assert!(recorded == software, "the memory ends up the same");
+    }
+
+    #[test]
     fn half_mode_buffers_are_half_the_desktop() {
         let mut v = mirrored();
         let cfg = VIDPROC_ENABLE | 1 << 18 | VIDPROC_HALF_MODE;

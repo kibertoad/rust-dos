@@ -917,16 +917,20 @@ impl Voodoo {
 
     /// Whether the workers are still drawing, with everything queued
     /// given to them first but without waiting for them: a Banshee's busy
-    /// bits, which a program polls until they clear.
+    /// bits, which a program polls until they clear. Jobs held back
+    /// (`backlog`) stay held: as far as the program can tell they are
+    /// drawn, since whatever reads what they draw catches up first.
     pub(crate) fn drawing(&self) -> bool {
         if !self.writes_queue() {
             return false;
         }
-        self.submit_words();
-        self.release_backlog();
+        if !self.deferring() {
+            self.submit_words();
+            self.release_backlog();
+        }
         self.pool.give_out();
         let busy = self.pool.busy();
-        if !busy {
+        if !busy && self.words.borrow().is_empty() && self.backlog.borrow().is_empty() {
             self.outstanding.set(false);
             self.tmu_in_use.set(0);
         }
@@ -1136,11 +1140,31 @@ impl Voodoo {
 
     /// The tiles held-back jobs are worked out on, for the buffers where
     /// they are now. Jobs held back for the old ones go to the workers.
+    /// A Banshee's are the buffers the recording keeps
+    /// (`banshee_mirror_key`): the one colBufferAddr points at and those
+    /// drawn into lately, which a program swaps between, so that the
+    /// frames drawn into one stay held while it draws into another.
+    /// Without a recording, both of its colour buffers are colBufferAddr's,
+    /// and nothing is held.
     pub(crate) fn update_tiles(&mut self) {
         let fbi = &self.fbi;
         let word = |offs: u32| (offs != NONE).then_some(offs as usize / 2);
-        let bases = [word(fbi.rgboffs[0]), word(fbi.rgboffs[1]), word(fbi.rgboffs[2]), word(fbi.auxoffs)];
-        let layout = TileLayout::new(bases, fbi.width, fbi.height, fbi.rowpixels, fbi.ram.len());
+        let recorded = self.banshee.is_some().then(|| self.mirror.as_ref()?.layout()).flatten();
+        let words = fbi.ram.len();
+        let layout = match recorded {
+            Some(key) => {
+                let [a, b, c] = key.color.map(word);
+                let bases = [a, b, c, word(key.aux)];
+                let size = (key.width, key.height);
+                TileLayout::new(bases, size, key.stride, key.aux_stride, words)
+            }
+            None => {
+                let [a, b, c] = fbi.rgboffs.map(word);
+                let bases = [a, b, c, word(fbi.auxoffs)];
+                let size = (fbi.width, fbi.height);
+                TileLayout::new(bases, size, fbi.stride, fbi.aux_stride, words)
+            }
+        };
         if layout != self.backlog.borrow().layout {
             self.release_backlog();
             self.backlog.borrow_mut().layout = layout;
@@ -1529,6 +1553,7 @@ impl Voodoo {
         if on != self.mirror.is_some() {
             self.mirror = on.then(|| Box::new(mirror::Mirror::new()));
             self.release_backlog();
+            self.update_tiles();
             // A renderer starting over has none of the picture.
             self.scanout_sent = [None; 2];
             self.display_dirty = true;
@@ -1567,6 +1592,8 @@ impl Voodoo {
         if let Some(mirror) = &mut self.mirror {
             mirror.resync(snapshot, key);
         }
+        // A Banshee's tiles follow the recording's buffers.
+        self.update_tiles();
     }
 
     /// The layout the drawing is in now, `old` the one recorded last.

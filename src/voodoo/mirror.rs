@@ -223,7 +223,7 @@ pub fn span(stride: Stride, height: u32) -> usize {
 }
 
 /// The column and row of the pixel `at` words from a buffer's first.
-fn pixel_at(stride: Stride, at: usize) -> Option<(u32, u32)> {
+pub fn pixel_at(stride: Stride, at: usize) -> Option<(u32, u32)> {
     if stride.words == 0 {
         return None;
     }
