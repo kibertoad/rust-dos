@@ -1129,11 +1129,12 @@ macro_rules! variants {
 
 // V0-V7 are the pipelines of Quake's 3dfx renderers (lightmapped textures
 // in two units, blended or not, and the untextured ones), which other
-// Glide games share. V8 and V9 fix the two states observed in a 60-batch
-// Oni main-menu capture. C0 and C1 are 3dfx's OpenGL driver (`3DFXVGL.DLL`)
+// Glide games share. C0 and C1 are 3dfx's OpenGL driver (`3DFXVGL.DLL`)
 // with one texture, which it gives TMU 1 while TMU 0 passes its colour
 // on: the texture times the iterated colour, with the iterated alpha or
-// the texture's times it. Oni draws its menu and its levels with these.
+// the texture's times it. Oni draws with these. V8 and V9 fix all the
+// stage bits of the two states of C1 and C0 a 60-batch capture of Oni's
+// main menu drew with, and take those states before them.
 variants! {
     V0: 2, full[0x90110, 0x0D42_0009, 0x0004_0400, 0, 0x8C26_1A0F, 0x8422_1C0F];
     V1: 2, full[0x90110, 0x0D42_0009, 0x0000_6010, 0, 0x8C26_130F, 0x8422_1C0F];
@@ -1532,19 +1533,18 @@ mod tests {
         };
         for regs in states {
             let st = two_unit_state(regs);
-            let combine_only = [C0::FIXED, C1::FIXED];
-            let v = combine_only
-                .iter()
-                .position(|fixed| {
+            // V8 and V9 take some of these states in `variant`: draw them
+            // with the combine-only variant that fits them as well.
+            assert!(variant(&st, 2).is_some(), "no variant for {regs:08X?}");
+            let v = [VariantId::C0, VariantId::C1]
+                .map(|id| id as usize)
+                .into_iter()
+                .find(|&i| {
                     regs.iter()
-                        .zip(fixed)
-                        .all(|(r, (mask, value))| r & mask == *value)
-                })
-                .map(|i| FIRST_COMBINE + i);
-            assert!(
-                v.is_some_and(|i| combine_only.contains(&VARIANTS[i].1)),
-                "no combine-only variant for {regs:08X?}"
-            );
+                        .zip(VARIANTS[i].1)
+                        .all(|(r, (mask, value))| r & mask == value)
+                });
+            assert!(v.is_some(), "no combine-only variant for {regs:08X?}");
             let generic = two_unit_state(regs);
             let (mut a, mut b) = (0, 0);
             let (mut sa, mut sb) = (Stats::default(), Stats::default());

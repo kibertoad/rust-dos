@@ -436,6 +436,6 @@ observation length, which defaults to 60 batches of 1,600,000 guest
 instructions. The output contains `voodoo-states.json` and
 `last-frame.png`. Each key fixes the same register bits as a full software
 variant. The report includes the selected pipeline, submitted triangle
-count and unclipped projected area. These are usage counts, not shaded
-pixels, CPU time or a game performance comparison. Inspect the picture
-to establish which part of the game the counts cover.
+count and unclipped projected area. They count submissions: shaded
+pixels, CPU time and the game's speed aren't measured. Inspect the
+picture to establish which part of the game the counts cover.

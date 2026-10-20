@@ -1,6 +1,7 @@
 //! Saved-game state usage, collected on the emulation thread in tests.
-//! Normal builds have no collector or calls into it. Projected area is
-//! unclipped triangle area, not pixel work or a timing measurement.
+//! Normal builds have no collector or calls into it. Projected area sums
+//! the triangles' screen areas before clipping and the per-pixel tests,
+//! and nothing here is timed.
 
 use super::RasterState;
 use std::cell::RefCell;
@@ -79,7 +80,7 @@ impl Drop for Capture {
 /// RUST_DOS_VOODOO_STATE is read-only. PROFILE_DIR must already contain a
 /// scratch copy named run.C.img; loading can revert and write that copy.
 /// BATCHES and INSTRUCTIONS select the observation length. This collects
-/// submitted states and a final picture, not benchmark timings.
+/// the submitted states and a final picture, with no timings.
 #[test]
 #[ignore = "requires a saved Voodoo scene and a separate scratch disk"]
 fn profile_saved_voodoo_scene() {
@@ -98,6 +99,9 @@ fn profile_saved_voodoo_scene() {
         .canonicalize()
         .expect("scratch disk copy");
     assert_ne!(dir, path.canonicalize().unwrap().parent().unwrap());
+    // The load writes the scratch disk: never the state's own copy.
+    let sidecar = crate::savestate::disks::copy_path(&path, crate::disk::DRIVE_C);
+    assert_ne!(Some(&scratch), sidecar.canonicalize().ok().as_ref());
     let (header, state) = slots::decode(&fs::read(&path).unwrap()).unwrap();
     let mut settings = slots::machine_settings(&header.machine, &Default::default());
     settings.voodoo.renderer = crate::voodoo::Renderer::Software;
@@ -109,6 +113,7 @@ fn profile_saved_voodoo_scene() {
         .push((crate::disk::DRIVE_C, scratch.clone()));
     crate::savestate::disks::offer_copies(&mut cpu, &path);
     machine::load(&mut cpu, &state).unwrap();
+    crate::savestate::disks::withdraw(&mut cpu);
     let disk = cpu
         .bus
         .disk
@@ -134,7 +139,6 @@ fn profile_saved_voodoo_scene() {
         cpu.bus.start_batch(cpu.bus.clock.icount + instructions);
         run_batch(&mut cpu, &mut NoHook, false);
         cpu.bus.sync_display();
-        cpu.bus.voodoo.as_mut().unwrap().frame_buffer();
     }
     let mut counts: Vec<_> = capture.finish().into_iter().collect();
     assert!(!counts.is_empty(), "the scene submitted no triangles");
@@ -169,7 +173,7 @@ fn profile_saved_voodoo_scene() {
         "instructions_per_batch": instructions,
         "triangles": triangles,
         "generic_triangles": generic,
-        "area_unit": "unclipped projected triangle area, not shaded pixels",
+        "area_unit": "unclipped projected triangle area, before per-pixel tests",
         "states": states,
     });
     fs::write(
@@ -178,6 +182,7 @@ fn profile_saved_voodoo_scene() {
     )
     .unwrap();
     let card = cpu.bus.voodoo.as_mut().unwrap();
+    card.frame_buffer();
     card.prepare_display();
     let (width, height) = card.size();
     let mut picture = crate::video::Frame::new(width, height);

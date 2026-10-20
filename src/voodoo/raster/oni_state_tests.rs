@@ -7,18 +7,26 @@ fn menu_full_variants_preserve_dynamic_registers_and_combine_output() {
         (VariantId::V8 as usize, VariantId::C1 as usize),
         (VariantId::V9 as usize, VariantId::C0 as usize),
     ] {
-        for (fbz, reference) in [
+        // V8 and V9 have the depth and alpha tests off, so the bits they
+        // leave to the triangle that still draw differently are the
+        // writes (9, 10), the chroma key (1), the alpha mask (13) and the
+        // Y origin (17). The chroma key cases use a Voodoo2 range (union
+        // of blue up to 0x80, green 0, red 0), which some texels fall in.
+        let range = 1 << 28 | 1 << 27 | 0x80;
+        for (fbz, chroma_range) in [
             (0x843E1, 0),
-            (0x843E1 ^ 0x600, 64),
-            (0x843E1 ^ 0xE0, 128),
-            (0x843E1 ^ 0x20000, 255),
+            (0x843E1 ^ 0x600, 0),
+            (0x843E1 | 0x2, range),
+            (0x843E1 | 0x2002, range),
+            (0x843E1 ^ 0x20000, 0),
         ] {
             let mut regs = VARIANTS[full].1.map(|(_, value)| value);
             regs[0] = fbz;
-            regs[2] |= reference << 24;
-            let selected = two_unit_state(regs);
-            let previous = two_unit_state(regs);
-            let generic = two_unit_state(regs);
+            let state = || RasterState {
+                chroma_range,
+                ..two_unit_state(regs)
+            };
+            let (selected, previous, generic) = (state(), state(), state());
             assert_eq!(variant(&selected, 2), Some(full));
             let p = TriParams {
                 startr: 100 << 12,
@@ -45,6 +53,7 @@ fn menu_full_variants_preserve_dynamic_registers_and_combine_output() {
                 (stipple, stats)
             };
             let expected = run(&generic, None);
+            assert!(chroma_range == 0 || expected.1.chroma_fail > 0);
             assert_eq!(run(&selected, Some(full)), expected);
             assert_eq!(run(&previous, Some(combine)), expected);
             for i in 0..selected.fb.len() {
