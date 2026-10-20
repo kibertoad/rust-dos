@@ -1,5 +1,6 @@
 use super::tests::two_unit_state;
 use super::*;
+use crate::voodoo::setup::render_triangle;
 use crate::voodoo::workers::{Job, Pool};
 
 fn parameters() -> TriParams {
@@ -24,13 +25,14 @@ fn parameters() -> TriParams {
 
 #[test]
 fn indexed_scanlines_preserve_generic_output_counters_and_stipple() {
-    for &(count, fixed) in VARIANTS {
+    for (k, &(count, fixed)) in VARIANTS.iter().enumerate() {
         let mut regs = fixed.map(|(_, value)| value);
         // Writes and the always-pass depth comparison remain dynamic.
         regs[0] |= 3 << 9 | 7 << 5;
         let selected = two_unit_state(regs);
         let generic = two_unit_state(regs);
         let index = variant(&selected, count).unwrap();
+        assert_eq!(index, k, "an earlier variant takes variant {k}'s state");
         let p = parameters();
         let (mut a, mut b) = (0x12345678, 0x12345678);
         let (mut sa, mut sb) = (Stats::default(), Stats::default());
@@ -66,26 +68,32 @@ fn invalid_variant_indices_keep_the_generic_fallback() {
 
 #[test]
 fn worker_dispatch_matches_whole_triangle_drawing() {
-    let mut generic = VARIANTS[0].1.map(|(_, value)| value);
+    let mut generic = V0::FIXED.map(|(_, value)| value);
     generic[0] ^= 1 << 20;
     for mut regs in [
-        VARIANTS[0].1.map(|(_, value)| value),
-        VARIANTS[8].1.map(|(_, value)| value),
+        V0::FIXED.map(|(_, value)| value),
+        C0::FIXED.map(|(_, value)| value),
         generic,
     ] {
         regs[0] |= 3 << 9 | 7 << 5;
         let reference = two_unit_state(regs);
-        let framebuffer = reference.fb.clone();
         let p = parameters();
         let verts = [(0.0, 0.0), (0.0, 16.0), (32.0, 16.0)];
-        let mut expected = Stats::default();
-        Job::Triangle {
-            st: reference,
-            p,
-            verts,
-            texcount: 2,
-        }
-        .run_all(&mut 0, &mut expected);
+        let (mut stipple, mut expected) = (0, Stats::default());
+        // The generic scanlines, so a wrong selection in `Job` shows.
+        render_triangle(verts, |y, x0, x1| {
+            scanline_as(
+                None,
+                2,
+                &reference,
+                &p,
+                y,
+                x0,
+                x1,
+                &mut stipple,
+                &mut expected,
+            );
+        });
         for workers in [0, 1, 4] {
             let st = two_unit_state(regs);
             let output = st.fb.clone();
@@ -99,7 +107,7 @@ fn worker_dispatch_matches_whole_triangle_drawing() {
             pool.flush();
             assert_eq!(pool.stats(), expected, "workers={workers}");
             assert!(
-                (0..output.len()).all(|i| output.get(i) == framebuffer.get(i)),
+                (0..output.len()).all(|i| output.get(i) == reference.fb.get(i)),
                 "workers={workers}"
             );
         }

@@ -1,9 +1,8 @@
-use super::{
-    AM_FIXED, CP_FIXED, FBZ_FIXED, FIRST_COMBINE, TC_FIXED, VARIANT_COUNTS, variant_index,
-};
+use super::{FIRST_COMBINE, VARIANT_COUNTS, variant_index};
 
-/// The two mask families have distinct keys. Match their fixed bits once
-/// instead of walking the list of variants for each triangle.
+/// The two mask families have distinct keys: the registers' fixed bits
+/// under the masks of `full` or `combine_only`, so a variant's key is its
+/// `FIXED` values and a triangle's is its registers under the same masks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Key {
     Full(usize, [u32; 6]),
@@ -13,29 +12,14 @@ pub(super) enum Key {
 impl Key {
     #[inline]
     pub(super) const fn full(tmus: usize, regs: [u32; 6]) -> Self {
-        Self::Full(
-            tmus,
-            [
-                regs[0] & FBZ_FIXED,
-                regs[1] & CP_FIXED,
-                regs[2] & AM_FIXED,
-                regs[3],
-                if tmus >= 1 { regs[4] } else { 0 },
-                if tmus >= 2 { regs[5] } else { 0 },
-            ],
-        )
+        let f = super::full(tmus, regs);
+        Self::Full(tmus, [f[0].1, f[1].1, f[2].1, f[3].1, f[4].1, f[5].1])
     }
 
     #[inline]
     pub(super) const fn combine_only(tmus: usize, regs: [u32; 3]) -> Self {
-        Self::Combine(
-            tmus,
-            [
-                regs[0] & CP_FIXED,
-                if tmus >= 1 { regs[1] & TC_FIXED } else { 0 },
-                if tmus >= 2 { regs[2] & TC_FIXED } else { 0 },
-            ],
-        )
+        let f = super::combine_only(tmus, regs);
+        Self::Combine(tmus, [f[1].1, f[4].1, f[5].1])
     }
 }
 

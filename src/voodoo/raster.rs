@@ -1023,13 +1023,15 @@ const CP_FIXED: u32 = 0x13FF_FFFF;
 /// `CP_FIXED` say, and all of fogMode and the textureMode of the units
 /// used.
 const fn full(tmus: usize, [fbz, cp, am, fog, t0, t1]: [u32; 6]) -> [(u32, u32); 6] {
+    let t0_fixed = if tmus >= 1 { u32::MAX } else { 0 };
+    let t1_fixed = if tmus >= 2 { u32::MAX } else { 0 };
     [
         (FBZ_FIXED, fbz & FBZ_FIXED),
         (CP_FIXED, cp & CP_FIXED),
         (AM_FIXED, am & AM_FIXED),
         (u32::MAX, fog),
-        (if tmus >= 1 { u32::MAX } else { 0 }, t0),
-        (if tmus >= 2 { u32::MAX } else { 0 }, t1),
+        (t0_fixed, t0 & t0_fixed),
+        (t1_fixed, t1 & t1_fixed),
     ]
 }
 
@@ -1043,13 +1045,15 @@ const TC_FIXED: u32 = 0x3FFF_F000;
 /// difference, so one of these covers the depth, blending and fog settings
 /// a game draws a colour path with.
 const fn combine_only(tmus: usize, [cp, t0, t1]: [u32; 3]) -> [(u32, u32); 6] {
+    let t0_fixed = if tmus >= 1 { TC_FIXED } else { 0 };
+    let t1_fixed = if tmus >= 2 { TC_FIXED } else { 0 };
     [
         (0, 0),
         (CP_FIXED, cp & CP_FIXED),
         (0, 0),
         (0, 0),
-        (if tmus >= 1 { TC_FIXED } else { 0 }, t0 & TC_FIXED),
-        (if tmus >= 2 { TC_FIXED } else { 0 }, t1 & TC_FIXED),
+        (t0_fixed, t0 & t0_fixed),
+        (t1_fixed, t1 & t1_fixed),
     ]
 }
 
@@ -1145,17 +1149,7 @@ variants! {
 /// The variant a triangle with `texcount` units and `st`'s registers can be
 /// drawn with: one whose fixed bits the registers have.
 pub fn variant(st: &RasterState, texcount: usize) -> Option<usize> {
-    let tmus = texcount.min(2);
-    if VARIANT_COUNTS & (1 << tmus) == 0 {
-        return None;
-    }
-    let tex = |i: usize| {
-        if i < tmus {
-            st.tmu[i].as_ref().map_or(0, |t| t.mode)
-        } else {
-            0
-        }
-    };
+    let tex = |i: usize| st.tmu[i].as_ref().map_or(0, |t| t.mode);
     let regs = [
         st.fbz_mode,
         st.fbz_color_path,
@@ -1164,7 +1158,7 @@ pub fn variant(st: &RasterState, texcount: usize) -> Option<usize> {
         tex(0),
         tex(1),
     ];
-    dispatch::variant(regs, tmus)
+    dispatch::variant(regs, texcount)
 }
 
 /// The screen row scanline `y` draws into: flipped with the Y origin at

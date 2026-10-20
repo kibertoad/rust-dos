@@ -8,7 +8,7 @@ use rust_dos::voodoo::{Board, Now, Voodoo};
 use std::hint::black_box;
 use std::sync::Arc;
 
-fn two_unit_state(regs: [u32; 6]) -> RasterState {
+pub fn two_unit_state(regs: [u32; 6]) -> RasterState {
     let lookup: Arc<[u32]> = (0..0x10000u32)
         .map(|i| i.wrapping_mul(0x9E37_79B9))
         .collect();
