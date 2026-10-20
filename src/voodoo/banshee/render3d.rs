@@ -13,9 +13,11 @@
 //! and vid_voodoo_banshee.c (Sarah Walker, GPLv2) and sections 5 and 8
 //! of 3dfx's Voodoo3 specification.
 
+use super::super::mirror::{LayoutKey, span};
 use super::super::raster::Stride;
 use super::super::regs::*;
 use super::super::{Effect, NONE, Now, PendingSwap, Voodoo};
+use super::{VID_DESKTOP_START_ADDR, VID_PROC_CFG, VIDPROC_OVERLAY_ENABLE};
 
 // The card's registers where a Voodoo2 has its command FIFO's and some
 // of its init registers (dword numbers in the 3D space).
@@ -157,6 +159,77 @@ impl Voodoo {
         self.update_tiles();
     }
 
+    /// The buffers the OpenGL renderer's recording keeps (`mirror_sync`),
+    /// `old` the layout recorded last. A program swaps by moving
+    /// colBufferAddr between two or three buffers, so those drawn into
+    /// lately stay in the layout beside colBufferAddr's, and a swap
+    /// doesn't make the recording start over from memory: up to three,
+    /// the oldest dropped first, while they keep their size and stride
+    /// and stay apart from colBufferAddr's buffer and the auxiliary one.
+    /// The buffers are as wide as their stride and as high as the
+    /// desktop, which is as much as the video processor shows of them
+    /// unscaled; the card has no register for their height.
+    pub(crate) fn banshee_mirror_key(&self, old: Option<&LayoutKey>) -> LayoutKey {
+        let fbi = &self.fbi;
+        let width = (fbi.stride.pixels() as u32).clamp(1, 2048);
+        let height = self
+            .banshee
+            .as_ref()
+            .map_or(1, |b| b.desktop_size().1)
+            .clamp(1, 2048);
+        let col = fbi.rgboffs[0];
+        let key = LayoutKey {
+            width,
+            height,
+            stride: fbi.stride,
+            aux_stride: fbi.aux_stride,
+            color: [col, NONE, NONE],
+            aux: fbi.auxoffs,
+        };
+        let same = |o: &&LayoutKey| {
+            (o.width, o.height, o.stride, o.aux_stride, o.aux)
+                == (width, height, fbi.stride, fbi.aux_stride, fbi.auxoffs)
+        };
+        let Some(old) = old.filter(same) else {
+            return key;
+        };
+        if old.color.contains(&col) {
+            return *old;
+        }
+        let bytes = 2 * span(fbi.stride, height) as u64;
+        let aux_bytes = 2 * span(fbi.aux_stride, height) as u64;
+        let apart = |a: u32, a_len: u64, b: u32, b_len: u64| {
+            a as u64 + a_len <= b as u64 || b as u64 + b_len <= a as u64
+        };
+        let mut color = [NONE; 3];
+        let mut n = 0;
+        for c in old.color {
+            if c != NONE && apart(c, bytes, col, bytes) && apart(c, bytes, fbi.auxoffs, aux_bytes) {
+                color[n] = c;
+                n += 1;
+            }
+        }
+        if n == 3 {
+            color.rotate_left(1);
+            n = 2;
+        }
+        color[n] = col;
+        LayoutKey { color, ..key }
+    }
+
+    /// The colour buffer of the recording (its word offset) the video
+    /// processor shows: the overlay's, which a swap points at
+    /// leftOverlayBuf, while the overlay is on, or else the desktop's.
+    pub(crate) fn banshee_mirror_front(&self, key: &LayoutKey) -> Option<u32> {
+        let b = self.banshee.as_ref()?;
+        let addr = if b.reg(VID_PROC_CFG) & VIDPROC_OVERLAY_ENABLE != 0 {
+            b.overlay_addr
+        } else {
+            b.reg(VID_DESKTOP_START_ADDR)
+        };
+        key.color.contains(&addr).then_some(addr / 2)
+    }
+
     /// swapbufferCMD: the overlay shows leftOverlayBuf, now or with bit 0
     /// at the retrace `bits 8:1` retraces after the last swap, and the
     /// swap counts off swapPending's count then (86Box's
@@ -225,6 +298,8 @@ impl Voodoo {
         let base = self.reg[0x100 + TEX_BASE_ADDR] & 0xFF_FFF0;
         let addr = base.wrapping_add(offset & 0x1F_FFFC);
         super::blit2d::write(&self.fbi.ram, addr, 4, data, self.fbi.mask);
+        let addr = addr & self.fbi.mask;
+        self.mirror_memory(addr, addr + 4);
     }
 
     /// For the debugger: where the 3D engine draws and what it shows.
@@ -421,6 +496,168 @@ mod tests {
         swap(&mut v, 1 << 1 | 1);
         let due = v.next_event().expect("the swap waits for a retrace");
         assert!(due - now.ticks < PIT_HZ / 30);
+    }
+
+    /// A card recording for the OpenGL renderer, a desktop of 64 rows on
+    /// and the linear frame buffer untiled.
+    fn mirrored() -> Voodoo {
+        let mut v = card();
+        let now = Now::default();
+        v.write(VGA_INIT0, VGAINIT0_EXTENDED_SHIFT_OUT, u32::MAX, now);
+        v.write(VID_PROC_CFG, VIDPROC_ENABLE | 1 << 18, u32::MAX, now);
+        v.write(LFB_MEMORY_CONFIG, 0x1FFF, u32::MAX, now);
+        v.banshee.as_mut().unwrap().crtc[0x12] = 63;
+        reg3d(&mut v, FBZ_MODE, 1 << 9);
+        v.set_mirror(true);
+        v
+    }
+
+    fn snapshots(frame: &Frame) -> Vec<&Snapshot> {
+        let resyncs = frame.commands.iter().filter_map(|c| match c {
+            Command::Resync(s) => Some(&**s),
+            _ => None,
+        });
+        resyncs.collect()
+    }
+
+    fn pixels(frame: &Frame) -> Vec<&Pixels> {
+        let rows = frame.commands.iter().filter_map(|c| match c {
+            Command::Pixels(p) => Some(p),
+            _ => None,
+        });
+        rows.collect()
+    }
+
+    use super::super::super::mirror::{Command, Frame, Pixels, Snapshot};
+    use super::super::{LFB_MEMORY_CONFIG, VGA_INIT0, VGAINIT0_EXTENDED_SHIFT_OUT, VIDPROC_ENABLE};
+
+    #[test]
+    fn the_recording_reads_tiled_buffers() {
+        let mut v = mirrored();
+        // Colour at 1 MB in rows of 10 tiles (640 pixels), depth at 2 MB
+        // linear, 1280 bytes a row.
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x10_0000);
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+        reg3d(&mut v, AUX_BUFFER_ADDR, 0x20_0000);
+        reg3d(&mut v, AUX_BUFFER_STRIDE, 1280);
+        // Pixel (65, 33): tile 1 of the second row of tiles, row 1 in it.
+        v.fbi.ram.set(0x10_0000 / 2 + 10 * 2048 + 2048 + 64 + 1, 0xF800);
+        v.fbi.ram.set(0x20_0000 / 2 + 33 * 640 + 65, 0x1234);
+        let frame = v.take_mirror().unwrap();
+        let [snapshot] = snapshots(&frame)[..] else { panic!("one snapshot") };
+        let layout = &snapshot.layout;
+        assert_eq!((layout.width, layout.height), (640, 64));
+        assert_eq!(layout.color, [0x10_0000 / 2]);
+        assert_eq!(snapshot.color[0][33 * 640 + 65], 0xF800);
+        assert_eq!(snapshot.color[0][33 * 640 + 64], 0);
+        assert_eq!(snapshot.aux.as_ref().unwrap()[33 * 640 + 65], 0x1234);
+    }
+
+    #[test]
+    fn swapping_between_buffers_keeps_the_recording() {
+        let mut v = mirrored();
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+        reg3d(&mut v, AUX_BUFFER_ADDR, 0x40_0000);
+        reg3d(&mut v, AUX_BUFFER_STRIDE, 1 << 15 | 10);
+        // Draw into a buffer, show it through the overlay, draw into the
+        // other, as a program double buffering does.
+        let (a, b) = (0x10_0000, 0x20_0000);
+        let mut frames = Vec::new();
+        for draw in [a, b, a, b] {
+            reg3d(&mut v, COL_BUFFER_ADDR, draw);
+            rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
+            reg3d(&mut v, LEFT_OVERLAY_BUF, draw);
+            reg3d(&mut v, SWAPBUFFER_CMD, 0);
+            frames.push(v.take_mirror().unwrap());
+        }
+        // The second buffer joins the layout once; then nothing starts
+        // over from memory.
+        let counts: Vec<usize> = frames.iter().map(|f| snapshots(f).len()).collect();
+        assert_eq!(counts, [1, 1, 0, 0]);
+        assert_eq!(snapshots(&frames[1])[0].layout.color, [a / 2, b / 2]);
+        // Without the overlay on, the desktop's buffer is the one shown.
+        assert_eq!(frames[3].front, None);
+        let cfg = VIDPROC_ENABLE | 1 << 18 | VIDPROC_OVERLAY_ENABLE;
+        v.write(VID_PROC_CFG, cfg, u32::MAX, Now::default());
+        assert_eq!(v.take_mirror().unwrap().front, Some(b / 2));
+        v.write(VID_DESKTOP_START_ADDR, a, u32::MAX, Now::default());
+        v.write(VID_PROC_CFG, VIDPROC_ENABLE | 1 << 18, u32::MAX, Now::default());
+        assert_eq!(v.take_mirror().unwrap().front, Some(a / 2));
+        // A third buffer joins, a fourth drops the oldest.
+        for (draw, expect) in [(0x30_0000, [a, b, 0x30_0000]), (0x50_0000, [b, 0x30_0000, 0x50_0000])] {
+            reg3d(&mut v, COL_BUFFER_ADDR, draw);
+            rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
+            let frame = v.take_mirror().unwrap();
+            assert_eq!(snapshots(&frame)[0].layout.color, expect.map(|c| c / 2));
+        }
+        // One that overlaps a buffer replaces it.
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x30_0000 + 0x8000);
+        rectangle(&mut v, (0.0, 0.0, 8.0, 8.0), (255.0, 0.0, 0.0));
+        let frame = v.take_mirror().unwrap();
+        assert_eq!(snapshots(&frame)[0].layout.color, [b / 2, 0x50_0000 / 2, 0x30_8000 / 2]);
+    }
+
+    #[test]
+    fn writes_past_the_3d_engine_reach_the_recording() {
+        use super::super::LINEAR;
+        let mut v = mirrored();
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x10_0000);
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1280);
+        reg3d(&mut v, AUX_BUFFER_ADDR, 0x20_0000);
+        reg3d(&mut v, AUX_BUFFER_STRIDE, 1 << 15 | 10);
+        v.take_mirror();
+        // The CPU through BAR1: pixels (2, 3) and (3, 3) of the colour
+        // buffer, then (65, 33) of the tiled depth.
+        let now = Now::default();
+        v.write(LINEAR + 0x10_0000 + 3 * 1280 + 4, 0x07E0_F800, u32::MAX, now);
+        let depth = 0x20_0000 + 2 * (10 * 2048 + 2048 + 64);
+        v.write(LINEAR + depth, 0x4321_FFFF, 0xFFFF_0000, now);
+        let frame = v.take_mirror().unwrap();
+        let rows = pixels(&frame);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].dest, rows[0].x, rows[0].y), (Some(0x10_0000 / 2), 2, 3));
+        assert_eq!(rows[0].values, [0xF800, 0x07E0]);
+        assert_eq!((rows[1].dest, rows[1].x, rows[1].y), (None, 65, 33));
+        assert_eq!(rows[1].values, [0x4321]);
+        // Memory elsewhere isn't any of the buffers' pixels.
+        v.write(LINEAR + 0x30_0000, 1, u32::MAX, now);
+        assert!(pixels(&v.take_mirror().unwrap()).is_empty());
+
+        // The 2D engine: a rectangle of 4x3 at (1, 2) in the colour
+        // buffer, whose rows go to the recording whole.
+        let reg2d = |v: &mut Voodoo, reg: u32, data: u32| v.write(0x10_0000 + reg, data, u32::MAX, now);
+        reg2d(&mut v, 0x14, 3 << 16 | 1280);
+        reg2d(&mut v, 0x10, 0x10_0000);
+        reg2d(&mut v, 0x08, 0);
+        reg2d(&mut v, 0x0C, 0x0FFF_0FFF);
+        reg2d(&mut v, 0x64, 0x001F);
+        reg2d(&mut v, 0x68, 3 << 16 | 4);
+        reg2d(&mut v, 0x6C, 2 << 16 | 1);
+        reg2d(&mut v, 0x70, 0xCC << 24 | 1 << 8 | 5);
+        let frame = v.take_mirror().unwrap();
+        let rows = pixels(&frame);
+        let covered: Vec<u32> = rows.iter().map(|p| p.y).collect();
+        assert_eq!(covered, [2, 3, 4]);
+        assert!(rows.iter().all(|p| p.x == 0 && p.values.len() == 640));
+        assert_eq!(rows[0].values[1..6], [0x001F, 0x001F, 0x001F, 0x001F, 0]);
+    }
+
+    #[test]
+    fn pipeline_writes_are_recorded_from_a_tiled_buffer() {
+        let mut v = mirrored();
+        reg3d(&mut v, COL_BUFFER_ADDR, 0x10_0000);
+        reg3d(&mut v, COL_BUFFER_STRIDE, 1 << 15 | 10);
+        v.take_mirror();
+        // 5-6-5 through the pixel pipeline: pixel (64, 33).
+        reg3d(&mut v, LFB_MODE, 1 << 8);
+        let offset = 0x100_0000 + 33 * 4096 + 64 * 2;
+        v.write(offset, 0xF800, 0x0000_FFFF, Now::default());
+        assert_eq!(v.fbi.ram.get(0x10_0000 / 2 + 10 * 2048 + 2048 + 64), 0xF800);
+        let frame = v.take_mirror().unwrap();
+        let rows = pixels(&frame);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].dest, rows[0].x, rows[0].y), (Some(0x10_0000 / 2), 64, 33));
+        assert_eq!(rows[0].values, [0xF800]);
     }
 
     #[test]

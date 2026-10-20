@@ -788,6 +788,9 @@ impl Voodoo {
         if std::mem::take(&mut b.engine.drawn) {
             self.display_dirty = true;
         }
+        if let Some((start, end)) = b.engine.touched.take() {
+            self.mirror_memory(start, end);
+        }
     }
 
     /// A write through BAR1: into the memory, through the tiles, and into
@@ -825,6 +828,10 @@ impl Voodoo {
             self.banshee_fifo_written(addr, now, effect);
         } else {
             self.display_dirty = true;
+            // The bytes written, first to last.
+            let addr = addr & fbmask;
+            let (first, last) = (mask.trailing_zeros() / 8, 4 - mask.leading_zeros() / 8);
+            self.mirror_memory(addr + first, addr + last);
         }
     }
 }

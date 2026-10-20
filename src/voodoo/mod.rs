@@ -1537,57 +1537,109 @@ impl Voodoo {
     /// since it last did, or it wants them.
     pub(crate) fn mirror_sync(&mut self) {
         let Some(mirror) = &self.mirror else { return };
-        let fbi = &self.fbi;
-        let key = mirror::LayoutKey { width: fbi.width, height: fbi.height, rowpixels: fbi.rowpixels, color: fbi.rgboffs, aux: fbi.auxoffs };
+        let key = self.mirror_key(mirror.layout());
         if !mirror.needs_snapshot(&key) {
             return;
         }
         self.flush();
-        let snapshot = self.snapshot(self.mirror_layout());
+        let snapshot = self.snapshot(key.layout());
         if let Some(mirror) = &mut self.mirror {
             mirror.resync(snapshot, key);
         }
     }
 
-    fn mirror_layout(&self) -> mirror::Layout {
+    /// The layout the drawing is in now, `old` the one recorded last.
+    fn mirror_key(&self, old: Option<&mirror::LayoutKey>) -> mirror::LayoutKey {
+        if self.banshee.is_some() {
+            return self.banshee_mirror_key(old);
+        }
         let fbi = &self.fbi;
-        mirror::Layout {
+        mirror::LayoutKey {
             width: fbi.width,
             height: fbi.height,
-            rowpixels: fbi.rowpixels,
-            color: fbi.rgboffs.iter().filter(|&&offs| offs != NONE).map(|&offs| offs / 2).collect(),
-            aux: (fbi.auxoffs != NONE).then_some(fbi.auxoffs / 2),
+            stride: fbi.stride,
+            aux_stride: fbi.aux_stride,
+            color: fbi.rgboffs,
+            aux: fbi.auxoffs,
         }
     }
 
     fn snapshot(&self, layout: mirror::Layout) -> mirror::Snapshot {
         let ram = &self.fbi.ram;
-        let (width, height, rowpixels) = (layout.width as usize, layout.height as usize, layout.rowpixels as usize);
-        let pixels = |base: u32| -> Vec<u16> {
+        let (width, height) = (layout.width as usize, layout.height as usize);
+        let pixels = |base: u32, stride: raster::Stride| -> Vec<u16> {
             let mut out = Vec::with_capacity(width * height);
             for y in 0..height {
-                let row = base as usize + y * rowpixels;
-                out.extend((row..row + width).map(|at| if at < ram.len() { ram.get(at) } else { 0 }));
+                let row = base as usize + stride.row(y);
+                out.extend((0..width).map(|x| {
+                    let at = row + stride.col(x);
+                    if at < ram.len() { ram.get(at) } else { 0 }
+                }));
             }
             out
         };
-        mirror::Snapshot { color: layout.color.iter().map(|&offs| pixels(offs)).collect(), aux: layout.aux.map(pixels), layout }
+        mirror::Snapshot {
+            color: layout.color.iter().map(|&offs| pixels(offs, layout.stride)).collect(),
+            aux: layout.aux.map(|offs| pixels(offs, layout.aux_stride)),
+            layout,
+        }
     }
 
     /// The drawing recorded since the last frame, and what the card shows.
     pub fn take_mirror(&mut self) -> Option<mirror::Frame> {
         self.mirror_sync();
-        let front = self.fbi.rgboffs[self.fbi.frontbuf as usize];
+        let key = *self.mirror.as_ref()?.layout()?;
+        let front = match &self.banshee {
+            Some(_) => self.banshee_mirror_front(&key),
+            None => {
+                let front = self.fbi.rgboffs[self.fbi.frontbuf as usize];
+                (front != NONE).then_some(front / 2)
+            }
+        };
         let output = self.output();
         let commands = self.mirror.as_mut()?.take();
         Some(mirror::Frame {
             commands,
-            front: (front != NONE).then_some(front / 2),
+            front,
             output,
-            width: self.fbi.width,
-            height: self.fbi.height,
+            width: key.width,
+            height: key.height,
             clut: self.clut,
         })
+    }
+
+    /// Bytes `start..end` of the frame buffer were written other than
+    /// through the 3D engine (the CPU through a Banshee's linear frame
+    /// buffer, its 2D engine, a command FIFO): tell the recording the
+    /// pixels of its buffers there, from memory, which has what the 3D
+    /// engine drew before (the writers catch up first).
+    pub(crate) fn mirror_memory(&mut self, start: u32, end: u32) {
+        let Some(mirror) = &mut self.mirror else { return };
+        // With no layout yet, the next snapshot reads the memory.
+        let Some(key) = mirror.layout().copied() else { return };
+        let ram = &self.fbi.ram;
+        let word = |at: usize| if at < ram.len() { ram.get(at) } else { 0 };
+        if end.saturating_sub(start) <= 16 {
+            for at in start / 2..end.div_ceil(2) {
+                if let Some((dest, x, y)) = key.locate(at) {
+                    mirror.pixel(dest, x, y, word(at as usize), key.width);
+                }
+            }
+            return;
+        }
+        for (dest, first, last) in key.rows_in(start, end) {
+            let (base, stride) = match dest {
+                Some(offs) => (offs, key.stride),
+                None => (key.aux / 2, key.aux_stride),
+            };
+            for y in first..last {
+                let row = base as usize + stride.row(y as usize);
+                for x in 0..key.width {
+                    let value = word(row + stride.col(x as usize));
+                    mirror.pixel(dest, x, y, value, key.width);
+                }
+            }
+        }
     }
 
     /// Pixel `x` of buffer row `y` written through the frame buffer: tell
@@ -1614,10 +1666,16 @@ impl Voodoo {
             return;
         }
         let fbi = &self.fbi;
-        let at = y as usize * fbi.rowpixels as usize + x as usize;
-        let word = |offs: usize| (offs + at < fbi.ram.len()).then(|| fbi.ram.get(offs + at));
-        let color = word(dest);
-        let aux = if aux && fbi.auxoffs != NONE { word(fbi.auxoffs as usize / 2) } else { None };
+        let word = |base: usize, stride: raster::Stride| {
+            let at = base + stride.row(y as usize) + stride.col(x as usize);
+            (at < fbi.ram.len()).then(|| fbi.ram.get(at))
+        };
+        let color = word(dest, fbi.stride);
+        let aux = if aux && fbi.auxoffs != NONE {
+            word(fbi.auxoffs as usize / 2, fbi.aux_stride)
+        } else {
+            None
+        };
         self.mirror_pixel(dest, x, y, color, aux);
     }
 

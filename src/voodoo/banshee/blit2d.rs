@@ -155,6 +155,9 @@ pub struct Engine {
     rx_cur: i32,
     /// Something was drawn since the display last looked.
     pub drawn: bool,
+    /// The bytes of memory drawn into since the card last looked, first
+    /// to last (exclusive), for the OpenGL renderer's recording.
+    pub touched: Option<(u32, u32)>,
 }
 
 /// The longest row of host data: a stride of 8191 bytes and the start's
@@ -231,6 +234,7 @@ impl Default for Engine {
             lx_cur: 0,
             rx_cur: 0,
             drawn: false,
+            touched: None,
         }
     }
 }
@@ -247,6 +251,7 @@ crate::state_fields!(Engine {
     src_size_y, src_x, src_y, dst_size_x, dst_size_y, dst_x, dst_y, launch_pending, patoff_x,
     patoff_y, cur_y, src_stride_src, src_stride_dest, host_data_size_src, host_data_size_dest,
     host_data, host_data_count, lx, ly, rx, ry, dx, dy, x_inc, error, lx_cur, rx_cur, drawn,
+    touched,
 });
 
 /// The signed 13-bit x and y of an XY register.
@@ -433,6 +438,8 @@ impl Engine {
         let value = self.mix(dest, src, pattern, src_key, self.dst_key());
         write(ram, addr, bytes as u32, value, mask);
         self.drawn = true;
+        let end = addr + bytes as u32;
+        self.touched = Some(self.touched.map_or((addr, end), |(a, b)| (a.min(addr), b.max(end))));
     }
 
     /// A register of the 2D space written (at byte `addr & 1FCh`);

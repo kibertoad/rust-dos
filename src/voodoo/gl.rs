@@ -993,6 +993,7 @@ mod tests {
     fn constant_depth_comparison_writes_interpolated_depth() {
         use super::*;
         use crate::voodoo::mirror::{DrawState, Layout};
+        use crate::voodoo::raster::Stride;
         let sdl = sdl2::init().unwrap();
         let video = sdl.video().unwrap();
         let attrs = video.gl_attr();
@@ -1019,7 +1020,14 @@ mod tests {
             renderer.run(&gl, Recording {
                 commands: vec![
                     Command::Resync(Box::new(Snapshot {
-                        layout: Layout { width: 8, height: 8, rowpixels: 8, color: vec![0, 64], aux: Some(128) },
+                        layout: Layout {
+                            width: 8,
+                            height: 8,
+                            stride: Stride::linear(8),
+                            aux_stride: Stride::linear(8),
+                            color: vec![0, 64],
+                            aux: Some(128),
+                        },
                         color: vec![vec![0; 64]; 2], aux: Some(vec![0xFFFF; 64]),
                     })),
                     Command::Draw(Box::new(Draw { state, vertices })),
