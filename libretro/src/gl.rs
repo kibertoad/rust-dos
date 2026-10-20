@@ -169,7 +169,10 @@ impl Screen {
             return false;
         };
         // A Banshee's or Voodoo3's picture is its whole desktop, which the
-        // core doesn't compose with OpenGL: it draws the card in software.
+        // video processor composes. The core has no compositor for that
+        // (the desktop frontend's is `VoodooGl::compose`), so it draws the
+        // card in software. This is the core's limit, not the card's, so
+        // the check lives here and the desktop frontend has none.
         if settings.renderer != Renderer::OpenGl
             || card.banshee.is_some()
             || self.voodoo_failed.is_some()
@@ -198,7 +201,7 @@ impl Screen {
             }
         }
         let Some(recording) = card.take_mirror() else { return false };
-        let shown = recording.output && recording.front.is_some();
+        let shown = recording.shown();
         let Some(voodoo) = &mut self.voodoo else { return false };
         voodoo.run(&self.gl, recording);
         shown

@@ -749,6 +749,14 @@ mod tests {
         v.write(VID_DESKTOP_OVERLAY_STRIDE, 1280, u32::MAX, now);
         assert!(scanout(&mut v).desktop_memory.is_some());
         assert!(scanout(&mut v).desktop_memory.is_none());
+        // A recording wants the software picture too, which looks at the
+        // change first: the scanout still hears of it.
+        v.set_software_picture(true);
+        v.prepare_display();
+        v.write(LINEAR + 8, 0x0BAD_F00D, u32::MAX, now);
+        assert!(v.prepare_display());
+        let memory = scanout(&mut v).desktop_memory.unwrap();
+        assert_eq!(memory[8..12], [0x0D, 0xF0, 0xAD, 0x0B]);
     }
 
     #[test]

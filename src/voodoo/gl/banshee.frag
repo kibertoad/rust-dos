@@ -123,9 +123,10 @@ vec3 overlay(ivec2 p, vec2 f) {
     uint v0 = uint(u_ovl_step.z);
     if (u_ovl.w == 1) {
         // Where the screen pixel's part is in the source, at the
-        // buffer's resolution.
+        // buffer's resolution: from its left and top edges, as the
+        // video processor steps from a pixel's, not from its centre.
         float scale = float(u_scale);
-        vec2 from = f / scale - vec2(u_ovl_rect.xy);
+        vec2 from = floor(f) / scale - vec2(u_ovl_rect.xy);
         float u = from.x * float(dudx) / 1048576.0;
         float v = (float(v0) + from.y * float(dvdy)) / 1048576.0;
         return through(buffer_texel(u_ovl_buf, vec2(u, v) * scale), u_ovl.y, bypass);

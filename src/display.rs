@@ -354,10 +354,7 @@ impl<'a> Display<'a> {
                         self.redraw = true;
                     }
                     let Some(recording) = card.take_mirror() else { return false };
-                    // A Banshee's picture is its whole desktop, which
-                    // OpenGL composes from the scanout.
-                    let shown = recording.output
-                        && (recording.front.is_some() || recording.scanout.is_some());
+                    let shown = recording.shown();
                     match gl.run_voodoo(recording, settings.scale, settings.msaa, settings.anisotropy) {
                         Ok(changed) => {
                             // The frame `present` gets does not change with

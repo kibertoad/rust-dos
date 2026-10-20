@@ -339,7 +339,9 @@ impl Voodoo {
     /// the buffers.
     pub(crate) fn banshee_scanout(&mut self, key: &LayoutKey) -> Option<Box<Scanout>> {
         let b = self.banshee.as_deref_mut()?;
-        let dirty = std::mem::take(&mut b.dirty) | std::mem::take(&mut self.display_dirty);
+        let dirty = std::mem::take(&mut b.dirty)
+            | std::mem::take(&mut self.display_dirty)
+            | std::mem::take(&mut self.scanout_dirty);
         let b = self.banshee.as_deref()?;
         let f = b.frame();
         let buffer = |start: u32, stride: u32, tiled: bool| {

@@ -573,6 +573,10 @@ pub struct Voodoo {
     /// The first bytes of the memory a Banshee's desktop and overlay show
     /// that the renderer has (`banshee_scanout`).
     scanout_sent: [Option<u32>; 2],
+    /// A Banshee's picture changed, which the software picture took
+    /// first (`prepare_display`), so the renderer's scanout still has to
+    /// hear of it.
+    scanout_dirty: bool,
     /// Messages already logged once.
     logged: u32,
     /// Where the card's accesses are recorded (`RUST_DOS_VOODOO_RECORD`),
@@ -649,6 +653,7 @@ impl Voodoo {
             software_picture: true,
             mirror: None,
             scanout_sent: [None; 2],
+            scanout_dirty: false,
             logged: 0,
             recorder: std::cell::RefCell::new(None),
             log: Vec::new(),
@@ -1216,6 +1221,12 @@ impl Voodoo {
         if let Some(b) = &mut self.banshee {
             let dirty = std::mem::take(&mut b.dirty);
             let draw = changed || switched || dirty;
+            // The OpenGL renderer may show the picture all the same (a
+            // recording or a screenshot wants it from memory too): its
+            // scanout needs the change as well.
+            if self.mirror.is_some() {
+                self.scanout_dirty |= draw;
+            }
             // Jobs may still be drawing into what it shows. Those that draw
             // elsewhere, into the next frame, go on beside the program.
             if draw && self.writes_queue() {

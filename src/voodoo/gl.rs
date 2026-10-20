@@ -1700,26 +1700,32 @@ mod tests {
             ),
         ];
         let mut cases = cases;
-        // A 3D buffer the overlay shows, and one the desktop is.
-        let mut overlay_buffer = card(
-            1 << 18 | VIDPROC_OVERLAY_ENABLE | 1 << 21 | VIDPROC_CURSOR,
-            320,
-            Some((0, 320, [at(8, 4), at(150, 95)])),
-        );
+        // A 3D buffer the overlay shows, as it is and scaled, and one the
+        // desktop is.
         let reg3d = |v: &mut Voodoo, r: usize, value: u32| {
             v.write(0x20_0000 + 4 * r as u32, value, u32::MAX, Now::default())
         };
-        reg3d(&mut overlay_buffer, COL_BUFFER_ADDR, 0xA_0000);
-        reg3d(&mut overlay_buffer, COL_BUFFER_STRIDE, 320);
-        reg3d(&mut overlay_buffer, LEFT_OVERLAY_BUF, 0xA_0000);
-        reg3d(&mut overlay_buffer, SWAPBUFFER_CMD, 0);
-        cases.push(("5-6-5 overlay from a 3D buffer", overlay_buffer));
+        for (name, scaling) in [
+            ("5-6-5 overlay from a 3D buffer", 0),
+            ("5-6-5 overlay from a 3D buffer, scaled", scaled),
+        ] {
+            let mut overlay_buffer = card(
+                1 << 18 | VIDPROC_OVERLAY_ENABLE | 1 << 21 | VIDPROC_CURSOR | scaling,
+                320,
+                Some((0, 320, [at(8, 4), at(150, 95)])),
+            );
+            reg3d(&mut overlay_buffer, COL_BUFFER_ADDR, 0xA_0000);
+            reg3d(&mut overlay_buffer, COL_BUFFER_STRIDE, 320);
+            reg3d(&mut overlay_buffer, LEFT_OVERLAY_BUF, 0xA_0000);
+            reg3d(&mut overlay_buffer, SWAPBUFFER_CMD, 0);
+            cases.push((name, overlay_buffer));
+        }
         let mut desktop_buffer = card(1 << 18 | VIDPROC_DESKTOP_TILED, 3, None);
         reg3d(&mut desktop_buffer, COL_BUFFER_ADDR, 0x1000);
         reg3d(&mut desktop_buffer, COL_BUFFER_STRIDE, 1 << 15 | 3);
         cases.push(("tiled 5-6-5 desktop that is a 3D buffer", desktop_buffer));
 
-        let buffers = cases.len() - 2;
+        let buffers = cases.len() - 3;
         for (n, (name, mut v)) in cases.into_iter().enumerate() {
             v.set_mirror(true);
             v.set_software_picture(false);

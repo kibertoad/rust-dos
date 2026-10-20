@@ -289,6 +289,16 @@ pub struct Frame {
     pub scanout: Option<Box<Scanout>>,
 }
 
+impl Frame {
+    /// Whether the renderer's picture is the one to show: the card shows
+    /// its own output, and it is a colour buffer or a Banshee's scanout.
+    /// A frontend that can't compose a scanout never asks a Banshee to
+    /// record, so this holds for both frontends.
+    pub fn shown(&self) -> bool {
+        self.output && (self.front.is_some() || self.scanout.is_some())
+    }
+}
+
 /// A surface a Banshee's video processor shows: its first byte in the
 /// card's memory, its stride in bytes (a row's, or a row of tiles' when
 /// tiled), its pixel format (the vidProcCfg field), the CLUT half it goes
