@@ -25,7 +25,7 @@ use rust_dos::config_ui::Layer;
 use rust_dos::voodoo::{Renderer, VoodooSettings};
 use sdl2::VideoSubsystem;
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::render::{ScaleMode, Texture, TextureCreator, WindowCanvas};
+use sdl2::render::{BlendMode, ScaleMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::surface::Surface;
 use sdl2::video::{FullscreenType, Window, WindowContext, WindowPos};
 use std::cell::OnceCell;
@@ -1016,6 +1016,9 @@ fn create_texture<'a>(
     let mut texture = creator
         .create_texture_streaming(PixelFormatEnum::RGBA32, width, height)
         .map_err(|e| e.to_string())?;
+    // SDL blends textures that have alpha by default; the pictures are
+    // opaque, so they are copied as they are, as the RGB24 ones were.
+    texture.set_blend_mode(BlendMode::None);
     texture.set_scale_mode(scale_mode(filter));
     Ok(texture)
 }

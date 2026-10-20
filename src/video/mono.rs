@@ -100,7 +100,13 @@ mod tests {
     fn tinted(mono: Monochrome, pixels: &[[u8; 3]]) -> Vec<[u8; 3]> {
         let mut frame = Frame::from_rgb(pixels.len() as u32, 1, pixels.concat());
         apply(&mut frame, mono);
-        frame.rgba.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect()
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect()
     }
 
     #[test]

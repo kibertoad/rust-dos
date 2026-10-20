@@ -146,7 +146,11 @@ impl Document {
 /// Pixels with an alpha channel, on white.
 fn on_white(width: u32, height: u32, rgba: &[u8]) -> Frame {
     let mut frame = Frame::new(width, height);
-    for (rgb, p) in frame.rgba.as_chunks_mut::<4>().0.iter_mut()
+    for (rgb, p) in frame
+        .rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
         .zip(rgba.as_chunks::<4>().0.iter())
     {
         let a = p[3] as u32;
@@ -204,7 +208,11 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame, String> {
     let mut frame = Frame::new(info.width as u32, info.height as u32);
     match info.pixel_format {
         PixelFormat::RGB24 => {
-            for (out, pixel) in frame.rgba.as_chunks_mut::<4>().0.iter_mut()
+            for (out, pixel) in frame
+                .rgba
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip(pixels.as_chunks::<3>().0)
             {
                 out[..3].copy_from_slice(pixel);
@@ -216,14 +224,22 @@ fn decode_jpeg(data: &[u8]) -> Result<Frame, String> {
             }
         }
         PixelFormat::L16 => {
-            for (rgba, g) in frame.rgba.as_chunks_mut::<4>().0.iter_mut()
+            for (rgba, g) in frame
+                .rgba
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip(pixels.as_chunks::<2>().0.iter())
             {
                 *rgba = [g[0], g[0], g[0], 255];
             }
         }
         PixelFormat::CMYK32 => {
-            for (rgb, p) in frame.rgba.as_chunks_mut::<4>().0.iter_mut()
+            for (rgb, p) in frame
+                .rgba
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip(pixels.as_chunks::<4>().0.iter())
             {
                 let k = 255 - p[3] as u32;
@@ -293,8 +309,13 @@ mod tests {
 
     fn rgb(frame: &Frame) -> Vec<u8> {
         assert!(frame.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
-        frame.rgba.as_chunks::<4>().0.iter()
-            .flat_map(|&[r, g, b, _]| [r, g, b]).collect()
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect()
     }
 
     fn scratch(name: &str, data: &[u8]) -> PathBuf {

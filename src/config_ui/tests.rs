@@ -1318,7 +1318,12 @@ fn the_stats_page_draws_its_numbers_and_graphs() {
         cpu_history: vec![40.0; 120],
     });
     let has = |frame: &Frame, c: Rgb| {
-        frame.rgba.as_chunks::<4>().0.iter().any(|px| px[..3] == [c.0, c.1, c.2])
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[..3] == [c.0, c.1, c.2])
     };
     for (width, height) in [(640, 400), (640, 350), (320, 200), (1024, 768)] {
         let mut frame = Frame::new(width, height);
@@ -2430,7 +2435,10 @@ fn the_help_covers_the_pictures_and_graphs_drawn_in_pixels() {
     let mut frame = Frame::new(640, 400);
     ui.draw(&mut frame);
     // The picture's first pixel: text is never 16 white pixels in a row.
-    let white = frame.rgba.windows(64).step_by(4)
+    let white = frame
+        .rgba
+        .windows(64)
+        .step_by(4)
         .position(|run| run.iter().all(|&b| b == 0xFF))
         .expect("the slot's picture");
     ui.key(UiKey::Help, &mut host);
@@ -2442,7 +2450,15 @@ fn the_help_covers_the_pictures_and_graphs_drawn_in_pixels() {
         "the help's background"
     );
     // Below the help, the picture shows.
-    assert!(frame.rgba.as_chunks::<4>().0.iter().skip(white).any(|px| px[..3] == [0xFF; 3]));
+    assert!(
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .skip(white)
+            .any(|px| px[..3] == [0xFF; 3])
+    );
 }
 
 #[test]

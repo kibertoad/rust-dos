@@ -163,7 +163,8 @@ impl Clipboard {
         let (y0, y1) = ((r0 * g.cell_h()).min(h), ((r1 + 1) * g.cell_h()).min(h));
         for y in y0..y1 {
             for pixel in frame.rgba[(y * w + x0) * 4..(y * w + x1) * 4]
-                .as_chunks_mut::<4>().0
+                .as_chunks_mut::<4>()
+                .0
             {
                 for value in &mut pixel[..3] {
                     *value = !*value;

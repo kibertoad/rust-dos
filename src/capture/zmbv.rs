@@ -39,7 +39,9 @@ impl Encoder {
     }
 
     /// Encode the next frame (RGB24, `width` x `height`). Returns its bytes
-    /// and whether it is a keyframe.
+    /// and whether it is a keyframe. Recordings use `encode_rgba`; the
+    /// tests check it against this.
+    #[cfg(test)]
     pub fn encode(&mut self, rgb: &[u8]) -> (Vec<u8>, bool) {
         let pixels: Vec<u8> = rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [b, g, r, 0]).collect();
         self.encode_pixels(pixels)
@@ -49,8 +51,12 @@ impl Encoder {
     /// picture. ZMBV stores BGRX and ignores the input alpha channel.
     pub fn encode_rgba(&mut self, rgba: &[u8]) -> (Vec<u8>, bool) {
         assert_eq!(rgba.len(), self.width * self.height * 4);
-        let pixels = rgba.as_chunks::<4>().0.iter()
-            .flat_map(|&[r, g, b, _]| [b, g, r, 0]).collect();
+        let pixels = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [b, g, r, 0])
+            .collect();
         self.encode_pixels(pixels)
     }
 
@@ -218,9 +224,14 @@ mod tests {
         let mut new = Encoder::new(width, height);
         for frame in 0..4 {
             let rgb: Vec<u8> = (0..width * height * 3)
-                .map(|i| (i * 7 + frame * 29) as u8).collect();
-            let rgba: Vec<_> = rgb.as_chunks::<3>().0.iter()
-                .flat_map(|&[r, g, b]| [r, g, b, frame as u8]).collect();
+                .map(|i| (i * 7 + frame * 29) as u8)
+                .collect();
+            let rgba: Vec<_> = rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[r, g, b]| [r, g, b, frame as u8])
+                .collect();
             assert_eq!(new.encode_rgba(&rgba), old.encode(&rgb));
         }
     }

@@ -286,7 +286,10 @@ fn every_depth_is_drawn_pixel_for_pixel() {
                 assert_eq!(
                     (frame.rgba[i], frame.rgba[i + 1], frame.rgba[i + 2]),
                     want,
-                    "mode {:X} at {}, {}", mode, x, y
+                    "mode {:X} at {}, {}",
+                    mode,
+                    x,
+                    y
                 );
             }
         }

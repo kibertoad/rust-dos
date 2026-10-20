@@ -149,7 +149,12 @@ mod tests {
     use super::*;
 
     fn lit(frame: &Frame) -> bool {
-        frame.rgba.as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|&b| b != 0))
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[..3].iter().any(|&b| b != 0))
     }
 
     #[test]
@@ -173,7 +178,9 @@ mod tests {
         // At the top, centred.
         let row = |y: usize| {
             frame.rgba[y * 640 * 4..(y + 1) * 640 * 4]
-                .as_chunks::<4>().0.iter()
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[..3].iter().any(|&b| b != 0))
         };
         assert!(row(10) && !row(100));
@@ -197,7 +204,9 @@ mod tests {
         osd.draw_at(&mut frame, start);
         let row = |y: usize| {
             frame.rgba[y * 640 * 4..(y + 1) * 640 * 4]
-                .as_chunks::<4>().0.iter()
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[..3].iter().any(|&b| b != 0))
         };
         assert!(row(350) && !row(100) && !row(10));

@@ -166,9 +166,13 @@ fn the_shell_runs_on_a_hercules_card() {
     video::print_string(&mut cpu, "HELLO");
     assert_eq!(cpu.bus.read_8(0xB0000), b'H');
     let frame = picture(&mut cpu);
-    assert!(frame.rgba[..720 * 14 * 4]
-        .as_chunks::<4>().0.iter()
-        .any(|p| p[..3].iter().any(|&b| b != 0)));
+    assert!(
+        frame.rgba[..720 * 14 * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[..3].iter().any(|&b| b != 0))
+    );
     assert_eq!(cpu.bus.read_16(0x0460), 0x0B0C);
 }
 

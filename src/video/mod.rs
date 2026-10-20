@@ -246,7 +246,11 @@ impl DrawnFrom {
 
 impl Frame {
     pub fn new(width: u32, height: u32) -> Self {
-        Self::from_rgba(width, height, [0, 0, 0, 255].repeat((width * height) as usize))
+        Self::from_rgba(
+            width,
+            height,
+            [0, 0, 0, 255].repeat((width * height) as usize),
+        )
     }
 
     /// A frame of `width` x `height` pixels `rgb`.
@@ -435,7 +439,13 @@ pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize
     // So does the 16-color one.
     if bus.video_mode.is_planar() && !bus.vga.adapter.gate_array() {
         let (w, rows) = bus.vga.graphics_size();
-        render_planar(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
+        render_planar(
+            &mut frame.rgba,
+            width,
+            &bus.vga.vram_graphics,
+            bus,
+            &mut frame.drawn_from,
+        );
         frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
         return frame.drawn_from.changed.clone();
     }
@@ -462,7 +472,9 @@ pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize
     // or leave a sub-row gap that we want to appear black.
     let row_bytes = width * 4;
     frame.rgba[y_min * row_bytes..y_max * row_bytes]
-        .as_chunks_mut::<4>().0.fill([0, 0, 0, 255]);
+        .as_chunks_mut::<4>()
+        .0
+        .fill([0, 0, 0, 255]);
     let canvas = &mut frame.rgba[..];
 
     // The Tandy's and PCjr's video shows system memory.
@@ -753,8 +765,8 @@ fn render_vbe(canvas: &mut [u8], canvas_w: usize, y_min: usize, y_max: usize, bu
     }
 }
 
-/// A row of `B`-byte VBE pixels in `src` as RGB into `out`, each `scale`
-/// times, by `rgb`.
+/// A row of `B`-byte VBE pixels in `src` as opaque RGBA into `out`, each
+/// `scale` times, by `rgb`.
 #[inline(always)]
 fn vbe_row<const B: usize>(src: &[u8], out: &mut [u8], scale: usize, rgb: impl Fn(&[u8; B]) -> (u8, u8, u8)) {
     let pixels = src.as_chunks::<B>().0;
@@ -1579,8 +1591,12 @@ mod planar_tests {
                 }
                 cga_reference(&mut old, &vram, start, &colors, bits);
                 assert!(new.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
-                let new: Vec<_> = new.as_chunks::<4>().0.iter()
-                    .flat_map(|&[r, g, b, _]| [r, g, b]).collect();
+                let new: Vec<_> = new
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|&[r, g, b, _]| [r, g, b])
+                    .collect();
                 let first = new.iter().zip(&old).position(|(a, b)| a != b);
                 assert!(new == old, "mode {} rows {} first {:?} adapter {:?} composite {}", mode, rows, first, bus.vga.adapter, bus.vga.composite_decoder().is_some());
             }

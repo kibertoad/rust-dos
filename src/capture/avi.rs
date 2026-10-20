@@ -170,7 +170,10 @@ impl AviWriter {
 /// What the recording thread gets: a frame and the sound since the last,
 /// or the end.
 enum Work {
-    Frame { rgba: Option<Vec<u8>>, sound: Vec<i16> },
+    Frame {
+        rgba: Option<Vec<u8>>,
+        sound: Vec<i16>,
+    },
     Stop,
 }
 

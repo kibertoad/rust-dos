@@ -32,7 +32,9 @@ fn rendered_shell(name: &str) -> (Cpu, Frame) {
 fn row_has_pixels(frame: &Frame, row: usize) -> bool {
     let row_bytes = SCREEN_WIDTH as usize * 4;
     frame.rgba[row * CELL_H * row_bytes..(row + 1) * CELL_H * row_bytes]
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .any(|p| p[..3].iter().any(|&b| b != 0))
 }
 

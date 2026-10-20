@@ -296,7 +296,8 @@ impl GlScreen {
             self.rgba.resize(rows.len() * w * 4, 0);
             for (y, out) in rows.clone().zip(self.rgba.chunks_exact_mut(w * 4)) {
                 let src = frame.rgba[2 * y * row_bytes..(2 * y + 1) * row_bytes]
-                    .as_chunks::<8>().0;
+                    .as_chunks::<8>()
+                    .0;
                 for (rgba, pair) in out.as_chunks_mut::<4>().0.iter_mut().zip(src) {
                     rgba.copy_from_slice(&pair[..4]);
                 }
@@ -640,10 +641,15 @@ impl GlScreen {
         // Rows from the top, four bytes a pixel.
         let shaded = complete.then(|| {
             let mut frame = Frame::new(w, h);
-            let rows = frame.rgba.chunks_exact_mut(w as usize * 4)
+            let rows = frame
+                .rgba
+                .chunks_exact_mut(w as usize * 4)
                 .zip(capture.rgba.chunks_exact(w as usize * 4).rev());
             for (to, from) in rows {
-                for (out, pixel) in to.as_chunks_mut::<4>().0.iter_mut()
+                for (out, pixel) in to
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
                     .zip(from.as_chunks::<4>().0)
                 {
                     *out = [pixel[0], pixel[1], pixel[2], 255];
