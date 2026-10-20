@@ -133,10 +133,18 @@ pub struct Access {
     /// It may touch memory outside the tiles: kept, and taken to read
     /// everything.
     pub pinned: bool,
+    /// A triangle drawing with a colour buffer's pixels as its texture.
+    pub textured: bool,
 }
 
 impl Access {
-    const PINNED: Access = Access { reads: [0; 4], writes: [0; 4], kills: [0; 4], pinned: true };
+    const PINNED: Access = Access {
+        reads: [0; 4],
+        writes: [0; 4],
+        kills: [0; 4],
+        pinned: true,
+        textured: false,
+    };
 
     fn add(&mut self, other: &Access) {
         for r in 0..4 {
@@ -145,6 +153,7 @@ impl Access {
             self.kills[r] |= other.kills[r];
         }
         self.pinned |= other.pinned;
+        self.textured |= other.textured;
     }
 }
 
@@ -267,13 +276,15 @@ pub fn triangle(layout: &TileLayout, st: &RasterState, verts: &[(f32, f32); 3]) 
             *reads = ALL;
         }
     }
+    access.textured = textures & 7 != 0;
     access
 }
 
 /// Whether `st` draws with rows or an auxiliary buffer other than the
 /// layout's, so that its pixels aren't where the tiles say.
 fn elsewhere(layout: &TileLayout, st: &RasterState) -> bool {
-    let aux = st.aux.is_some() && (st.aux != layout.bases[AUX] || st.aux_stride != layout.aux_stride);
+    let aux = st.aux.is_some()
+        && (st.aux != layout.bases[AUX] || st.aux_stride != layout.aux_stride);
     st.stride != layout.stride || aux
 }
 
@@ -302,12 +313,19 @@ fn textures_read(layout: &TileLayout, st: &RasterState) -> u8 {
 }
 
 /// The bytes the texture `t` may take texels from, first to past the
-/// last: its levels, or all of the memory where they wrap around.
+/// last: the levels its LOD range picks, or all of the memory where they
+/// wrap around. The rasterizer clamps the LOD to lodmin..lodmax, and a
+/// level the texture hasn't takes the next (`texture`). The levels
+/// outside the range aren't read: Glide points texBaseAddr below a
+/// texture whose largest level is smaller than 256x256, so those lie in
+/// other memory, a colour buffer's among it.
 fn texture_bytes(t: &TmuRaster) -> (u64, u64) {
     let wide = ((t.mode >> 8) & 0xF >= 8) as u32;
     let memory = t.mask as u64 + 1;
+    let first = (t.lodmin.min(t.lodmax) >> 8).clamp(0, 8) as usize;
+    let last = ((t.lodmax >> 8) + 1).clamp(0, 8) as usize;
     let (mut start, mut end) = (memory, 0);
-    for (level, &base) in t.lodoffset.iter().enumerate() {
+    for (level, &base) in t.lodoffset.iter().enumerate().take(last + 1).skip(first) {
         let texels = ((t.wmask >> level) + 1) as u64 * ((t.hmask >> level) + 1) as u64;
         let last = base as u64 + (texels << wide);
         if last > memory {
@@ -435,17 +453,15 @@ impl Backlog {
     pub fn push_words(&mut self, fb: &Vram, new: &[Word]) -> Vec<Job> {
         let access = words(&self.layout, new);
         self.words += new.len();
-        if let Some((Job::Pixels { words, .. }, last, _)) = self.jobs.last_mut() {
-            if access.pinned || access.writes[AUX] != 0 {
-                self.cleared = None;
+        if matches!(self.jobs.last(), Some((Job::Pixels { .. }, ..))) {
+            let (mut job, mut last, n) = self.jobs.pop().expect("a last job");
+            self.reach(&job, &access);
+            self.track(&job, &access);
+            if let Job::Pixels { words, .. } = &mut job {
+                words.extend_from_slice(new);
             }
-            for (slot, reach) in self.reach.iter_mut().enumerate() {
-                if access.pinned || access.writes[slot] != 0 {
-                    *reach = self.layout.width;
-                }
-            }
-            words.extend_from_slice(new);
             last.add(&access);
+            self.jobs.push((job, last, n));
             return self.overflow();
         }
         self.push(Job::Pixels { fb: fb.clone(), words: new.to_vec() }, access)
@@ -466,7 +482,14 @@ impl Backlog {
     }
 
     fn count_words(&mut self) {
-        self.words = self.jobs.iter().map(|(job, ..)| if let Job::Pixels { words, .. } = job { words.len() } else { 0 }).sum();
+        self.words = self
+            .jobs
+            .iter()
+            .map(|(job, ..)| match job {
+                Job::Pixels { words, .. } => words.len(),
+                _ => 0,
+            })
+            .sum();
     }
 
     /// Drop the jobs whose pixels nothing can see any more: everything is
@@ -541,7 +564,7 @@ impl Backlog {
             // Drawing with a colour buffer's pixels as its texture, it
             // reads what was there before the clear wherever no triangle
             // has drawn over it yet.
-            Job::Triangle { st, .. } if textures_read(&self.layout, st) & 7 != 0 => {}
+            Job::Triangle { .. } if access.textured => {}
             Job::Triangle { st, verts, .. } if !access.pinned => {
                 let Some(cleared) = &mut self.cleared else {
                     return;
@@ -634,9 +657,6 @@ impl Cleared {
         reach: &[u32; 3],
     ) -> Option<(usize, u64)> {
         let slot = layout.slot(st.dest)?;
-        if st.aux.is_some() && st.aux != layout.bases[AUX] {
-            return None;
-        }
         let (fbz, am) = (st.fbz_mode, st.alpha_mode);
         let writes_depth = fbz & (1 << 10) != 0 && st.aux.is_some();
         // Chroma key, stipple, alpha mask, alpha planes; alpha test and
