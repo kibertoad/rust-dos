@@ -509,9 +509,52 @@ fn child_program() -> Vec<u8> {
     com(&[(0x100, main)])
 }
 
+/// A child that chains a real-mode timer handler of its own to the vector
+/// it finds, becomes a client without a protected-mode one, and waits in
+/// protected mode for three ticks: they go down to its real-mode handler
+/// and on from there. It puts the vector back and ends with code 33h.
+fn timer_child_program() -> Vec<u8> {
+    let main = asm16(0x100, |a| {
+        let mut fail = a.create_label();
+        a.mov(ax, 0x3508)?;
+        a.int(0x21)?;
+        a.mov(word_ptr(OLD8), bx)?;
+        a.mov(word_ptr(OLD8 + 2), es)?;
+        a.mov(ax, 0x2508)?;
+        a.mov(dx, TICK_HANDLER as u32)?;
+        a.int(0x21)?;
+        enter(a, false, fail)?;
+        step(a, 30)?;
+        a.sti()?;
+        let mut wait = a.create_label();
+        a.set_label(&mut wait)?;
+        a.hlt()?;
+        a.cmp(word_ptr(TICKS), 3)?;
+        a.jb(wait)?;
+        step(a, 31)?;
+        a.mov(ax, 0x0201)?;
+        a.mov(bl, 8)?;
+        a.mov(cx, word_ptr(OLD8 + 2))?;
+        a.mov(dx, word_ptr(OLD8))?;
+        a.int(0x31)?;
+        exit(a, 0x33)?;
+        a.set_label(&mut fail)?;
+        exit(a, 0xEE)
+    });
+    // The real-mode timer handler: count, then JMP FAR to the old vector.
+    let tick = asm16(TICK_HANDLER, |a| {
+        a.inc(word_ptr(TICKS).cs())?;
+        a.db(&[0x2E, 0xFF, 0x2E])?;
+        a.dw(&[OLD8])
+    });
+    com(&[(0x100, main), (TICK_HANDLER, tick)])
+}
+
 /// A 32-bit client that runs CHILD.COM with EXEC through INT 31h AX=0300h
-/// and ends with the child's exit code.
-fn parent_program() -> Vec<u8> {
+/// and ends with the child's exit code. With `timer`, it has a
+/// protected-mode timer handler of its own while the child runs, which
+/// chains to the default one.
+fn parent_program(timer: bool) -> Vec<u8> {
     let main = asm16(0x100, |a| {
         let mut fail = a.create_label();
         // The EXEC parameter block: no environment of its own, an empty
@@ -520,6 +563,20 @@ fn parent_program() -> Vec<u8> {
         a.mov(word_ptr(PARAMS + 8), cs)?;
         a.mov(word_ptr(PARAMS + 12), cs)?;
         enter(a, true, fail)?;
+        if timer {
+            a.mov(ax, 0x0204)?;
+            a.mov(bl, 8)?;
+            a.int(0x31)?;
+            a.mov(word_ptr(OLD8), dx)?;
+            a.mov(word_ptr(OLD8 + 2), cx)?;
+            a.mov(ax, 0x0205)?;
+            a.mov(bl, 8)?;
+            a.mov(cx, cs)?;
+            a.xor(edx, edx)?;
+            a.mov(dx, TICK_HANDLER as u32)?;
+            a.int(0x31)?;
+            a.jc(fail)?;
+        }
         step(a, 20)?;
         clear_struct(a, STRUCT)?;
         a.mov(word_ptr(STRUCT + 0x1C), 0x4B00)?;
@@ -549,7 +606,18 @@ fn parent_program() -> Vec<u8> {
         a.set_label(&mut fail)?;
         exit(a, 0xEE)
     });
-    let mut image = com(&[(0x100, main)]);
+    // The timer handler: count, then JMP FAR to the default handler.
+    let tick = asm16(TICK_HANDLER, |a| {
+        a.push(ds)?;
+        a.push(ax)?;
+        a.mov(ds, word_ptr(DSSEL).cs())?;
+        a.inc(word_ptr(TICKS))?;
+        a.pop(ax)?;
+        a.pop(ds)?;
+        a.db(&[0x2E, 0xFF, 0x2E])?;
+        a.dw(&[OLD8])
+    });
+    let mut image = com(&[(0x100, main), (TICK_HANDLER, tick)]);
     let at = |offset: u16| (offset - 0x100) as usize;
     image[at(NAME)..at(NAME) + 10].copy_from_slice(b"CHILD.COM\0");
     image[at(PARAMS) + 2..at(PARAMS) + 4].copy_from_slice(&TAIL.to_le_bytes());
@@ -561,12 +629,30 @@ fn parent_program() -> Vec<u8> {
 
 #[test]
 fn a_client_runs_a_child_that_is_a_client_too() {
-    let (mut cpu, psp) =
-        machine("nested", &[("PARENT.COM", parent_program()), ("CHILD.COM", child_program())], "PARENT.COM");
+    let files = [("PARENT.COM", parent_program(false)), ("CHILD.COM", child_program())];
+    let (mut cpu, psp) = machine("nested", &files, "PARENT.COM");
     assert!(run_to_exit(&mut cpu, 200), "the program didn't end (step {})", word(&cpu, psp, STEP));
     assert_eq!(cpu.errorlevel, 0x33, "failed at step {}", word(&cpu, psp, STEP));
     assert_eq!(word(&cpu, psp, R + 2), MAGIC_VALUE);
     assert!(!cpu.bus.dpmi.active());
+}
+
+/// The parent's protected-mode timer handler has the host's stub in the
+/// real-mode vector when the child chains its own handler in front of it,
+/// as a DOS/4GW game that runs a Smacker player does. Ticks reflected
+/// down to the child's handler reach the stub through its chain, and go
+/// on to what the vector held before the stub, not back to the child's
+/// handler.
+#[test]
+fn a_child_chains_its_real_mode_timer_handler_to_the_hosts_stub() {
+    let files = [("PARENT.COM", parent_program(true)), ("CHILD.COM", timer_child_program())];
+    let (mut cpu, psp) = machine("nested_timer", &files, "PARENT.COM");
+    let timer = cpu.bus.read_32(8 * 4);
+    assert!(run_to_exit(&mut cpu, 2000), "the program didn't end (step {})", word(&cpu, psp, STEP));
+    assert_eq!(cpu.errorlevel, 0x33, "failed at step {}", word(&cpu, psp, STEP));
+    assert_eq!(word(&cpu, psp, R + 2), MAGIC_VALUE);
+    assert!(!cpu.bus.dpmi.active());
+    assert_eq!(cpu.bus.read_32(8 * 4), timer);
 }
 
 /// Where the DOS program keeps things: results (a word each), the "MS-DOS"

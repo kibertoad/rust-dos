@@ -1276,7 +1276,9 @@ fn take_frame(cpu: &mut Cpu, kinds: &[u8]) -> Option<Frame> {
 /// An interrupt of the host's real-mode stub for `vector` (`hook`): to the
 /// running client's protected-mode handler, on its locked stack, unless it
 /// is reflecting that interrupt down to real mode itself; otherwise on to
-/// the handler the vector had.
+/// the handler the vector had before the stub. The vector may hold
+/// another program's handler by now that chains to the stub, as a child
+/// of a client installs one, and going back to it would loop.
 fn rm_interrupt(cpu: &mut Cpu, vector: u8) {
     let dpmi = &cpu.bus.dpmi;
     let reflecting = dpmi.frames.iter().any(|f| f.kind == F_REFLECT && f.vector == vector);
@@ -1308,7 +1310,11 @@ fn rm_interrupt(cpu: &mut Cpu, vector: u8) {
             resume(cpu, &ctx);
         }
         _ => {
-            let target = real_mode_handler(cpu, vector);
+            let hooks = &cpu.bus.dpmi.hooks;
+            let target = hooks
+                .iter()
+                .find(|&&(v, _)| v == vector)
+                .map_or(0, |&(_, original)| original);
             if target == 0 || target == rm_stub(vector) {
                 iret_real(cpu);
             } else {
