@@ -109,6 +109,7 @@ pub(crate) fn write_open_file(cpu: &mut Cpu, handle: u16, sft: u16, data: &[u8])
             }
         }
         let visible: Vec<u8> = data.iter().copied().filter(|&b| b != 0x07).collect();
+        let visible = expand_tabs(cpu, &visible);
         // Handle 2 is standard error on the host's terminal.
         let stderr = handle == 2;
         if let Some(console) = cpu.host_console.as_mut() {
@@ -276,22 +277,70 @@ fn con_read(cpu: &mut Cpu) -> Option<u8> {
 /// functions do: to the screen (a bell beeps), or to where the command
 /// line redirected it.
 fn stdout_char(cpu: &mut Cpu, byte: u8) {
-    stdout_bytes(cpu, &[byte]);
+    stdout_bytes(cpu, &[byte], false);
 }
 
-/// Write `bytes` to standard output as `stdout_char` does.
-fn stdout_bytes(cpu: &mut Cpu, bytes: &[u8]) {
+/// Write `bytes` to standard output as `stdout_char` does. `cooked`
+/// output to the screen has its tabs expanded (`expand_tabs`), as
+/// AH=02h's and AH=09h's is; AH=06h's is raw.
+fn stdout_bytes(cpu: &mut Cpu, bytes: &[u8], cooked: bool) {
     if let Some(sft) = file_of(cpu, 1).filter(|&sft| cpu.bus.disk.handle_device(sft) != Some(CharDevice::Con)) {
         let _ = cpu.bus.disk.write_file(sft, bytes);
         return;
     }
-    let mut rest = bytes;
+    let expanded;
+    let mut rest = if cooked {
+        expanded = expand_tabs(cpu, bytes);
+        &expanded[..]
+    } else {
+        bytes
+    };
     while let Some(bell) = rest.iter().position(|&b| b == 0x07) {
         console_write(cpu, &rest[..bell]);
         play_sdl_beep(&mut cpu.bus);
         rest = &rest[bell + 1..];
     }
     console_write(cpu, rest);
+}
+
+/// `bytes` with each tab turned into the spaces up to the next column that
+/// is a multiple of eight, at least one, as DOS's console output does it:
+/// the BIOS would show the tab's character. The columns count from the
+/// cursor's, and go back to 0 at a carriage return and at the end of the
+/// line.
+fn expand_tabs(cpu: &mut Cpu, bytes: &[u8]) -> Vec<u8> {
+    if !bytes.contains(&0x09) {
+        return bytes.to_vec();
+    }
+    let page = cpu.bus.guest_read_8(0x0462) as u32;
+    let mut col = cpu.bus.guest_read_8(0x0450 + 2 * page) as u16;
+    let cols = cpu.bus.guest_read_16(0x044A).max(1);
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    for &b in bytes {
+        match b {
+            0x09 => loop {
+                out.push(b' ');
+                col = (col + 1) % cols;
+                if col.is_multiple_of(8) {
+                    break;
+                }
+            },
+            b'\r' => {
+                out.push(b);
+                col = 0;
+            }
+            0x08 => {
+                out.push(b);
+                col = col.saturating_sub(1);
+            }
+            b'\n' | 0x07 => out.push(b),
+            _ => {
+                out.push(b);
+                col = (col + 1) % cols;
+            }
+        }
+    }
+    out
 }
 
 /// A line being typed at the keyboard for INT 21h AH=0Ah or a read of
@@ -482,7 +531,7 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
         // AH = 02h: Output Character (DL = Char)
         0x02 => {
             let char_byte = cpu.get_dl();
-            stdout_char(cpu, char_byte);
+            stdout_bytes(cpu, &[char_byte], true);
             cpu.set_reg8(Register::AL, char_byte);
         }
 
@@ -592,7 +641,7 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 offset = offset.wrapping_add(1);
             }
             if !cpu.bus.guest_faulted() {
-                stdout_bytes(cpu, &text);
+                stdout_bytes(cpu, &text, true);
             }
         }
 
