@@ -25,6 +25,7 @@ const EXCERR: u16 = 0x2026;
 const STEP: u16 = 0x2028;
 const OLDEXC: u16 = 0x202C;
 const CBADDR: u16 = 0x2030;
+const OLDRM: u16 = 0x2038;
 const STRUCT: u16 = 0x2040;
 const CBSTRUCT: u16 = 0x2080;
 /// Results, a word each.
@@ -42,6 +43,7 @@ const TICK_HANDLER: u16 = 0x0D00;
 const CB_PROC: u16 = 0x0E00;
 const RM_PART: u16 = 0x0F00;
 const PM_BACK: u16 = 0x1000;
+const RM_TICK: u16 = 0x1100;
 
 const MAGIC_VALUE: u16 = 0x4D47;
 
@@ -126,6 +128,38 @@ fn clear_struct(a: &mut CodeAssembler, at: u16) -> Result<(), IcedError> {
     a.xor(ax, ax)?;
     a.cld()?;
     a.rep().stosw()
+}
+
+/// Protected mode: keep the timer's handler at `OLD8` and set
+/// `pm_tick_handler` in its place.
+fn set_pm_tick_handler(a: &mut CodeAssembler, fail: CodeLabel) -> Result<(), IcedError> {
+    a.mov(ax, 0x0204)?;
+    a.mov(bl, 8)?;
+    a.int(0x31)?;
+    a.mov(word_ptr(OLD8), dx)?;
+    a.mov(word_ptr(OLD8 + 2), cx)?;
+    a.mov(ax, 0x0205)?;
+    a.mov(bl, 8)?;
+    a.mov(cx, cs)?;
+    a.xor(edx, edx)?;
+    a.mov(dx, TICK_HANDLER as u32)?;
+    a.int(0x31)?;
+    a.jc(fail)
+}
+
+/// The protected-mode timer handler: count, then JMP FAR to the default
+/// handler.
+fn pm_tick_handler() -> Vec<u8> {
+    asm16(TICK_HANDLER, |a| {
+        a.push(ds)?;
+        a.push(ax)?;
+        a.mov(ds, word_ptr(DSSEL).cs())?;
+        a.inc(word_ptr(TICKS))?;
+        a.pop(ax)?;
+        a.pop(ds)?;
+        a.db(&[0x2E, 0xFF, 0x2E])?;
+        a.dw(&[OLD8])
+    })
 }
 
 /// The program exercising the host's services, for a 16-bit or 32-bit
@@ -256,18 +290,7 @@ fn services_program(bits32: bool) -> Vec<u8> {
         // The timer interrupt to a handler that chains to the default
         // one, waited for with HLT, which level 3 may not run.
         step(a, 16)?;
-        a.mov(ax, 0x0204)?;
-        a.mov(bl, 8)?;
-        a.int(0x31)?;
-        a.mov(word_ptr(OLD8), dx)?;
-        a.mov(word_ptr(OLD8 + 2), cx)?;
-        a.mov(ax, 0x0205)?;
-        a.mov(bl, 8)?;
-        a.mov(cx, cs)?;
-        a.xor(edx, edx)?;
-        a.mov(dx, TICK_HANDLER as u32)?;
-        a.int(0x31)?;
-        a.jc(fail)?;
+        set_pm_tick_handler(a, fail)?;
         a.sti()?;
         let mut wait = a.create_label();
         a.set_label(&mut wait)?;
@@ -356,17 +379,7 @@ fn services_program(bits32: bool) -> Vec<u8> {
         a.pop(bp)?;
         if bits32 { a.db(&[0x66, 0xCB]) } else { a.retf() }
     });
-    // The timer handler: count, then JMP FAR to the default handler.
-    let tick = asm16(TICK_HANDLER, |a| {
-        a.push(ds)?;
-        a.push(ax)?;
-        a.mov(ds, word_ptr(DSSEL).cs())?;
-        a.inc(word_ptr(TICKS))?;
-        a.pop(ax)?;
-        a.pop(ds)?;
-        a.db(&[0x2E, 0xFF, 0x2E])?;
-        a.dw(&[OLD8])
-    });
+    let tick = pm_tick_handler();
     // The callback's procedure: return to the caller of the real-mode far
     // call, and count.
     let cb = asm16(CB_PROC, |a| {
@@ -510,9 +523,11 @@ fn child_program() -> Vec<u8> {
 }
 
 /// A child that chains a real-mode timer handler of its own to the vector
-/// it finds, becomes a client without a protected-mode one, and waits in
-/// protected mode for three ticks: they go down to its real-mode handler
-/// and on from there. It puts the vector back and ends with code 33h.
+/// it finds and waits in real mode for three ticks, which its handler must
+/// count once each. Then it becomes a client without a protected-mode
+/// handler and waits in protected mode for three more: they go down to its
+/// real-mode handler and on from there. It puts the vector back and ends
+/// with code 33h.
 fn timer_child_program() -> Vec<u8> {
     let main = asm16(0x100, |a| {
         let mut fail = a.create_label();
@@ -523,6 +538,27 @@ fn timer_child_program() -> Vec<u8> {
         a.mov(ax, 0x2508)?;
         a.mov(dx, TICK_HANDLER as u32)?;
         a.int(0x21)?;
+        // Three ticks in real mode first, which go round the parent's
+        // protected-mode handler: the handler counts each once, as the
+        // BIOS's tick count at 0040:006Ch goes up.
+        a.mov(ax, 0x40)?;
+        a.mov(es, ax)?;
+        a.cli()?;
+        a.mov(word_ptr(TICKS), 0)?;
+        a.mov(si, word_ptr(0x6C).es())?;
+        a.sti()?;
+        let mut wait_rm = a.create_label();
+        a.set_label(&mut wait_rm)?;
+        a.hlt()?;
+        a.cmp(word_ptr(TICKS), 3)?;
+        a.jb(wait_rm)?;
+        a.cli()?;
+        a.mov(ax, word_ptr(0x6C).es())?;
+        a.sub(ax, si)?;
+        a.cmp(ax, word_ptr(TICKS))?;
+        a.jne(fail)?;
+        a.mov(word_ptr(TICKS), 0)?;
+        a.sti()?;
         enter(a, false, fail)?;
         step(a, 30)?;
         a.sti()?;
@@ -564,18 +600,7 @@ fn parent_program(timer: bool) -> Vec<u8> {
         a.mov(word_ptr(PARAMS + 12), cs)?;
         enter(a, true, fail)?;
         if timer {
-            a.mov(ax, 0x0204)?;
-            a.mov(bl, 8)?;
-            a.int(0x31)?;
-            a.mov(word_ptr(OLD8), dx)?;
-            a.mov(word_ptr(OLD8 + 2), cx)?;
-            a.mov(ax, 0x0205)?;
-            a.mov(bl, 8)?;
-            a.mov(cx, cs)?;
-            a.xor(edx, edx)?;
-            a.mov(dx, TICK_HANDLER as u32)?;
-            a.int(0x31)?;
-            a.jc(fail)?;
+            set_pm_tick_handler(a, fail)?;
         }
         step(a, 20)?;
         clear_struct(a, STRUCT)?;
@@ -606,18 +631,7 @@ fn parent_program(timer: bool) -> Vec<u8> {
         a.set_label(&mut fail)?;
         exit(a, 0xEE)
     });
-    // The timer handler: count, then JMP FAR to the default handler.
-    let tick = asm16(TICK_HANDLER, |a| {
-        a.push(ds)?;
-        a.push(ax)?;
-        a.mov(ds, word_ptr(DSSEL).cs())?;
-        a.inc(word_ptr(TICKS))?;
-        a.pop(ax)?;
-        a.pop(ds)?;
-        a.db(&[0x2E, 0xFF, 0x2E])?;
-        a.dw(&[OLD8])
-    });
-    let mut image = com(&[(0x100, main), (TICK_HANDLER, tick)]);
+    let mut image = com(&[(0x100, main), (TICK_HANDLER, pm_tick_handler())]);
     let at = |offset: u16| (offset - 0x100) as usize;
     image[at(NAME)..at(NAME) + 10].copy_from_slice(b"CHILD.COM\0");
     image[at(PARAMS) + 2..at(PARAMS) + 4].copy_from_slice(&TAIL.to_le_bytes());
@@ -651,6 +665,107 @@ fn a_child_chains_its_real_mode_timer_handler_to_the_hosts_stub() {
     assert!(run_to_exit(&mut cpu, 2000), "the program didn't end (step {})", word(&cpu, psp, STEP));
     assert_eq!(cpu.errorlevel, 0x33, "failed at step {}", word(&cpu, psp, STEP));
     assert_eq!(word(&cpu, psp, R + 2), MAGIC_VALUE);
+    assert!(!cpu.bus.dpmi.active());
+    assert_eq!(cpu.bus.read_32(8 * 4), timer);
+}
+
+/// A client that sets a protected-mode timer handler, chains a real-mode
+/// one in front of the host's stub, and sets the default protected-mode
+/// handler back while its real-mode handler is still in the vector. It
+/// waits in protected mode for three ticks, which its real-mode handler
+/// must count as the BIOS's tick count at 0040:006Ch goes up. Then it
+/// puts the stub back in the vector and ends with code 34h.
+fn chained_client_program() -> Vec<u8> {
+    let main = asm16(0x100, |a| {
+        let mut fail = a.create_label();
+        enter(a, false, fail)?;
+        step(a, 40)?;
+        set_pm_tick_handler(a, fail)?;
+        a.mov(ax, 0x0200)?;
+        a.mov(bl, 8)?;
+        a.int(0x31)?;
+        a.mov(word_ptr(OLDRM), dx)?;
+        a.mov(word_ptr(OLDRM + 2), cx)?;
+        a.mov(ax, 0x0201)?;
+        a.mov(bl, 8)?;
+        a.mov(cx, word_ptr(RMSEG))?;
+        a.mov(dx, RM_TICK as u32)?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        step(a, 41)?;
+        a.mov(ax, 0x0205)?;
+        a.mov(bl, 8)?;
+        a.mov(cx, word_ptr(OLD8 + 2))?;
+        a.xor(edx, edx)?;
+        a.mov(dx, word_ptr(OLD8))?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        step(a, 42)?;
+        a.mov(ax, 0x0002)?;
+        a.mov(bx, 0x40)?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        a.mov(es, ax)?;
+        a.cli()?;
+        a.mov(word_ptr(TICKS), 0)?;
+        a.mov(si, word_ptr(0x6C).es())?;
+        a.sti()?;
+        let mut wait = a.create_label();
+        a.set_label(&mut wait)?;
+        a.hlt()?;
+        a.cmp(word_ptr(TICKS), 3)?;
+        a.jb(wait)?;
+        a.cli()?;
+        a.mov(ax, word_ptr(0x6C).es())?;
+        a.sub(ax, si)?;
+        a.cmp(ax, word_ptr(TICKS))?;
+        a.jne(fail)?;
+        a.sti()?;
+        step(a, 43)?;
+        a.mov(ax, 0x0201)?;
+        a.mov(bl, 8)?;
+        a.mov(cx, word_ptr(OLDRM + 2))?;
+        a.mov(dx, word_ptr(OLDRM))?;
+        a.int(0x31)?;
+        a.jc(fail)?;
+        exit(a, 0x34)?;
+        a.set_label(&mut fail)?;
+        exit(a, 0xEE)
+    });
+    // The real-mode timer handler: count, then JMP FAR to the old vector.
+    let rm_tick = asm16(RM_TICK, |a| {
+        a.inc(word_ptr(TICKS).cs())?;
+        a.db(&[0x2E, 0xFF, 0x2E])?;
+        a.dw(&[OLDRM])
+    });
+    com(&[
+        (0x100, main),
+        (TICK_HANDLER, pm_tick_handler()),
+        (RM_TICK, rm_tick),
+    ])
+}
+
+/// A client's real-mode timer handler that chains to the host's stub
+/// stays in the vector after the client sets the default protected-mode
+/// handler back. Ticks that reach the stub through it still go on to the
+/// BIOS's handler, and the stub comes out of the vector when the client
+/// ends.
+#[test]
+fn a_real_mode_handler_chained_to_the_stub_outlives_the_pm_handler() {
+    let files = [("T.COM", chained_client_program())];
+    let (mut cpu, psp) = machine("chained_unhook", &files, "T.COM");
+    let timer = cpu.bus.read_32(8 * 4);
+    assert!(
+        run_to_exit(&mut cpu, 2000),
+        "the program didn't end (step {})",
+        word(&cpu, psp, STEP)
+    );
+    assert_eq!(
+        cpu.errorlevel,
+        0x34,
+        "failed at step {}",
+        word(&cpu, psp, STEP)
+    );
     assert!(!cpu.bus.dpmi.active());
     assert_eq!(cpu.bus.read_32(8 * 4), timer);
 }
