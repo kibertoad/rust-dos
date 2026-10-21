@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{Datelike, Timelike};
 use iced_x86::Register;
 
@@ -109,7 +111,12 @@ pub(crate) fn write_open_file(cpu: &mut Cpu, handle: u16, sft: u16, data: &[u8])
             }
         }
         let visible: Vec<u8> = data.iter().copied().filter(|&b| b != 0x07).collect();
-        let visible = expand_tabs(cpu, &visible);
+        // In raw (binary) mode a tab goes out as it is.
+        let visible = if cpu.bus.disk.device_raw(sft) {
+            Cow::Borrowed(&visible[..])
+        } else {
+            expand_tabs(cpu, &visible)
+        };
         // Handle 2 is standard error on the host's terminal.
         let stderr = handle == 2;
         if let Some(console) = cpu.host_console.as_mut() {
@@ -273,9 +280,9 @@ fn con_read(cpu: &mut Cpu) -> Option<u8> {
     Some(ascii)
 }
 
-/// Write a character to standard output (handle 1) as DOS's character
-/// functions do: to the screen (a bell beeps), or to where the command
-/// line redirected it.
+/// Write a character to standard output (handle 1) raw, as AH=06h does:
+/// to the screen (a bell beeps), or to where the command line redirected
+/// it.
 fn stdout_char(cpu: &mut Cpu, byte: u8) {
     stdout_bytes(cpu, &[byte], false);
 }
@@ -288,13 +295,8 @@ fn stdout_bytes(cpu: &mut Cpu, bytes: &[u8], cooked: bool) {
         let _ = cpu.bus.disk.write_file(sft, bytes);
         return;
     }
-    let expanded;
-    let mut rest = if cooked {
-        expanded = expand_tabs(cpu, bytes);
-        &expanded[..]
-    } else {
-        bytes
-    };
+    let text = if cooked { expand_tabs(cpu, bytes) } else { Cow::Borrowed(bytes) };
+    let mut rest = &text[..];
     while let Some(bell) = rest.iter().position(|&b| b == 0x07) {
         console_write(cpu, &rest[..bell]);
         play_sdl_beep(&mut cpu.bus);
@@ -305,16 +307,14 @@ fn stdout_bytes(cpu: &mut Cpu, bytes: &[u8], cooked: bool) {
 
 /// `bytes` with each tab turned into the spaces up to the next column that
 /// is a multiple of eight, at least one, as DOS's console output does it:
-/// the BIOS would show the tab's character. The columns count from the
-/// cursor's, and go back to 0 at a carriage return and at the end of the
-/// line.
-fn expand_tabs(cpu: &mut Cpu, bytes: &[u8]) -> Vec<u8> {
+/// the BIOS would show the tab's character. The columns count from where
+/// the output goes on (`console_column`), and go back to 0 at a carriage
+/// return and at the end of the line.
+fn expand_tabs<'a>(cpu: &mut Cpu, bytes: &'a [u8]) -> Cow<'a, [u8]> {
     if !bytes.contains(&0x09) {
-        return bytes.to_vec();
+        return Cow::Borrowed(bytes);
     }
-    let page = cpu.bus.guest_read_8(0x0462) as u32;
-    let mut col = cpu.bus.guest_read_8(0x0450 + 2 * page) as u16;
-    let cols = cpu.bus.guest_read_16(0x044A).max(1);
+    let (mut col, cols) = crate::video::console_column(cpu);
     let mut out = Vec::with_capacity(bytes.len() + 8);
     for &b in bytes {
         match b {
@@ -340,7 +340,7 @@ fn expand_tabs(cpu: &mut Cpu, bytes: &[u8]) -> Vec<u8> {
             }
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// A line being typed at the keyboard for INT 21h AH=0Ah or a read of
@@ -573,7 +573,10 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
             if let Some(ascii) = con_read(cpu) {
                 cpu.set_reg8(Register::AL, ascii);
                 if ascii != 0 && !pending {
-                    console_write(cpu, &[ascii]);
+                    // Echoed as AH=02h writes it, a tab as spaces.
+                    let echo = [ascii];
+                    let echo = expand_tabs(cpu, &echo);
+                    console_write(cpu, &echo);
                 }
             } else {
                 cpu.key_wait();
@@ -1566,8 +1569,21 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                             .unwrap_or(cpu.bus.disk.get_current_drive());
                         cpu.set_dx(drive as u16);
                     }
+                    // Bit 5: a device in raw (binary) mode.
+                    if device.is_some() && cpu.bus.disk.device_raw(sft) {
+                        cpu.set_dx(cpu.dx() | 0x20);
+                    }
                     cpu.set_cpu_flag(CpuFlags::CF, false);
                     // cpu.bus.log_string(&format!("[DOS] IOCTL Get Device Info -> {:04X}", cpu.dx()));
+                }
+                // Set Device Information: bit 5 of DL puts a device in raw
+                // (binary) mode, where its output isn't cooked.
+                0x01 if device.is_some() => {
+                    if let Some(sft) = sft {
+                        let raw = cpu.get_dl() & 0x20 != 0;
+                        cpu.bus.disk.set_device_raw(sft, raw);
+                    }
+                    cpu.set_cpu_flag(CpuFlags::CF, false);
                 }
                 // Check if Block Device is Removable (BL = drive, 0=default)
                 0x08 => {
