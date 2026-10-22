@@ -47,8 +47,9 @@ enum Placement {
 }
 
 /// The paragraphs a program needs to start: its PSP, its code, and for a
-/// COM file a stack, for an EXE file the memory its header asks for.
-fn program_paras(bytes: &[u8]) -> u16 {
+/// COM file a stack, for an EXE file the memory its header asks for. An
+/// EXE file's image is cut at the end of the file, as `load_exe` cuts it.
+pub(crate) fn program_paras(bytes: &[u8]) -> u16 {
     if bytes.len() >= 0x20 && &bytes[0..2] == b"MZ" {
         let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
         let (last_page, pages, header, min_alloc) = (word(2), word(4), word(8), word(10));
@@ -56,7 +57,8 @@ fn program_paras(bytes: &[u8]) -> u16 {
             (0, _) => bytes.len(),
             (p, 0) => p * 512,
             (p, l) => (p - 1) * 512 + l,
-        };
+        }
+        .min(bytes.len());
         (0x10 + module.saturating_sub(header * 16).div_ceil(16) + min_alloc).min(0xFFFF) as u16
     } else {
         (0x10 + bytes.len().div_ceil(16) + 0x20).min(0x1000) as u16

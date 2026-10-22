@@ -1001,11 +1001,18 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 } else {
                     // Load failed — release the MCBs we allocated, pop the
                     // context we just saved, and return an error to the parent.
+                    // An EXE file whose MINALLOC doesn't fit in the largest
+                    // free block is short of memory (08h), not missing.
+                    let block = crate::mcb::read_mcb(&mut cpu.bus, load_segment - 1).size;
+                    let short = program.as_deref().is_some_and(|bytes| {
+                        bytes.starts_with(b"MZ") && block < crate::cpu::program_paras(bytes)
+                    });
                     let _ = crate::mcb::free(&mut cpu.bus, load_segment);
                     let _ = crate::mcb::free(&mut cpu.bus, env_seg);
                     cpu.restore_process_context();
                     cpu.set_cpu_flag(CpuFlags::CF, true);
-                    cpu.set_reg16(Register::AX, 0x02); // File not found
+                    // Insufficient memory, or file not found.
+                    cpu.set_reg16(Register::AX, if short { 0x08 } else { 0x02 });
                 }
             } else if mode == 0x03 {
                 // AL=03h: Load Overlay. Loads an EXE (or raw binary) into

@@ -472,3 +472,40 @@ fn exec_gives_an_exe_file_no_more_than_its_maxalloc_paragraphs() {
     let top = cpu.bus.read_16(child_psp as usize * 16 + 2);
     assert_eq!(top, child_psp + 0x12);
 }
+
+#[test]
+fn exec_of_an_exe_file_too_big_for_memory_fails_with_insufficient_memory() {
+    #[rustfmt::skip]
+    let parent = [
+        0xB4, 0x4A,             // MOV AH,4Ah: shrink to 1000h paragraphs
+        0xBB, 0x00, 0x10,       // MOV BX,1000h
+        0xCD, 0x21,             // INT 21h
+        0xB8, 0x00, 0x4B,       // MOV AX,4B00h
+        0xBB, 0x00, 0x02,       // MOV BX,0200h
+        0xBA, 0x00, 0x03,       // MOV DX,0300h
+        0xCD, 0x21,             // INT 21h
+        0xF4,                   // HLT
+    ];
+    // MINALLOC F000h paragraphs: more than all of conventional memory.
+    let child = exe(&[0xF4], 0xF000, 0xF000);
+    let dir = scratch("exec_too_big", &[("PARENT.COM", &parent), ("CHILD.EXE", &child)]);
+    let mut cpu = Cpu::new(dir);
+    assert!(cpu.load_executable("PARENT.COM", None));
+    let psp = cpu.current_psp;
+    let base = psp as usize * 16;
+    cpu.bus.write_16(base + 0x202, 0x0280);
+    cpu.bus.write_16(base + 0x204, psp);
+    cpu.bus.load_bytes(base + 0x280, &[0x00, 0x0D]);
+    cpu.bus.load_bytes(base + 0x300, b"CHILD.EXE\0");
+
+    for _ in 0..1000 {
+        let at = cpu.get_physical_addr(cpu.cs(), cpu.ip());
+        if cpu.bus.read_8(at) == 0xF4 {
+            break;
+        }
+        cpu.step();
+    }
+    assert_eq!(cpu.current_psp, psp, "the parent is back at its HLT");
+    assert!(cpu.get_cpu_flag(CpuFlags::CF));
+    assert_eq!(cpu.ax(), 0x0008);
+}
