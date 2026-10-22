@@ -672,8 +672,13 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
             // the exit code the parent expects. F117.COM tests `AL != 0` after
             // DSWAP, so we return 1 there; it doesn't inspect PLAYER's exit
             // code at all so 0 is fine.
+            //
+            // PLAYER.EXE is a common name: Millennia's intro player has it
+            // too. Only the one with DSWAP.EXE beside it is MicroProse's.
             let upper = filename.to_ascii_uppercase();
             let short = upper.rsplit(&['\\', '/', ':'][..]).next().unwrap_or("");
+            let dir = &filename[..filename.len() - short.len()];
+            let microprose = cpu.bus.disk.file_data(&format!("{dir}DSWAP.EXE")).is_some();
             if mode == 0x00 {
                 match short {
                     "DSWAP.EXE" => {
@@ -686,7 +691,7 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                         cpu.set_reg16(Register::AX, 0x0000);
                         return;
                     }
-                    "PLAYER.EXE" => {
+                    "PLAYER.EXE" if microprose => {
                         cpu.bus.log_string(&format!(
                             "[DOS] EXEC: short-circuiting PLAYER.EXE ({}), exit=00",
                             filename
