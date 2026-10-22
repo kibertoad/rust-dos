@@ -468,4 +468,7 @@ fn exec_gives_an_exe_file_no_more_than_its_maxalloc_paragraphs() {
     // Its PSP, its one paragraph of code, and MAXALLOC's one.
     let block = rust_dos::mcb::read_mcb(&mut cpu.bus, child_psp - 1);
     assert_eq!(block.size, 0x12);
+    // Its PSP's top of memory is the end of that block.
+    let top = cpu.bus.read_16(child_psp as usize * 16 + 2);
+    assert_eq!(top, child_psp + 0x12);
 }

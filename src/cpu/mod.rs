@@ -1881,6 +1881,12 @@ impl Cpu {
         self.load_program_bytes(filename, &bytes, placement)
     }
 
+    /// EXEC: load a program already read from `filename` (with
+    /// `read_program_file`) into the block allocated for it at `segment`.
+    pub(crate) fn load_child(&mut self, filename: &str, bytes: &[u8], segment: u16) -> bool {
+        self.load_program_bytes(filename, bytes, Placement::Child(segment))
+    }
+
     /// LOADHIGH: load a program from the shell into the largest free upper
     /// memory block, if it fits there, else as `load_executable` does.
     pub fn load_executable_high(&mut self, filename: &str) -> bool {
@@ -2181,12 +2187,14 @@ impl Cpu {
     }
 
     /// The top of a program's memory, for its PSP: the end of conventional
-    /// memory, or of its upper memory block.
+    /// memory, or of the block EXEC or LOADHIGH allocated for it, which
+    /// EXEC sizes to an EXE file's MAXALLOC.
     fn memory_top(&mut self, placement: Placement, load_segment: u16) -> u16 {
         match placement {
-            Placement::High(psp) => psp + crate::mcb::read_mcb(&mut self.bus, psp - 1).size,
+            Placement::High(psp) | Placement::Child(psp) => {
+                psp.saturating_add(crate::mcb::read_mcb(&mut self.bus, psp - 1).size)
+            }
             Placement::Shell => crate::mcb::low_end(&self.bus),
-            Placement::Child(_) => crate::mcb::conventional_end(&self.bus),
         }
         .max(load_segment)
     }
@@ -2240,7 +2248,7 @@ impl Cpu {
         self.bus.guest_write_bytes(psp_phys, &[0xCD, 0x20]);
 
         // Offset 0x02: Top of Memory (Segment): the end of conventional
-        // memory (640 KB), or of the upper memory block.
+        // memory (640 KB), or of the block allocated for the program.
         self.bus.guest_write_16(psp_phys + 2, top);
 
         // [0x06] Bytes in Segment (CP/M compatibility)
@@ -2438,7 +2446,7 @@ impl Cpu {
 
         // Offset 0x02: Top of Memory (Segment)
         // Programs read this to know how much RAM they have: the end of
-        // conventional memory (640KB), or of their upper memory block.
+        // conventional memory (640KB), or of the block allocated for them.
         let top = self.memory_top(placement, load_segment);
         self.bus.guest_write_16(psp_phys + 2, top);
 

@@ -160,10 +160,11 @@ fn write_country_info(cpu: &mut Cpu, addr: usize, len: usize) {
     cpu.bus.guest_write_bytes(addr as u32, &info[..len]);
 }
 
-/// Allocate the largest available free MCB for a child process about to be
-/// loaded via EXEC, and return its first usable paragraph (the new PSP seg).
+/// Allocate a block for a child process about to be loaded via EXEC: the
+/// largest free one, or `wanted` paragraphs of it when that is less.
+/// Returns its first usable paragraph (the new PSP segment).
 /// The MCB owner is temporarily set to the placeholder 0xFFFF and must be
-/// patched to the child's PSP by the caller once load_executable sets it.
+/// patched to the child's PSP by the caller once the program is loaded.
 /// Returns None if no free memory could be allocated.
 fn find_child_load_segment(cpu: &mut Cpu, wanted: Option<u16>) -> Option<u16> {
     // Walk the chain to find the largest free block: in conventional
@@ -182,11 +183,19 @@ fn find_child_load_segment(cpu: &mut Cpu, wanted: Option<u16>) -> Option<u16> {
     }
 
     // The whole block, unless the program's header asks for less: DOS
-    // gives an EXE file no more than its MAXALLOC paragraphs, and a program
-    // that counts on that (Millennia's ECGAME.EXE asks for one) never shrinks
-    // its block before starting its own children.
+    // gives an EXE file no more than its MAXALLOC paragraphs, and a
+    // program that counts on that (Millennia's ECGAME.EXE asks for one)
+    // never shrinks its block before starting its own children. A block
+    // smaller than the largest goes where the strategy says, so a program
+    // asking for upper memory first gets it there if it fits.
     let paras = wanted.map_or(largest, |wanted| wanted.min(largest));
-    crate::mcb::alloc(&mut cpu.bus, 0xFFFF, paras).ok()
+    let strategy = cpu.alloc_strategy;
+    let high = if upper {
+        crate::mcb::alloc_strategy(&mut cpu.bus, 0xFFFF, paras, strategy).ok()
+    } else {
+        None
+    };
+    high.or_else(|| crate::mcb::alloc(&mut cpu.bus, 0xFFFF, paras).ok())
 }
 
 /// 0-based drive for a DOS drive code where 0 = default, 1 = A:, ...
@@ -856,14 +865,11 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 let return_address = (cpu.bus.guest_read_16(frame), cpu.bus.guest_read_16(frame + 2));
 
                 let parent_psp_before = cpu.current_psp;
-                // Allocate the child's block from the largest free one: all of
-                // it for a COM file, up to what its header asks for an EXE.
-                let wanted = cpu
-                    .bus
-                    .disk
-                    .file_data(&target_filename)
-                    .and_then(|file| file.read().ok())
-                    .and_then(|bytes| crate::cpu::exec_block_paras(&bytes));
+                // Allocate the child's block from the largest free one: all
+                // of it for a COM file, up to what its header asks for an
+                // EXE file.
+                let program = cpu.read_program_file(&target_filename);
+                let wanted = program.as_deref().and_then(crate::cpu::exec_block_paras);
                 let load_segment = match find_child_load_segment(cpu, wanted) {
                     Some(seg) => seg,
                     None => {
@@ -877,7 +883,10 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                     }
                 };
 
-                if cpu.load_executable(&target_filename, Some(load_segment)) {
+                let loaded = program
+                    .as_deref()
+                    .is_some_and(|bytes| cpu.load_child(&target_filename, bytes, load_segment));
+                if loaded {
                     let child_at = cpu.psp_address(load_segment);
                     if let Some(context) = cpu.process_stack.last_mut() {
                         context.child = load_segment;
