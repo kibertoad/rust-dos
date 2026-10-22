@@ -678,7 +678,6 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
             let upper = filename.to_ascii_uppercase();
             let short = upper.rsplit(&['\\', '/', ':'][..]).next().unwrap_or("");
             let dir = &filename[..filename.len() - short.len()];
-            let microprose = cpu.bus.disk.file_data(&format!("{dir}DSWAP.EXE")).is_some();
             if mode == 0x00 {
                 match short {
                     "DSWAP.EXE" => {
@@ -691,7 +690,7 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                         cpu.set_reg16(Register::AX, 0x0000);
                         return;
                     }
-                    "PLAYER.EXE" if microprose => {
+                    "PLAYER.EXE" if cpu.bus.disk.is_file(&format!("{dir}DSWAP.EXE")) => {
                         cpu.bus.log_string(&format!(
                             "[DOS] EXEC: short-circuiting PLAYER.EXE ({}), exit=00",
                             filename
