@@ -63,6 +63,23 @@ fn program_paras(bytes: &[u8]) -> u16 {
     }
 }
 
+/// The block EXEC gives a program, when it is less than the largest free
+/// one: for an EXE file its PSP, its image and MAXALLOC paragraphs, or the
+/// MINALLOC ones if there are more. `None` for a COM file and for an EXE
+/// file asking for no memory (load high), which get the whole block.
+pub(crate) fn exec_block_paras(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x20 || &bytes[0..2] != b"MZ" {
+        return None;
+    }
+    let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let (min_alloc, max_alloc) = (word(10), word(12));
+    if min_alloc == 0 && max_alloc == 0 {
+        return None;
+    }
+    let base = program_paras(bytes).saturating_sub(min_alloc);
+    Some(base.saturating_add(max_alloc.max(min_alloc)))
+}
+
 /// FLAGS bits POPF and IRET load: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL
 /// and NT.
 const FLAGS16_WRITABLE: u32 = 0x7FD5;

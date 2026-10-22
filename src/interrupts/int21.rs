@@ -165,7 +165,7 @@ fn write_country_info(cpu: &mut Cpu, addr: usize, len: usize) {
 /// The MCB owner is temporarily set to the placeholder 0xFFFF and must be
 /// patched to the child's PSP by the caller once load_executable sets it.
 /// Returns None if no free memory could be allocated.
-fn find_child_load_segment(cpu: &mut Cpu) -> Option<u16> {
+fn find_child_load_segment(cpu: &mut Cpu, wanted: Option<u16>) -> Option<u16> {
     // Walk the chain to find the largest free block: in conventional
     // memory, unless the program asked for upper memory and linked it.
     let upper = cpu.alloc_strategy & 0xC0 != 0 && cpu.bus.umb.is_some_and(|u| u.linked);
@@ -181,9 +181,12 @@ fn find_child_load_segment(cpu: &mut Cpu) -> Option<u16> {
         return None;
     }
 
-    // Grab the whole block — DOS convention is "give the child everything;
-    // the child's own startup will AH=4A down to what it needs".
-    crate::mcb::alloc(&mut cpu.bus, 0xFFFF, largest).ok()
+    // The whole block, unless the program's header asks for less: DOS
+    // gives an EXE file no more than its MAXALLOC paragraphs, and a program
+    // that counts on that (Millennia's ECGAME.EXE asks for one) never shrinks
+    // its block before starting its own children.
+    let paras = wanted.map_or(largest, |wanted| wanted.min(largest));
+    crate::mcb::alloc(&mut cpu.bus, 0xFFFF, paras).ok()
 }
 
 /// 0-based drive for a DOS drive code where 0 = default, 1 = A:, ...
@@ -853,10 +856,15 @@ fn dispatch(cpu: &mut Cpu, ah: u8) {
                 let return_address = (cpu.bus.guest_read_16(frame), cpu.bus.guest_read_16(frame + 2));
 
                 let parent_psp_before = cpu.current_psp;
-                // Allocate the largest free MCB for the child. DOS gives the
-                // child all available conventional memory; it will shrink via
-                // AH=4A in its own startup if it wants to spawn nested children.
-                let load_segment = match find_child_load_segment(cpu) {
+                // Allocate the child's block from the largest free one: all of
+                // it for a COM file, up to what its header asks for an EXE.
+                let wanted = cpu
+                    .bus
+                    .disk
+                    .file_data(&target_filename)
+                    .and_then(|file| file.read().ok())
+                    .and_then(|bytes| crate::cpu::exec_block_paras(&bytes));
+                let load_segment = match find_child_load_segment(cpu, wanted) {
                     Some(seg) => seg,
                     None => {
                         let _ = crate::mcb::free(&mut cpu.bus, env_seg);
