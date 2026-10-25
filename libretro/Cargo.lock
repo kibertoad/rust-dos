@@ -1322,6 +1322,7 @@ dependencies = [
  "rust-dos-dma",
  "rust-dos-gus",
  "rust-dos-hostdirs",
+ "rust-dos-indeo3",
  "rust-dos-installshield",
  "rust-dos-lpt-dac",
  "rust-dos-mpu401",
@@ -1378,6 +1379,10 @@ version = "1.7.5"
 dependencies = [
  "dirs",
 ]
+
+[[package]]
+name = "rust-dos-indeo3"
+version = "1.7.5"
 
 [[package]]
 name = "rust-dos-installshield"
