@@ -47,6 +47,22 @@ impl DiskController {
     /// tells it: (sectors per cluster, free clusters, bytes per sector,
     /// total clusters), whatever their size.
     pub fn get_disk_free_space32(&self, drive: u8) -> Result<(u32, u32, u32, u32), u16> {
+        self.free_space(drive, false)
+    }
+
+    /// The free space of `drive` (0 the current one, 1 A:) as the built-in
+    /// Windows tells it, in the numbers of `get_disk_free_space32`. A
+    /// folder hard disk is a larger fake disk here than DOS's 80 MB
+    /// (`WINDOWS_HARD_DISK_STEP`): Windows 95 and 98 report a real disk's
+    /// space, up to 2 GB through GetDiskFreeSpaceA, and their setup
+    /// programs check whole installs of a few hundred MB against it.
+    pub fn windows_free_space(&self, drive: u8) -> Result<(u32, u32, u32, u32), u16> {
+        self.free_space(drive, true)
+    }
+
+    /// The free space of `drive` (0 the current one, 1 A:), for DOS or,
+    /// with `windows`, for the built-in Windows (`windows_free_space`).
+    fn free_space(&self, drive: u8, windows: bool) -> Result<(u32, u32, u32, u32), u16> {
         let target_drive = if drive == 0 {
             self.current_drive
         } else {
@@ -73,6 +89,12 @@ impl DiskController {
             // A hard disk counts it too, so the free space drops as files
             // are written: Sierra's installer takes a disk whose free space
             // doesn't for a compressed one.
+            DriveKind::HardDisk if windows => {
+                let used = used(u64::MAX);
+                let free = hard_disk_free(WINDOWS_HARD_DISK_STEP, used);
+                let total = (used + free as u64).min(u32::MAX as u64) as u32;
+                (spc, free, bps, total)
+            }
             DriveKind::HardDisk => {
                 let used = used(u64::MAX);
                 let free = hard_disk_free(total, used);
@@ -614,3 +636,9 @@ fn hard_disk_free(step: u32, used: u64) -> u32 {
     let step = step as u64;
     (((used + step / 2) / step + 1) * step - used) as u32
 }
+
+/// The step of a folder hard disk's fake size for the built-in Windows
+/// (`windows_free_space`): 1 GB of 4 KB clusters. Its free space then
+/// stays between 512 MB and 1.5 GB, below the 2 GB that programs of the
+/// time multiply out in signed 32-bit numbers.
+const WINDOWS_HARD_DISK_STEP: u32 = 1 << 18;
