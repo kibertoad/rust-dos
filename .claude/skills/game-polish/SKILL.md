@@ -256,12 +256,15 @@ Fix the issues in rank order. For each one:
    solution / smallest scope
    ```
 
-   Apply every finding it makes, optional improvements included, choosing
-   the change that is better for the code in the long run over the
-   smallest one. Check the result again as in step 4, commit, and push to
-   the pull request's branch. Validation in step 7 runs on this pushed
-   head, never on the code from before the review: if validation leads to
-   more changes, push them, and run the review again on what changed.
+   Apply each finding that is a net improvement, optional ones included,
+   choosing the change that is better for the code in the long run over
+   the smallest one. Leave out a finding that the review or you judge not
+   actually useful (a false positive, or a change that costs more than it
+   gives), and say in the pull request which ones were left out and why.
+   Check the result again as in step 4, commit, and push to the pull
+   request's branch. Validation in step 7 runs on this pushed head, never
+   on the code from before the review: if validation leads to more
+   changes, push them, and run the review again on what changed.
 7. **Validate against the game.** Build the worktree's release binary
    from the pushed head, then run the game as in Phase 0 with that
    binary:
