@@ -1,4 +1,5 @@
-//! Drives: which there are, their kinds and their free space, from DOS's.
+//! Drives: which there are and their kinds, from DOS's, and their free
+//! space as the built-in Windows sees it.
 
 use super::{ERROR_INVALID_DRIVE, ERROR_PATH_NOT_FOUND, FALSE, TRUE, set_error, string_at};
 use crate::cpu::Cpu;

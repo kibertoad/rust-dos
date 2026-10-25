@@ -88,20 +88,20 @@ impl DiskController {
             DriveKind::Floppy => (spc, total - used(total as u64) as u32, bps, total),
             // A hard disk counts it too, so the free space drops as files
             // are written: Sierra's installer takes a disk whose free space
-            // doesn't for a compressed one.
-            DriveKind::HardDisk if windows => {
-                let used = used(u64::MAX);
-                let free = hard_disk_free(WINDOWS_HARD_DISK_STEP, used);
-                let total = (used + free as u64).min(u32::MAX as u64) as u32;
-                (spc, free, bps, total)
-            }
+            // doesn't for a compressed one. DOS sees a fake 80 MB disk in
+            // no more clusters than AH=36h holds, so that it doesn't count
+            // in larger clusters (`old_space`) and every 4 KB written
+            // shows. The built-in Windows sees a fake 1 GB one
+            // (`WINDOWS_HARD_DISK_STEP`).
             DriveKind::HardDisk => {
+                let (step, max_total) = if windows {
+                    (WINDOWS_HARD_DISK_STEP, u32::MAX)
+                } else {
+                    (total, 0xFFFF)
+                };
                 let used = used(u64::MAX);
-                let free = hard_disk_free(total, used);
-                // No more clusters than AH=36h holds, so that it doesn't
-                // count in larger clusters (`old_space`) and every 4 KB
-                // written shows.
-                let total = (used + free as u64).min(0xFFFF) as u32;
+                let free = hard_disk_free(step, used);
+                let total = (used + free as u64).min(max_total as u64) as u32;
                 (spc, free, bps, total)
             }
             DriveKind::CdRom => (spc, 0, bps, total),
@@ -627,11 +627,13 @@ impl DiskController {
 }
 
 /// The free clusters of a hard disk made of a host folder, `used` of them
-/// in use: what is left of the fake size `step` (80 MB), or of as many
-/// times that as leaves more than half of it free. Free space then drops
-/// cluster by cluster as files are written, and a folder holding more than
-/// 80 MB still has room for a save. Free clusters stay between half a step
-/// and one and a half (10,001 to 30,000), which signed 16-bit numbers hold.
+/// in use: what is left of the fake size `step`, or of as many times that
+/// as leaves more than half of it free. Free space then drops cluster by
+/// cluster as files are written, and a folder holding more than the fake
+/// size still has room for a save. Free clusters stay between half a step
+/// and one and a half: 10,001 to 30,000 of DOS's 80 MB, which signed
+/// 16-bit numbers hold, and just over 512 MB to 1.5 GB of the built-in
+/// Windows's 1 GB (`WINDOWS_HARD_DISK_STEP`).
 fn hard_disk_free(step: u32, used: u64) -> u32 {
     let step = step as u64;
     (((used + step / 2) / step + 1) * step - used) as u32
