@@ -175,3 +175,4 @@ the core.
 * The program's CRT shaders (the frontend has shaders of its own).
 * MIDI out of the host's MIDI ports (`midisynth=host`).
 * The debug server.
+
