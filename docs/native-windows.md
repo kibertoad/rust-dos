@@ -258,6 +258,37 @@ exceptions run as the program's own code on top of that.
   doesn't load, as on Windows 95, and `GetProcAddress` doesn't find it.
   The setting is read when the first process starts, and kept in save
   states.
+- The built-in DLLs are files in the system directory,
+  `C:\WINDOWS\SYSTEM`, as Windows has its DLLs there: programs and
+  setups that look for a DLL by its file (`CreateFile` or `fopen` for
+  reading, `OpenFile` with `OF_EXIST`, `GetFileAttributes`,
+  `FindFirstFile`) find the ones `LoadLibrary` loads
+  (`src/win32/dll_files.rs`). Xenocracy's hardware profiler opens
+  `GLIDE2X.DLL` there to tell whether the machine has Glide. Each file
+  is the DLL's PE image: its headers, sections and export directory as
+  it is mapped in a process, with the functions the version of Windows
+  has, and the version resource `GetFileVersionInfo` gives for it. They
+  are there while the built-in Windows is on, and follow the loader's
+  rules: `GLIDE2X.DLL` with a 3dfx card alone (`voodoo=true`, or a
+  Banshee or Voodoo3 as the display adapter), `NTDLL.DLL` with
+  `win32_dlls` alone, and a DLL that `win32_dlls_replace` replaces with
+  one of the folder's not at all.
+
+  The files are read-only: they open for reading alone, show as
+  read-only (FILE_ATTRIBUTE_READONLY and ARCHIVE), and opening one for
+  writing, making, deleting or renaming one, copying a file over it or
+  changing its attributes fails with ERROR_ACCESS_DENIED, as for a
+  read-only file. A file of the same name on C: wins: a game that
+  copies its own DLL there has it. `DiskController` shows them
+  (`src/disk/system_files.rs`), under the drive's own files, so DOS
+  sees them too: `DIR C:\WINDOWS\SYSTEM` and a DOS program's INT 21h
+  list and open them, as in a DOS box of Windows 98. A save state
+  opens a file that was open again by its path, and once loaded the
+  files are of the version of Windows its programs run under. While C:
+  has no `WINDOWS\SYSTEM` folder, it and `WINDOWS` show as directories
+  with just the DLLs in them, and are made on C: when a program makes a
+  file or directory in them; neither can be removed while it holds
+  them.
 
 ### Video
 
@@ -565,21 +596,23 @@ Glide, Expendable with Direct3D.
 
 GLIDE2X.DLL drives the card's registers as 3dfx's library did, on a
 Voodoo Graphics, a Voodoo2, a Banshee and a Voodoo3, and Direct3D's HAL
-(Direct3D 1 to 7's interfaces in DDRAW.DLL) draws through the same
-code. On a Banshee or Voodoo3 the desktop is 640x480 at 16 bits a pixel
-in the card's own memory and modes, so DirectDraw's surfaces there are
-what the 3D engine renders into, in a window too. A Voodoo Graphics or
-Voodoo2 add-on card is a second DirectDraw device, as 3dfx's driver
-made it, with the card's full-screen modes and buffers. There is no
-software rasterizer, so the RGB and Ramp devices aren't there. The 3D
-engine draws 16-bit color and depth only, so on a Banshee or Voodoo3 a
-24- or 32-bit render target or depth buffer is drawn into a 16-bit
-shadow of it in the card's memory, which the HAL loads from the
-surface before drawing and widens into it when the program can see it
-(Lock, GetDC, Blt, Flip, EndScene): the surface stays 32-bit, what is
-drawn has 16-bit precision, and a Clear writes its exact color. On a
-Voodoo Graphics or Voodoo2 such targets fail, as they did with 3dfx's
-driver.
+(Direct3D 1 to 7's interfaces in DDRAW.DLL) draws through the same code.
+On a Banshee or Voodoo3 the desktop is 640x480 at 16 bits a pixel in the
+card's own memory and modes, so DirectDraw's surfaces there are what the
+3D engine renders into, in a window too. A Voodoo Graphics or Voodoo2
+add-on card is a second DirectDraw device, as 3dfx's driver made it,
+with the card's full-screen modes and buffers. Without a 3dfx card there
+is no GLIDE2X.DLL, as on Windows without 3dfx's driver: `LoadLibrary`
+doesn't find it (or finds the game's own copy), and a program that
+imports it doesn't start. There is no software rasterizer, so the RGB
+and Ramp devices aren't there. The 3D engine draws 16-bit color and
+depth only, so on a Banshee or Voodoo3 a 24- or 32-bit render target or
+depth buffer is drawn into a 16-bit shadow of it in the card's memory,
+which the HAL loads from the surface before drawing and widens into it
+when the program can see it (Lock, GetDC, Blt, Flip, EndScene): the
+surface stays 32-bit, what is drawn has 16-bit precision, and a Clear
+writes its exact color. On a Voodoo Graphics or Voodoo2 such targets
+fail, as they did with 3dfx's driver.
 
 Unreal Gold runs from GOG's folder on a Voodoo2 and a Voodoo3: its
 levels with Glide, its intro and menus with Direct3D. Quake 2's 3.14
@@ -588,6 +621,19 @@ came with on the Voodoo2 and MiniGL 1.49 on the Voodoo3, as on the real
 cards. Incoming and Expendable run with Direct3D. SHELL32, COMCTL32,
 COMDLG32, WSOCK32 and DPLAYX came in for them, answering as a machine
 without a network does, with each common dialog cancelled.
+
+D3D8.DLL (DirectX 8.1's interfaces) came after phase 5, on the same
+HAL: IDirect3D8 with one adapter, the display's 16- and 32-bit modes,
+and a HAL device that processes vertices in software, as 3dfx's DirectX
+8 driver for the Voodoo3 did. Hardware or mixed vertex processing, the
+REF device, stencil, cube and volume textures and pixel shaders aren't
+there, and the caps say so. Its surfaces, textures and buffers are
+DirectDraw surfaces underneath, so a 32-bit target or texture is drawn
+with 16-bit precision as Direct3D 7's are. Vertices go through the
+fixed-function pipeline of Direct3D 7's device, from an FVF or a
+vertex declaration, and vs.1.1 shaders run in an interpreter before
+the HAL draws what they give. On a Voodoo Graphics or Voodoo2 add-on
+card CreateDevice fails with D3DERR_NOTAVAILABLE.
 
 **Phase 5: breadth.**
 
@@ -683,6 +729,43 @@ DOS, but needs Windows 3.1's own files.
 winevdm's scope (GPL-2.0, Wine's 16-bit DLLs) is the reference for what a
 complete layer needs.
 
+What the layer has (`src/win16/`, with the NE parser in `crates/ne`):
+
+- A Windows 3.1 program starts as a task of KRNL386.EXE, a Win32
+  process whose threads are the tasks. They share its LDT and global
+  heap, and run one at a time under the Win16 lock, giving it up when
+  they wait for messages.
+- KERNEL, USER, GDI, KEYBOARD, SOUND, SYSTEM, DISPLAY, WIN87EM,
+  TOOLHELP, SHELL, COMMDLG, MMSYSTEM, LZEXPAND, VER, WING and DDEML are
+  NE images made at start-up, of stubs that trap into Rust. Most
+  functions go on to the 32-bit function of the same name through a
+  thunk that converts handles, structures and 16:16 pointers. Window,
+  dialog, enumeration and font enumeration procedures are called back
+  through thunks the other way. A program's own DLLs, such as
+  VBRUN300.DLL, load from its folder.
+- KERNEL's global and local heaps are Windows 3.1's: selectors tiled
+  for huge blocks, moveable and discardable blocks, lock counts, local
+  heaps in any segment (LocalInit). Resources come from the NE file,
+  names from RT_NAMETABLE included, and AccessResource opens the file at
+  them.
+- INT 21h from a Windows program goes to DOS with its 16:16 pointers
+  translated, and INT 31h to a DPMI 0.9 host of the task's LDT: its
+  descriptors, DOS memory, interrupt vectors, real-mode calls and
+  linear memory. A descriptor that changes under a segment register is
+  loaded into it again, as Windows' host does.
+- Windows 3.1 programs see version 3.95, Windows 95's, and not the
+  WS_EX_WINDOWEDGE style USER32 gives their windows.
+- A call of a function the built-in modules don't have yet stops the
+  program with a message that names it.
+
+Games tried, all of which start and draw their windows: SkiFree,
+BrickBreaker II, Jewels, Klotz, Gems, Kloks, Hyperoid, Button Madness,
+Castle of the Winds, Kye, Mah Jongg, Missile Attack, Mother of All
+Battles, Runner, Squirmer, WinFire, WinRoids, WinG's STATIC sample, and
+two Visual Basic games with their runtimes, 3 Shuffles & A Draw (VB3)
+and Prairie Dog Hunt (VB2). The 16-bit setup programs, InstallShield's
+among them, are still to be tried.
+
 Some choices in the earlier phases keep this phase from having to rework
 them:
 
@@ -735,7 +818,8 @@ traces call, not whole DLLs.
     for the program groups InstallShield 5 makes through DDE),
     version's `info` and `install`, lz32's `lzexpand_main`, and ole32's
     `compobj`, `hglobalstream` and `propvariant`; and DirectMusic's
-    three, from the releases named above.
+    three, from the releases named above. D3D8.DLL brings all eight of
+    d3d8's.
   - Since phase 5 they run as Windows 98 SE (`win32_version=98se`), so
     that the functions Windows 98 added are there for the tests that
     use them.
@@ -755,6 +839,15 @@ traces call, not whole DLLs.
     passes with a note, so `cargo test` works on any machine.
   - They are under the LGPL 2.1 or later, kept with their notices,
     which rust-dos's GPL-2.0-or-later allows.
+- Wine's tests ported to Windows 3.1 programs, for Win16, in
+  `tests/conformance16/` (its README lists them): five of KERNEL's,
+  seven of USER's and nine of GDI's, each cut from the Win32 test of
+  the same functions in the 1.2.3 tree to what Windows 3.1 has, and a
+  test of the DPMI services written here.
+  `tests/win16_conformance_tests.rs` builds them with OpenWatcom and
+  checks their results against `expected.txt` as the Win32 tests are
+  checked. CI runs them in the conformance workflow with a pinned
+  OpenWatcom snapshot.
 - The same test programs on the booted Windows 95 and 98 images give
   the expected output where Wine's tests don't say what 9x does: a test
   passes when the built-in layer prints what Windows printed. Wine's

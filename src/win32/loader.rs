@@ -26,7 +26,7 @@ pub const MIN_MEMORY: u32 = 0x40_0000;
 const MAX_STACK_COMMIT: u32 = 0x10_0000;
 /// Where the TLS slot array is in the TIB's page (`fs:[2Ch]` points at
 /// it), and how many slots it has, as on Windows 95.
-pub(super) const TLS_ARRAY: u32 = 0x100;
+pub(crate) const TLS_ARRAY: u32 = 0x100;
 pub(super) const TLS_SLOTS: u32 = 80;
 /// The address space the process heap can grow to.
 const HEAP_RESERVE: u32 = 0x100_0000;
@@ -38,31 +38,31 @@ const TIB_STACK_LIMIT: u32 = 0x08;
 const TIB_SELF: u32 = 0x18;
 const TIB_TLS_ARRAY: u32 = 0x2C;
 /// The process's database, as Windows 95 has it (`process_block`).
-pub(super) const TIB_PROCESS: u32 = 0x30;
+pub(crate) const TIB_PROCESS: u32 = 0x30;
 
 /// Where the process's database is: in the block of the command line,
 /// after the ANSI one. Of its fields only the process heap at 18h is
 /// filled, which Windows 95 has there as Windows NT has it in the PEB
 /// that fs:[30h] points to there: Wine's DLLs read it so for
 /// GetProcessHeap.
-pub(super) fn process_block(command_line: u32) -> u32 {
+pub(crate) fn process_block(command_line: u32) -> u32 {
     command_line + PAGE / 2
 }
 const PROCESS_HEAP: u32 = 0x18;
 
 /// Windows 95's directories, where the built-in DLLs are said to be and
 /// which the search for a DLL goes through.
-pub(super) const WINDOWS_DIR: &str = "C:\\WINDOWS";
-pub(super) const SYSTEM_DIR: &str = "C:\\WINDOWS\\SYSTEM";
+pub(crate) const WINDOWS_DIR: &str = "C:\\WINDOWS";
+pub(crate) const SYSTEM_DIR: &str = "C:\\WINDOWS\\SYSTEM";
 
 /// What a module is (`Module::flags`): a built-in DLL, a DLL that came
 /// with the program (neither is ever unloaded), one mapped as data, one
 /// whose imports weren't loaded, one whose entry point returned TRUE to
 /// DLL_PROCESS_ATTACH, and one that DisableThreadLibraryCalls was called
 /// for.
-pub(super) const BUILTIN: u32 = 0x01;
+pub(crate) const BUILTIN: u32 = 0x01;
 pub(super) const STATIC: u32 = 0x02;
-pub(super) const DATAFILE: u32 = 0x04;
+pub(crate) const DATAFILE: u32 = 0x04;
 pub(super) const UNRESOLVED: u32 = 0x08;
 pub(super) const ATTACHED: u32 = 0x10;
 pub(super) const NO_THREAD_CALLS: u32 = 0x20;
@@ -466,7 +466,7 @@ pub(super) fn module_file_name(name: &str) -> String {
 }
 
 /// The directory of the DOS path `path`, without a final backslash.
-pub(super) fn directory_of(path: &str) -> String {
+pub(crate) fn directory_of(path: &str) -> String {
     match path.rfind('\\') {
         Some(i) => path[..i].to_string(),
         None => String::new(),
@@ -498,12 +498,7 @@ fn find_file(l: &Loader, name: &str, file: &str) -> Option<String> {
     dirs.extend(disk.qualify_directory("X"));
     dirs.push(SYSTEM_DIR.to_string());
     dirs.push(WINDOWS_DIR.to_string());
-    let path = l.process.environment.iter().find_map(|s| {
-        s.split_once('=')
-            .filter(|(n, _)| n.eq_ignore_ascii_case("PATH"))
-            .map(|(_, v)| v.to_string())
-    });
-    if let Some(path) = path {
+    if let Some(path) = super::variable_value(&l.process.environment, "PATH") {
         dirs.extend(
             path.split(';')
                 .map(str::trim)
@@ -555,7 +550,7 @@ fn bad_image_error(file: &[u8]) -> u32 {
 
 /// Map the built-in DLL `index` where Windows 95 has it, read only.
 /// Its base.
-pub(super) fn map_builtin(
+pub(crate) fn map_builtin(
     bus: &mut Bus,
     memory: &mut Memory,
     process: &mut Process,
@@ -621,10 +616,18 @@ pub(super) fn load_module(
         } else {
             ERROR_DLL_NOT_FOUND
         },
-        message: format!(
-            "{} needs {}, which the built-in Windows doesn't have yet.",
-            importer, name
-        ),
+        message: if file == super::glide::DLL.name {
+            format!(
+                "{} needs {}, which the built-in Windows has with a 3dfx card \
+                 alone (the voodoo setting).",
+                importer, name
+            )
+        } else {
+            format!(
+                "{} needs {}, which the built-in Windows doesn't have yet.",
+                importer, name
+            )
+        },
     };
     if file.is_empty() {
         return Err(not_found());
@@ -959,23 +962,27 @@ fn bind_imports(
 /// names. With the `win32_dlls` setting, NTDLL.DLL is one, UCRT's
 /// ucrtbase.dll and api-ms-win-crt-*.dll are MSVCRT.DLL and
 /// KERNELBASE.DLL is KERNEL32.DLL, which Wine's DLLs import; a DLL the
-/// setting replaces, which the folder has, isn't.
+/// setting replaces, which the folder has, isn't. GLIDE2X.DLL is there
+/// with a 3dfx card alone, as 3dfx's driver brings it. The system
+/// directory shows the same DLLs as files (dll_files.rs).
 pub(super) fn builtin_for(bus: &Bus, file: &str) -> Option<usize> {
     let index = stubs::find_dll(file);
     let win32 = &bus.win32;
-    if win32.guest_dlls.is_none() {
-        return index.filter(|&i| stubs::DLLS[i].name != super::ntdll::DLL.name);
-    }
-    let stem = file.strip_suffix(".DLL").unwrap_or(file).to_ascii_lowercase();
-    if win32.guest_replace.contains(&stem) && guest_file(bus, file).is_some() {
-        return None;
-    }
-    match stem.as_str() {
-        "ucrtbase" => stubs::find_dll("MSVCRT.DLL"),
-        _ if stem.starts_with("api-ms-win-crt-") => stubs::find_dll("MSVCRT.DLL"),
-        "kernelbase" => stubs::find_dll("KERNEL32.DLL"),
-        _ => index,
-    }
+    let found = if win32.guest_dlls.is_none() {
+        index.filter(|&i| stubs::DLLS[i].name != super::ntdll::DLL.name)
+    } else {
+        let stem = file.strip_suffix(".DLL").unwrap_or(file).to_ascii_lowercase();
+        if win32.guest_replace.contains(&stem) && guest_file(bus, file).is_some() {
+            return None;
+        }
+        match stem.as_str() {
+            "ucrtbase" => stubs::find_dll("MSVCRT.DLL"),
+            _ if stem.starts_with("api-ms-win-crt-") => stubs::find_dll("MSVCRT.DLL"),
+            "kernelbase" => stubs::find_dll("KERNEL32.DLL"),
+            _ => index,
+        }
+    };
+    found.filter(|&i| stubs::DLLS[i].name != super::glide::DLL.name || bus.voodoo.is_some())
 }
 
 /// The DLL `file` in the host folder the `win32_dlls` setting names,
@@ -1109,7 +1116,7 @@ pub(super) fn map_builtin_named(cpu: &mut crate::cpu::Cpu, name: &str) -> Option
 
 /// `len` bytes at `lin` in `memory`, read through its page tables
 /// without a page fault: None where a page isn't there.
-pub(super) fn peek(bus: &Bus, memory: &Memory, lin: u32, len: usize) -> Option<Vec<u8>> {
+pub(crate) fn peek(bus: &Bus, memory: &Memory, lin: u32, len: usize) -> Option<Vec<u8>> {
     (0..len as u32)
         .map(|i| {
             let phys = memory.translate(bus, lin.wrapping_add(i))?;
@@ -1124,7 +1131,7 @@ pub(super) fn peek_32(bus: &Bus, memory: &Memory, lin: u32) -> Option<u32> {
 }
 
 /// The NUL-terminated string at `lin`, at most `max` bytes of it.
-pub(super) fn peek_string(bus: &Bus, memory: &Memory, lin: u32, max: usize) -> Option<Vec<u8>> {
+pub(crate) fn peek_string(bus: &Bus, memory: &Memory, lin: u32, max: usize) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     while bytes.len() < max {
         let phys = memory.translate(bus, lin.wrapping_add(bytes.len() as u32))?;
