@@ -1,0 +1,68 @@
+name: exp
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  t:
+    name: ${{ matrix.v }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - v: base
+          - v: lt
+            debug: line-tables-only
+          - v: o1lt
+            debug: line-tables-only
+            opt: "1"
+          - v: nx-lt
+            debug: line-tables-only
+            nextest: true
+          - v: nx-o1lt
+            debug: line-tables-only
+            opt: "1"
+            nextest: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsdl2-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: exp-${{ matrix.v }}
+      - if: matrix.nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: profile
+        run: |
+          if [ -n "${{ matrix.debug }}" ]; then echo "CARGO_PROFILE_TEST_DEBUG=${{ matrix.debug }}" >> "$GITHUB_ENV"; echo "CARGO_PROFILE_DEV_DEBUG=${{ matrix.debug }}" >> "$GITHUB_ENV"; fi
+          if [ -n "${{ matrix.opt }}" ]; then echo "CARGO_PROFILE_TEST_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"; echo "CARGO_PROFILE_DEV_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"; fi
+          nproc; free -g; lscpu | grep "Model name"
+      - name: build
+        run: cargo test --workspace --locked --no-run
+      - name: run (interpreter)
+        if: ${{ !matrix.nextest }}
+        run: RUSTC_BOOTSTRAP=1 cargo test --workspace --locked -- -Z unstable-options --report-time
+      - name: run (dynamic)
+        if: ${{ !matrix.nextest }}
+        run: RUST_DOS_CORE=dynamic RUSTC_BOOTSTRAP=1 cargo test --locked -- -Z unstable-options --report-time
+      - name: run (interpreter, nextest)
+        if: matrix.nextest
+        run: cargo nextest run --workspace --locked --no-fail-fast && cargo test --workspace --locked --doc
+      - name: run (dynamic, nextest)
+        if: matrix.nextest
+        run: RUST_DOS_CORE=dynamic cargo nextest run --locked --no-fail-fast && RUST_DOS_CORE=dynamic cargo test --locked --doc
+      - run: du -sh target/debug/deps target/debug
