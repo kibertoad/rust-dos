@@ -47,18 +47,26 @@ jobs:
         with:
           tool: cargo-nextest
       - name: profile
+        env:
+          DEBUG: ${{ matrix.debug }}
+          OPT: ${{ matrix.opt }}
         run: |
-          if [ -n "${{ matrix.debug }}" ]; then echo "CARGO_PROFILE_TEST_DEBUG=${{ matrix.debug }}" >> "$GITHUB_ENV"; echo "CARGO_PROFILE_DEV_DEBUG=${{ matrix.debug }}" >> "$GITHUB_ENV"; fi
-          if [ -n "${{ matrix.opt }}" ]; then echo "CARGO_PROFILE_TEST_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"; echo "CARGO_PROFILE_DEV_OPT_LEVEL=${{ matrix.opt }}" >> "$GITHUB_ENV"; fi
-          nproc; free -g; lscpu | grep "Model name"
+          if [ -n "$DEBUG" ]; then
+            echo "" >> Cargo.toml
+            echo "[profile.test]" >> Cargo.toml
+            echo "debug = \"$DEBUG\"" >> Cargo.toml
+            if [ -n "$OPT" ]; then echo "opt-level = $OPT" >> Cargo.toml; fi
+          fi
+          tail -4 Cargo.toml
+          nproc; lscpu | grep "Model name"
       - name: build
-        run: cargo test --workspace --locked --no-run
+        run: cargo test --workspace --locked --no-run --verbose 2>&1 | grep -E "Running .*crate-name rust_dos .*src/lib.rs" | grep -oE "opt-level=[0-9]|debuginfo=[a-z0-9-]+" | sort | uniq -c; cargo test --workspace --locked --no-run
       - name: run (interpreter)
         if: ${{ !matrix.nextest }}
-        run: RUSTC_BOOTSTRAP=1 cargo test --workspace --locked -- -Z unstable-options --report-time
+        run: cargo test --workspace --locked
       - name: run (dynamic)
         if: ${{ !matrix.nextest }}
-        run: RUST_DOS_CORE=dynamic RUSTC_BOOTSTRAP=1 cargo test --locked -- -Z unstable-options --report-time
+        run: RUST_DOS_CORE=dynamic cargo test --locked
       - name: run (interpreter, nextest)
         if: matrix.nextest
         run: cargo nextest run --workspace --locked --no-fail-fast && cargo test --workspace --locked --doc
