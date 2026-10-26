@@ -720,7 +720,6 @@ pub fn create_surface(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
         return Some(DDERR_NOCOOPERATIVELEVELSET);
     }
     let desc = Desc::read(cpu, desc_at, size);
-    if std::env::var_os("GLV_DBG").is_some() { eprintln!("CS desc flags={:x} caps={:x?} w={} h={} bb={} fmt={:?}", desc.flags, desc.caps, desc.width, desc.height, desc.backbuffers, desc.format); }
     let ids = hr!(make(cpu, dd, version, level, &desc));
     let root = ids[0];
     let surface_version = match version {
