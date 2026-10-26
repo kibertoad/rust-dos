@@ -10,67 +10,56 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   t:
-    name: ${{ matrix.v }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} ${{ matrix.v }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - v: base
-          - v: lt
-            debug: line-tables-only
-          - v: o1lt
-            debug: line-tables-only
-            opt: "1"
-          - v: nx-lt
-            debug: line-tables-only
-            nextest: true
-          - v: nx-o1lt
-            debug: line-tables-only
-            opt: "1"
-            nextest: true
+        os: [windows-latest, macos-latest]
+        v: [base, o1lt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsdl2-dev libasound2-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install sdl2
+          echo "LIBRARY_PATH=$(brew --prefix)/lib:$LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          curl -fsSL -o SDL2-devel-VC.zip https://github.com/libsdl-org/SDL/releases/download/release-2.30.0/SDL2-devel-2.30.0-VC.zip
+          unzip -q SDL2-devel-VC.zip
+          mv SDL2-2.30.0 SDL2
+          echo "LIB=${{ github.workspace }}/SDL2/lib/x64" >> "$GITHUB_ENV"
+          echo "INCLUDE=${{ github.workspace }}/SDL2/include" >> "$GITHUB_ENV"
+          echo "${{ github.workspace }}/SDL2/lib/x64" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: exp-${{ matrix.v }}
-      - if: matrix.nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
+          key: exp2-${{ matrix.v }}
       - name: profile
-        env:
-          DEBUG: ${{ matrix.debug }}
-          OPT: ${{ matrix.opt }}
+        if: matrix.v == 'o1lt'
         run: |
-          if [ -n "$DEBUG" ]; then
-            echo "" >> Cargo.toml
-            echo "[profile.test]" >> Cargo.toml
-            echo "debug = \"$DEBUG\"" >> Cargo.toml
-            if [ -n "$OPT" ]; then echo "opt-level = $OPT" >> Cargo.toml; fi
-          fi
-          tail -4 Cargo.toml
-          nproc; lscpu | grep "Model name"
-      - name: build
-        run: cargo test --workspace --locked --no-run --verbose 2>&1 | grep -E "Running .*crate-name rust_dos .*src/lib.rs" | grep -oE "opt-level=[0-9]|debuginfo=[a-z0-9-]+" | sort | uniq -c; cargo test --workspace --locked --no-run
-      - name: run (interpreter)
-        if: ${{ !matrix.nextest }}
-        run: cargo test --workspace --locked
-      - name: run (dynamic)
-        if: ${{ !matrix.nextest }}
-        run: RUST_DOS_CORE=dynamic cargo test --locked
-      - name: run (interpreter, nextest)
-        if: matrix.nextest
-        run: cargo nextest run --workspace --locked --no-fail-fast && cargo test --workspace --locked --doc
-      - name: run (dynamic, nextest)
-        if: matrix.nextest
-        run: RUST_DOS_CORE=dynamic cargo nextest run --locked --no-fail-fast && RUST_DOS_CORE=dynamic cargo test --locked --doc
-      - run: du -sh target/debug/deps target/debug
+          echo "CARGO_PROFILE_TEST_OPT_LEVEL=1" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_TEST_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+      - name: Run the dynamic recompiler's tests
+        run: |
+          cargo test --locked --test dynrec_tests --test dyndiff_tests --test pm_tests
+          RUST_DOS_CORE=dynamic cargo test --locked --test pm_tests --test cpu32_tests
+      - name: Run the deterministic mode's tests
+        run: |
+          cargo test --locked --test deterministic_tests
+          cargo test --locked --bin rust-dos determinis
+      - name: Run the debug build of the program (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --locked --test debug_journal_tests
