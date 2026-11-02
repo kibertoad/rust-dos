@@ -1,0 +1,323 @@
+diff --git a/src/video/frame_tests.rs b/src/video/frame_tests.rs
+index de94264e..132a4564 100644
+--- a/src/video/frame_tests.rs
++++ b/src/video/frame_tests.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::bus::Device;
+ 
+ #[test]
+ fn new_frames_are_opaque_black_rgba() {
+@@ -145,14 +146,34 @@ fn a_new_overscan_colour_repaints_rows_whose_picture_did_not_change() {
+     render_screen_rows(&mut frame, &cpu.bus);
+     cpu.bus.vga.clear_dirty();
+ 
+-    cpu.bus.vga.palette[27..30].copy_from_slice(&[0, 0x3F, 0]);
+-    cpu.bus.vga.attribute_regs[0x11] = 9;
+-    cpu.bus.vga.mark_dirty_full();
++    // As a program does: through the ports, and they mark the screen.
++    let vga = &mut cpu.bus.vga;
++    vga.io_write(0x3C8, 9);
++    for channel in [0, 0x3F, 0] {
++        vga.io_write(0x3C9, channel);
++    }
++    vga.attribute_flip_flop = false;
++    vga.io_write(0x3C0, 0x11);
++    vga.io_write(0x3C0, 9);
++    assert!(cpu.bus.vga.dirty);
+     render_screen_rows(&mut frame, &cpu.bus);
+     let (r, g, b) = cpu.bus.vga.get_rgb(9);
+     assert_eq!(pixel(&frame, 639, 0), [r, g, b]);
+ }
+ 
++#[test]
++fn an_overscan_colour_nobody_sees_keeps_the_rows_drawn() {
++    let mut cpu = Cpu::new(std::path::PathBuf::from("."));
++    crate::interrupts::int10::set_mode(&mut cpu, 0x0D);
++    cpu.bus.vga.mark_dirty_full();
++    let mut frame = Frame::new(640, 400);
++    render_screen_rows(&mut frame, &cpu.bus);
++
++    cpu.bus.vga.attribute_regs[0x11] = 9;
++    cpu.bus.vga.mark_dirty_full();
++    assert_eq!(render_screen_rows(&mut frame, &cpu.bus), 0..0);
++}
++
+ #[test]
+ fn mode13_counts_the_overscan_in_its_own_character_clocks() {
+     let mut cpu = Cpu::new(std::path::PathBuf::from("."));
+@@ -176,7 +197,7 @@ fn mode13_counts_the_overscan_in_its_own_character_clocks() {
+ #[test]
+ fn the_bios_modes_have_no_overscan_beside_the_picture() {
+     let mut cpu = Cpu::new(std::path::PathBuf::from("."));
+-    for mode in [0x0D, 0x0E, 0x10, 0x12, 0x13] {
++    for mode in [0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13] {
+         crate::interrupts::int10::set_mode(&mut cpu, mode);
+         assert_eq!(cpu.bus.vga.graphics_border(), 0, "mode {mode:02X}h");
+     }
+@@ -193,9 +214,28 @@ fn a_mode_that_moves_the_blanking_with_the_picture_keeps_its_width() {
+ }
+ 
+ #[test]
+-fn blanking_past_the_line_is_no_border() {
++fn the_overscan_ends_at_the_retrace_if_the_blanking_comes_after_it() {
+     let mut cpu = narrowed_mode_0d();
+     cpu.bus.vga.crtc_regs[0x02] = 0xF0;
++    // From character 27h, the first after the picture, to the retrace's 2Bh.
++    assert_eq!(cpu.bus.vga.graphics_border(), 4 * 8);
++    cpu.bus.vga.crtc_regs[0x04] = 0x20;
++    assert_eq!(cpu.bus.vga.graphics_border(), 0);
++}
++
++#[test]
++fn an_et4000_shows_the_overscan_as_a_vga_does() {
++    let mut cpu = narrowed_mode_0d();
++    cpu.bus.vga.adapter = adapter::Adapter::Et4000;
++    assert_eq!(cpu.bus.vga.graphics_border(), 8);
++    assert_eq!(frame_size(&cpu.bus), (640, 400));
++}
++
++#[test]
++fn an_et4000_keeps_hicolor_frames_the_size_of_the_picture() {
++    let mut cpu = narrowed_mode_0d();
++    cpu.bus.vga.adapter = adapter::Adapter::Et4000;
++    cpu.bus.vga.et4000.dac_command = 0xE0;
+     assert_eq!(cpu.bus.vga.graphics_border(), 0);
+ }
+ 
+diff --git a/src/video/mod.rs b/src/video/mod.rs
+index 665e1ace..92828ad1 100644
+--- a/src/video/mod.rs
++++ b/src/video/mod.rs
+@@ -407,8 +407,8 @@ pub fn changed_rows_in(
+ /// text and CGA modes, and for the others their size, doubled in each
+ /// direction where it is small (mode 13h's 320x200 is 640x400, mode 12h
+ /// 640x480, a 320x240 "mode X" 640x480). A graphics picture narrower than
+-/// its raster has the overscan colour beside it (`Vga::graphics_border`),
+-/// and the frame keeps the raster's size.
++/// its raster has the overscan colour beside it
++/// (`VgaCard::graphics_border`), and the frame keeps the raster's size.
+ pub fn frame_size(bus: &Bus) -> (u32, u32) {
+     // A 3dfx card showing its picture instead of the VGA's.
+     if let Some(v) = &bus.voodoo
+@@ -492,7 +492,6 @@ pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize
+         return 0..frame.height as usize;
+     }
+     if bus.video_mode == VideoMode::Graphics320x200 && !bus.vga.adapter.gate_array() {
+-        let (w, rows) = bus.vga.graphics_size();
+         let candidates = if bus.mode13_scanout_is_linear() {
+             y_min..y_max
+         } else {
+@@ -506,16 +505,13 @@ pub fn render_screen_rows(frame: &mut Frame, bus: &Bus) -> std::ops::Range<usize
+             candidates,
+             &mut frame.drawn_from,
+         );
+-        let w = w + bus.vga.graphics_border();
+-        frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
++        frame.doubled = raster_doubled(frame, bus);
+         return frame.drawn_from.changed.clone();
+     }
+     // So does the 16-color one.
+     if bus.video_mode.is_planar() && !bus.vga.adapter.gate_array() {
+-        let (w, rows) = bus.vga.graphics_size();
+         render_planar(&mut frame.rgba, width, &bus.vga.vram_graphics, bus, &mut frame.drawn_from);
+-        let w = w + bus.vga.graphics_border();
+-        frame.doubled = (frame.width as usize, frame.height as usize) == (2 * w, 2 * rows);
++        frame.doubled = raster_doubled(frame, bus);
+         return frame.drawn_from.changed.clone();
+     }
+     // And the CGA's graphics on a composite monitor, at 640x400.
+@@ -851,16 +847,35 @@ fn vbe_row<const B: usize>(src: &[u8], out: &mut [u8], scale: usize, rgb: impl F
+     }
+ }
+ 
++/// Whether `frame` shows a graphics mode's raster with each of its pixels
++/// doubled in both directions.
++fn raster_doubled(frame: &Frame, bus: &Bus) -> bool {
++    let (width, rows) = bus.vga.graphics_size();
++    let width = width + bus.vga.graphics_border();
++    (frame.width as usize, frame.height as usize) == (2 * width, 2 * rows)
++}
++
++/// How a row of a graphics picture `width` wide fills a canvas `canvas_w`
++/// wide: the canvas pixels the picture takes, and the pixel that fills the
++/// rest. That is black where no overscan shows, so that a program changing
++/// a colour nobody sees (a timing bar in the overscan, say) doesn't cost
++/// the renderers the rows they keep.
++fn raster_row(bus: &Bus, canvas_w: usize, width: usize) -> (usize, [u8; 4]) {
++    let border = bus.vga.graphics_border();
++    let (r, g, b) = if border > 0 { bus.vga.overscan_rgb() } else { (0, 0, 0) };
++    (canvas_w * width / (width + border), [r, g, b, 255])
++}
++
+ /// Renderer for the planar 16-color VGA/EGA modes (0Dh, 0Eh, 10h, 12h and
+ /// variants programs make of them, such as 640x240 with doubled scanlines).
+ ///
+ /// Reads pixels out of the 4-plane memory layout and runs each 4-bit pixel
+ /// through the Attribute Controller palette, then the DAC, scaling the
+ /// picture to the canvas, with the overscan colour right of it
+-/// (`Vga::graphics_border`). Covers every pixel of the canvas, and leaves
+-/// the rows whose plane bytes are those it drew them from last time as
+-/// they are: a program drawing a sprite marks the whole screen dirty, and
+-/// only the sprite's rows are converted again.
++/// (`VgaCard::graphics_border`). Covers every pixel of the canvas, and
++/// leaves the rows whose plane bytes are those it drew them from last time
++/// as they are: a program drawing a sprite marks the whole screen dirty,
++/// and only the sprite's rows are converted again.
+ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, drawn_from: &mut DrawnFrom) {
+     let (width, rows) = bus.vga.graphics_size();
+     // The planes the Color Plane Enable register lets through, and the
+@@ -882,12 +897,9 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
+     let plane_size = vram.len() / 4;
+     // The source pixel of each canvas column, and a row's pixels as
+     // values.
+-    let border = bus.vga.graphics_border();
+-    let shown = canvas_w * width / (width + border);
++    let (shown, overscan) = raster_row(bus, canvas_w, width);
+     let columns: Vec<usize> = (0..shown).map(|tx| tx * width / shown).collect();
+     let mut line = vec![0u8; width + 16];
+-    let (r, g, b) = bus.vga.overscan_rgb();
+-    let overscan = [r, g, b, 255];
+ 
+     // The rows drawn before are still there if the colors, the shape, the
+     // panning and the split screen's first row are the same. Each row is
+@@ -896,7 +908,7 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
+     // it changes its panning, and its bytes may be the same on both sides.)
+     let spans = |pan: usize| (pan % 8 + width).div_ceil(8);
+     let span = spans(pan).max(spans(split_pan));
+-    let mut key = [0u8; 1 + 16 * 3 + 8 * 4 + 3];
++    let mut key = [0u8; 1 + 16 * 3 + 9 * 4];
+     key[0] = b'P';
+     key[1..49].copy_from_slice(colors.map(|(r, g, b)| [r, g, b]).as_flattened());
+     for (value, out) in [
+@@ -907,14 +919,14 @@ fn render_planar(canvas: &mut [u8], canvas_w: usize, vram: &[u8], bus: &Bus, dra
+         pan,
+         split_pan,
+         split.min(rows),
+-        border,
++        shown,
++        u32::from_le_bytes(overscan) as usize,
+     ]
+     .into_iter()
+     .zip(key[49..].as_chunks_mut::<4>().0)
+     {
+         *out = (value as u32).to_le_bytes();
+     }
+-    key[81..].copy_from_slice(&overscan[..3]);
+     let known = drawn_from.reuse(&key, 4 * span * rows);
+     let mask = bus.vga.display_address_mask();
+     let mut source = vec![0u8; 4 * span];
+@@ -1106,7 +1118,7 @@ fn planar_pixel(vram: &[u8], bytes_per_row: usize, x: usize, y: usize, base: usi
+ /// 256-color modes: mode 13h and the unchained "mode X" family (320x240,
+ /// 360x480, ...), whatever size the CRTC registers give them, scaled to
+ /// the canvas, `canvas_w` pixels wide, with the overscan colour right of
+-/// the picture (`Vga::graphics_border`).
++/// the picture (`VgaCard::graphics_border`).
+ fn render_graphics_mode(
+     canvas: &mut [u8],
+     canvas_w: usize,
+@@ -1138,22 +1150,18 @@ fn render_graphics_mode(
+     });
+     let canvas_h = canvas.len() / (canvas_w * 4);
+     let row_bytes = canvas_w * 4;
+-    let border = bus.vga.graphics_border();
+-    let shown = canvas_w * width / (width + border);
+-    let (r, g, b) = bus.vga.overscan_rgb();
+-    let overscan = [r, g, b, 255];
++    let (shown, overscan) = raster_row(bus, canvas_w, width);
+ 
+     // The rows drawn before are still there if the colors and the shape
+     // are the same.
+-    let mut key = [0u8; 256 * 3 + 5 * 4 + 3];
++    let mut key = [0u8; 256 * 3 + 6 * 4];
+     key[..768].copy_from_slice(colors.as_flattened());
+-    for (value, out) in [width, rows, canvas_w, canvas_h, border]
++    for (value, out) in [width, rows, canvas_w, canvas_h, shown, u32::from_le_bytes(overscan) as usize]
+         .into_iter()
+         .zip(key[768..].as_chunks_mut::<4>().0)
+     {
+         *out = (value as u32).to_le_bytes();
+     }
+-    key[788..].copy_from_slice(&overscan[..3]);
+     let known = drawn_from.reuse(&key, width * rows);
+     let first_row = candidates.start * rows / canvas_h;
+     let end_row = (candidates.end * rows).div_ceil(canvas_h).min(rows);
+diff --git a/src/video/vga.rs b/src/video/vga.rs
+index b70d37b1..f9a1ae48 100644
+--- a/src/video/vga.rs
++++ b/src/video/vga.rs
+@@ -906,12 +906,7 @@ impl VgaCard {
+     /// 12h, and whatever variants games program themselves: 320x240 or
+     /// 360x480 in 256 colors, 640x240 in 16.
+     pub fn graphics_size(&self) -> (usize, usize) {
+-        let pixels_per_char = if self.adapter.is_et4000() {
+-            self.et4000.pixels_per_char(self)
+-        } else {
+-            self.vga_pixels_per_char()
+-        };
+-        let width = (self.crtc_regs[0x01] as usize + 1) * pixels_per_char;
++        let width = (self.crtc_regs[0x01] as usize + 1) * self.pixels_per_char();
+         let mut scanlines = (self.crtc_regs[0x09] as usize & 0x1F) + 1;
+         if self.crtc_regs[0x09] & 0x80 != 0 {
+             scanlines *= 2;
+@@ -920,34 +915,41 @@ impl VgaCard {
+         (width.clamp(16, 1024), rows.clamp(1, 1024))
+     }
+ 
+-    /// Pixels a character clock shows in a VGA's graphics modes.
+-    fn vga_pixels_per_char(&self) -> usize {
+-        if self.graphics_regs[0x05] & 0x40 != 0 { 4 } else { 8 }
++    /// Pixels a character clock shows in a graphics mode.
++    fn pixels_per_char(&self) -> usize {
++        if self.adapter.is_et4000() {
++            self.et4000.pixels_per_char(self)
++        } else if self.graphics_regs[0x05] & 0x40 != 0 {
++            4
++        } else {
++            8
++        }
+     }
+ 
+     /// The pixels of overscan colour right of a graphics picture. The
+     /// picture ends at Horizontal Display End and the beam goes on in the
+-    /// overscan colour until Start Horizontal Blanking, so a program that
+-    /// lowers only Display End narrows the picture inside a raster of the
+-    /// same width. Prehistorik 2 does that to hide the column it draws
+-    /// scenery into as the map scrolls. The VGA's mode tables start the
+-    /// blanking right after the picture, and so do programs that move both
+-    /// registers for a mode of their own.
++    /// overscan colour until Start Horizontal Blanking, or until Start
++    /// Horizontal Retrace if that comes first, as a monitor shows nothing
++    /// in the sync. So a program that lowers only Display End narrows the
++    /// picture inside a raster of the same width. Prehistorik 2 does that
++    /// to hide the column it draws scenery into as the map scrolls. The
++    /// mode tables of a VGA and of an ET4000 start the blanking right
++    /// after the picture, and so do programs that move both registers for
++    /// a mode of their own.
+     ///
+-    /// None on an EGA, whose tables leave a border in every mode, nor on
+-    /// an ET4000, whose modes have registers of their own: their frames
+-    /// stay the size of the picture.
++    /// None on an EGA, whose tables leave a border in every mode: its
++    /// frames stay the size of the picture. None in an ET4000's HiColor
++    /// modes either, whose renderer fills the canvas with the picture and
++    /// where the register's byte would reach a DAC taking two bytes a
++    /// pixel.
+     pub fn graphics_border(&self) -> usize {
+-        if !self.adapter.vga_bios() || self.adapter.is_et4000() {
++        let hicolor = self.adapter.is_et4000() && self.et4000.hicolor().is_some();
++        if !self.adapter.vga_bios() || hicolor {
+             return 0;
+         }
+         let display = self.crtc_regs[0x01] as usize + 1;
+-        let blank = self.crtc_regs[0x02] as usize;
+-        let total = self.crtc_regs[0x00] as usize + 5;
+-        if blank <= display || blank > total {
+-            return 0;
+-        }
+-        (blank - display) * self.vga_pixels_per_char()
++        let end = self.crtc_regs[0x02].min(self.crtc_regs[0x04]) as usize;
++        end.saturating_sub(display) * self.pixels_per_char()
+     }
+ 
+     /// The colour of the overscan: the DAC entry the Overscan Color
