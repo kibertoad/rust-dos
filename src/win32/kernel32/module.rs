@@ -628,6 +628,23 @@ pub(super) fn resource_data(
     }))
 }
 
+/// `resource_data` of a resource whose name the system has as text.
+pub(super) fn resource_named(
+    cpu: &mut Cpu,
+    module: u32,
+    kind: u32,
+    name: &str,
+) -> Option<(u32, u32)> {
+    let name = match name.strip_prefix('#').and_then(|n| n.parse().ok()) {
+        Some(id) => Res::Id(id),
+        None => Res::Name(name.to_string()),
+    };
+    let base = resource_module(cpu, module)?;
+    let entry = find(cpu, base, &Res::Id(kind as u16), &name, None).ok()?;
+    let (rva, size) = data_entry(cpu, entry)?;
+    Some((base.wrapping_add(rva), size))
+}
+
 /// FindResourceA(module, name, type).
 pub(super) fn find_resource(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
     find_for(cpu, args[0], args[2], args[1], None)

@@ -79,13 +79,16 @@ fn scratch_path(name: &str) -> PathBuf {
     PathBuf::from("target/test_win32_winmm").join(name)
 }
 
-/// A fresh folder for a test's drive C:, with `files` in it.
+/// A fresh folder for a test's drive C:, with `files` in it (a file's
+/// name may have folders).
 fn scratch(name: &str, files: &[(&str, Vec<u8>)]) -> PathBuf {
     let base = scratch_path(name);
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
     for (file, bytes) in files {
-        fs::write(base.join(file), bytes).unwrap();
+        let path = base.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
     }
     base
 }
@@ -739,5 +742,329 @@ fn aux_devices_are_the_sound_blaster_16s_lines() {
             (level(0x2000), level(0x4000)),
         );
         assert!(seen.contains(&set), "{core:?}: {seen:?}");
+    }
+}
+
+// An installable MCI driver, TESTV32.DLL, at its own base. Its data is
+// a log of the messages its DriverProc got (a count, then up to 16), a
+// word set when an MCI message came with another driver id than the one
+// its DRV_OPEN returned, the first character of the element its
+// MCI_OPEN_DRIVER got, the driver data MCI_STATUS read back and the
+// device id DRV_OPEN was given.
+const DRIVER_BASE: u32 = 0x1000_0000;
+const LOG_COUNT: u32 = 0x00;
+const LOG: u32 = 0x04;
+const BAD_ID: u32 = 0x48;
+const ELEMENT: u32 = 0x4C;
+const DRIVER_DATA: u32 = 0x50;
+const DEVICE_ID: u32 = 0x54;
+const DRIVER_ID: i32 = 0x55;
+
+const DRV_OPEN: i32 = 3;
+const MCI_OPEN_DRIVER: i32 = 0x801;
+const MCI_CLOSE_DRIVER: u32 = 0x802;
+const MCI_OPEN: i32 = 0x803;
+const MCI_CLOSE: i32 = 0x804;
+const MCI_INFO: i32 = 0x80A;
+const MCI_STATUS: i32 = 0x814;
+const MCI_OPEN_ELEMENT: i32 = 0x200;
+const MCI_INFO_PRODUCT: i32 = 0x100;
+const MCI_STATUS_ITEM: i32 = 0x100;
+const MCI_STATUS_MODE: u32 = 4;
+const MCI_MODE_PLAY: i32 = 526;
+const MCI_DEVTYPE_DIGITAL_VIDEO: i32 = 521;
+const MCIERR_INVALID_DEVICE_ID: i32 = 257;
+
+/// The driver: a DLL whose DriverProc answers DRV_OPEN with its device
+/// type and a command table of its own (RCDATA 5), takes MCI_OPEN_DRIVER
+/// and keeps driver data, gives "Test" in UTF-16 for MCI_INFO and a mode
+/// for MCI_STATUS with the resource flag (MCI_RESOURCE_RETURNED), and
+/// logs every message. It exports DriverProc and Log, which gives the
+/// log's address.
+fn mci_driver() -> Vec<u8> {
+    let mut b = Builder::dll(DRIVER_BASE, "TESTV32.DLL");
+    let names = ["mciLoadCommandResource", "mciSetDriverData", "mciGetDriverData"];
+    let list: Vec<Imp> = names.iter().map(|n| Imp::Name(n)).collect();
+    let iat = b.imports(&[("WINMM.dll", list.as_slice())]).concat();
+    let data_rva = b.section(
+        ".data",
+        &[0; 0x60],
+        pe::SCN_INITIALIZED_DATA | pe::SCN_READ | pe::SCN_WRITE,
+    );
+    let data = DRIVER_BASE + data_rva;
+    let at = |offset: u32| dword_ptr((data + offset) as u64);
+    let import = |i: usize| dword_ptr(iat[i] as u64);
+    let code = |f: &dyn Fn(&mut CodeAssembler) -> Result<(), IcedError>, rva: u32| {
+        let mut a = CodeAssembler::new(32).unwrap();
+        f(&mut a).unwrap();
+        a.assemble((DRIVER_BASE + rva) as u64).unwrap()
+    };
+    let flags = pe::SCN_CODE | pe::SCN_EXECUTE | pe::SCN_READ;
+    // DllMain: TRUE.
+    let entry = b.next_rva();
+    let bytes = code(
+        &|a| {
+            a.mov(eax, 1)?;
+            a.ret_1(12)
+        },
+        entry,
+    );
+    b.section(".t0", &bytes, flags);
+    b.entry(entry);
+    // DriverProc(id, driver, message, p1, p2).
+    let proc_rva = b.next_rva();
+    let bytes = code(
+        &|a| {
+            let mut skip_log = a.create_label();
+            let mut checked = a.create_label();
+            let mut open = a.create_label();
+            let mut mci_open = a.create_label();
+            let mut info = a.create_label();
+            let mut status = a.create_label();
+            let mut zero = a.create_label();
+            let mut done = a.create_label();
+            a.push(esi)?;
+            a.push(edi)?;
+            // The arguments are at ESP+12 on.
+            a.mov(eax, dword_ptr(esp + 20))?;
+            a.mov(ecx, at(LOG_COUNT))?;
+            a.cmp(ecx, 16)?;
+            a.jae(skip_log)?;
+            a.mov(dword_ptr(ecx * 4 + (data + LOG)), eax)?;
+            a.inc(at(LOG_COUNT))?;
+            a.set_label(&mut skip_log)?;
+            a.cmp(eax, 0x800)?;
+            a.jb(checked)?;
+            a.cmp(dword_ptr(esp + 12), DRIVER_ID)?;
+            a.je(checked)?;
+            a.mov(at(BAD_ID), 1)?;
+            a.set_label(&mut checked)?;
+            a.mov(esi, dword_ptr(esp + 28))?;
+            a.cmp(eax, DRV_OPEN)?;
+            a.je(open)?;
+            a.cmp(eax, MCI_OPEN_DRIVER)?;
+            a.je(mci_open)?;
+            a.cmp(eax, MCI_INFO)?;
+            a.je(info)?;
+            a.cmp(eax, MCI_STATUS)?;
+            a.je(status)?;
+            a.cmp(eax, 0x800)?;
+            a.jae(zero)?;
+            // DRV_LOAD, DRV_ENABLE, DRV_CLOSE, DRV_DISABLE, DRV_FREE.
+            a.mov(eax, 1)?;
+            a.jmp(done)?;
+            // MCI_OPEN_DRIVER_PARMS: the device's id, its type and the
+            // driver's command table.
+            a.set_label(&mut open)?;
+            a.mov(eax, dword_ptr(esi))?;
+            a.mov(at(DEVICE_ID), eax)?;
+            a.mov(dword_ptr(esi + 12), MCI_DEVTYPE_DIGITAL_VIDEO)?;
+            a.push(0)?;
+            a.push(5)?;
+            a.push(DRIVER_BASE as i32)?;
+            a.call(import(0))?;
+            a.mov(dword_ptr(esi + 8), eax)?;
+            a.mov(eax, DRIVER_ID)?;
+            a.jmp(done)?;
+            // MCI_OPEN_PARMSW: the element's first character, and the
+            // driver data for the device.
+            a.set_label(&mut mci_open)?;
+            a.mov(eax, dword_ptr(esi + 12))?;
+            a.movzx(eax, word_ptr(eax))?;
+            a.mov(at(ELEMENT), eax)?;
+            a.push(0xABCD)?;
+            a.push(dword_ptr(esi + 4))?;
+            a.call(import(1))?;
+            a.jmp(zero)?;
+            a.set_label(&mut info)?;
+            a.mov(edi, dword_ptr(esi + 4))?;
+            a.mov(dword_ptr(edi), 0x0065_0054)?;
+            a.mov(dword_ptr(edi + 4), 0x0074_0073)?;
+            a.mov(word_ptr(edi + 8), 0)?;
+            a.jmp(zero)?;
+            a.set_label(&mut status)?;
+            a.push(at(DEVICE_ID))?;
+            a.call(import(2))?;
+            a.mov(at(DRIVER_DATA), eax)?;
+            a.mov(dword_ptr(esi + 4), 0x0123_0000 | MCI_MODE_PLAY)?;
+            a.mov(eax, 0x2_0000)?;
+            a.jmp(done)?;
+            a.set_label(&mut zero)?;
+            a.xor(eax, eax)?;
+            a.set_label(&mut done)?;
+            a.pop(edi)?;
+            a.pop(esi)?;
+            a.ret_1(20)
+        },
+        proc_rva,
+    );
+    b.section(".t1", &bytes, flags);
+    b.export(Some("DriverProc"), 1, proc_rva);
+    let log_rva = b.next_rva();
+    let bytes = code(
+        &|a| {
+            a.mov(eax, data as i32)?;
+            a.ret()
+        },
+        log_rva,
+    );
+    b.section(".t2", &bytes, flags);
+    b.export(Some("Log"), 2, log_rva);
+    b.resource(10, 5, 1033, b"table");
+    b.build()
+}
+
+// The program's data: MCI_OPEN_PARMS, the element's name, MCI_INFO_PARMS
+// and its buffer, MCI_STATUS_PARMS, the driver's name, "Log" and the
+// messages the driver is to get.
+const OPEN_PARMS: u32 = 0x00;
+const ELEMENT_NAME: u32 = 0x20;
+const INFO_PARMS: u32 = 0x40;
+const INFO_TEXT: u32 = 0x50;
+const STATUS_PARMS: u32 = 0x70;
+const DRIVER_NAME: u32 = 0x80;
+const LOG_NAME: u32 = 0x90;
+const GENERIC_PARMS: u32 = 0x98;
+const EXPECTED: u32 = 0xA0;
+
+/// The messages the driver gets, in order: its DLL is loaded and the
+/// driver opened, MCI opens it, MCI_INFO and MCI_STATUS, MCI closes it
+/// and then the driver is closed, the last of its DLL.
+const MESSAGES: [u32; 10] = [
+    1,
+    2,
+    DRV_OPEN as u32,
+    MCI_OPEN_DRIVER as u32,
+    MCI_INFO as u32,
+    MCI_STATUS as u32,
+    MCI_CLOSE_DRIVER,
+    4,
+    5,
+    6,
+];
+
+/// Opens C:\CLIP.TST, whose extension WIN.INI's [mci extensions] gives
+/// the device type TestVideo, which SYSTEM.INI's [mci] gives the 16-bit
+/// driver TESTV.DRV: MCI opens TESTV32.DLL. The exit code has a bit for
+/// each check: the open, the id, MCI_INFO's text in ANSI, MCI_STATUS,
+/// its mode without the resource, the close, the id gone after it, and
+/// the driver's log (with its ids, the element in UTF-16 and its driver
+/// data).
+fn mci_driver_program() -> Vec<u8> {
+    let mut data = vec![0u8; 0x100];
+    put(&mut data, ELEMENT_NAME as usize, b"C:\\CLIP.TST");
+    put(&mut data, DRIVER_NAME as usize, b"TESTV32.DLL");
+    put(&mut data, LOG_NAME as usize, b"Log");
+    for (i, m) in MESSAGES.iter().enumerate() {
+        put(&mut data, EXPECTED as usize + 4 * i, &m.to_le_bytes());
+    }
+    let imports: &[(&str, &[&str])] = &[
+        (
+            "KERNEL32.dll",
+            &["ExitProcess", "LoadLibraryA", "GetProcAddress"],
+        ),
+        ("WINMM.dll", &["mciSendCommandA"]),
+    ];
+    let send = |a: &mut CodeAssembler, l: &Layout, msg: i32, flags: i32, parms: u32| {
+        a.push(l.at(parms) as i32)?;
+        a.push(flags)?;
+        a.push(msg)?;
+        a.push(edi)?;
+        a.call(l.import(3))
+    };
+    program(imports, &data, |a, l| {
+        a.xor(ebx, ebx)?;
+        // The driver's DLL stays loaded for its log to be read.
+        call(a, l.import(1), &[l.at(DRIVER_NAME) as i32])?;
+        a.push(l.at(LOG_NAME) as i32)?;
+        a.push(eax)?;
+        a.call(l.import(2))?;
+        a.mov(esi, eax)?;
+        a.mov(dword_ptr(l.at(OPEN_PARMS + 12)), l.at(ELEMENT_NAME) as i32)?;
+        a.xor(edi, edi)?;
+        send(a, l, MCI_OPEN, MCI_OPEN_ELEMENT, OPEN_PARMS)?;
+        check_eax(a, 0, 0)?;
+        a.mov(edi, dword_ptr(l.at(OPEN_PARMS + 4)))?;
+        let mut no_id = a.create_label();
+        a.test(edi, edi)?;
+        a.jz(no_id)?;
+        a.or(ebx, 1 << 1)?;
+        a.set_label(&mut no_id)?;
+        a.mov(dword_ptr(l.at(INFO_PARMS + 4)), l.at(INFO_TEXT) as i32)?;
+        a.mov(dword_ptr(l.at(INFO_PARMS + 8)), 32)?;
+        send(a, l, MCI_INFO, MCI_INFO_PRODUCT, INFO_PARMS)?;
+        let mut info_failed = a.create_label();
+        a.test(eax, eax)?;
+        a.jnz(info_failed)?;
+        a.cmp(dword_ptr(l.at(INFO_TEXT)), u32::from_le_bytes(*b"Test") as i32)?;
+        a.jne(info_failed)?;
+        a.cmp(byte_ptr(l.at(INFO_TEXT + 4)), 0)?;
+        a.jne(info_failed)?;
+        a.or(ebx, 1 << 2)?;
+        a.set_label(&mut info_failed)?;
+        a.mov(dword_ptr(l.at(STATUS_PARMS + 8)), MCI_STATUS_MODE as i32)?;
+        send(a, l, MCI_STATUS, MCI_STATUS_ITEM, STATUS_PARMS)?;
+        check_eax(a, 0, 3)?;
+        a.mov(eax, dword_ptr(l.at(STATUS_PARMS + 4)))?;
+        check_eax(a, MCI_MODE_PLAY, 4)?;
+        send(a, l, MCI_CLOSE, 0, GENERIC_PARMS)?;
+        check_eax(a, 0, 5)?;
+        send(a, l, MCI_STATUS, MCI_STATUS_ITEM, STATUS_PARMS)?;
+        check_eax(a, MCIERR_INVALID_DEVICE_ID, 6)?;
+        // The driver's log.
+        let mut log_wrong = a.create_label();
+        a.call(esi)?;
+        a.mov(esi, eax)?;
+        a.cmp(dword_ptr(esi + LOG_COUNT), MESSAGES.len() as i32)?;
+        a.jne(log_wrong)?;
+        a.cmp(dword_ptr(esi + BAD_ID), 0)?;
+        a.jne(log_wrong)?;
+        a.cmp(dword_ptr(esi + ELEMENT), b'C' as i32)?;
+        a.jne(log_wrong)?;
+        a.cmp(dword_ptr(esi + DRIVER_DATA), 0xABCD)?;
+        a.jne(log_wrong)?;
+        a.lea(esi, dword_ptr(esi + LOG))?;
+        a.mov(edi, l.at(EXPECTED) as i32)?;
+        a.mov(ecx, MESSAGES.len() as i32)?;
+        a.cld()?;
+        a.repe().cmpsd()?;
+        a.jne(log_wrong)?;
+        a.or(ebx, 1 << 7)?;
+        a.set_label(&mut log_wrong)?;
+        a.push(ebx)?;
+        a.call(l.import(0))?;
+        a.int3()
+    })
+}
+
+/// A device type the system names a driver for opens with the driver:
+/// mciSendCommandA's commands go to its DriverProc, with the open's
+/// strings in UTF-16 and MCI_INFO's answer back in ANSI, as Windows NT's
+/// WINMM gives them to its 32-bit MCI drivers. SYSTEM.INI's [mci] names
+/// Windows 9x's 16-bit driver, which the built-in Windows takes the
+/// 32-bit driver of the same name for.
+#[test]
+fn mci_opens_a_device_with_its_installable_driver() {
+    for core in CORES {
+        let files = [
+            ("T.EXE", mci_driver_program()),
+            ("WINDOWS/SYSTEM/TESTV32.DLL", mci_driver()),
+            (
+                "WINDOWS/SYSTEM.INI",
+                b"[mci]\r\nTestVideo=testv.drv\r\n".to_vec(),
+            ),
+            (
+                "WINDOWS/WIN.INI",
+                b"[mci extensions]\r\ntst=TestVideo\r\n".to_vec(),
+            ),
+        ];
+        let mut cpu = machine("mci_driver", core, &files, |_| {});
+        run_to_exit(&mut cpu, 2_000, |_| {});
+        assert_eq!(
+            cpu.errorlevel,
+            0xFF,
+            "{core:?}: the checks that failed: {:08b}",
+            !cpu.errorlevel
+        );
     }
 }

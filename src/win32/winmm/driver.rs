@@ -28,7 +28,9 @@ const DRV_SUCCESS: u32 = 1;
 /// An installable driver a process opened (OpenDriver): its handle, its
 /// DLL and the DLL's DriverProc, the id its DRV_OPEN returned and the
 /// argument it got. `opening` while its DLL loads, for the thread `tid`
-/// whose OpenDriver loads it.
+/// whose OpenDriver loads it. `mci` is the MCI device whose driver it is
+/// (mci/driver.rs), 0 for one OpenDriver opened, and `result` what the
+/// call that closes it returns once it is closed.
 #[derive(Clone, Debug, Default)]
 pub struct Driver {
     pub pid: u32,
@@ -39,6 +41,8 @@ pub struct Driver {
     pub id: u32,
     pub param: u32,
     pub opening: bool,
+    pub mci: u32,
+    pub result: u32,
 }
 
 crate::state_fields!(Driver {
@@ -49,7 +53,9 @@ crate::state_fields!(Driver {
     proc,
     id,
     param,
-    opening
+    opening,
+    mci,
+    result
 });
 
 /// A process ended: its drivers went with its memory.
@@ -135,6 +141,16 @@ pub fn open_driver(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
     if file.is_empty() {
         return Some(0);
     }
+    cpu.bus
+        .log_string(&format!("[W32] OpenDriver({}): {}", name, file));
+    start(cpu, &file, param, 0);
+    None
+}
+
+/// Open the driver whose DLL is `file` with `param`, for the MCI device
+/// `mci` (0 for OpenDriver's): its handle. Its DLL loads, and once the
+/// driver is open, or has failed, OpenDriver returns or MCI goes on.
+fn start(cpu: &mut Cpu, file: &str, param: u32, mci: u32) -> u32 {
     let pid = crate::win32::user32::current_pid(cpu);
     let tid = crate::win32::user32::current_tid(cpu);
     let handle = new_handle(cpu);
@@ -148,12 +164,56 @@ pub fn open_driver(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
         handle,
         param,
         opening: true,
+        mci,
+        result: TRUE,
         ..Driver::default()
     });
-    cpu.bus
-        .log_string(&format!("[W32] OpenDriver({}): {}", name, file));
-    crate::win32::kernel32::module::load_driver(cpu, &file);
-    None
+    crate::win32::kernel32::module::load_driver(cpu, file);
+    handle
+}
+
+/// Open an MCI device's driver (mci/driver.rs): the DLL `file`'s
+/// DriverProc gets DRV_OPEN with the device's MCI_OPEN_DRIVER_PARMS at
+/// `parms`, and then MCI's `opened` goes on with the driver, or MCI_OPEN
+/// returns MCIERR_CANNOT_LOAD_DRIVER. The driver's handle.
+pub(super) fn open_for_mci(cpu: &mut Cpu, file: &str, parms: u32, mci: u32) -> u32 {
+    start(cpu, file, parms, mci)
+}
+
+/// Send the MCI device's driver `handle` `message`, as SendDriverMessage
+/// does: MCI's `returned` gets what it returns, with `data`.
+pub(super) fn send_for_mci(
+    cpu: &mut Cpu,
+    handle: u32,
+    message: u32,
+    p1: u32,
+    p2: u32,
+    resume: (u32, u32),
+    data: Vec<u32>,
+) {
+    send_with(cpu, handle, STEP_MCI, message, p1, p2, resume, data);
+}
+
+/// Close the MCI device's driver `handle` as CloseDriver does: once it
+/// is closed, `value` returns to `resume`.
+pub(super) fn close_for_mci(cpu: &mut Cpu, handle: u32, value: u32, resume: (u32, u32)) {
+    let Some(driver) = find(cpu, handle) else {
+        call::finish(cpu, resume, value);
+        return;
+    };
+    driver.result = value;
+    send(cpu, handle, STEP_CLOSE, DRV_CLOSE, 0, 0, resume);
+}
+
+/// What a driver that couldn't be opened makes the call that opened it
+/// return: OpenDriver 0, MCI_OPEN MCIERR_CANNOT_LOAD_DRIVER. The MCI
+/// device of one goes.
+fn not_opened(cpu: &mut Cpu, mci: u32) -> u32 {
+    if mci == 0 {
+        return 0;
+    }
+    super::mci::driver::open_failed(cpu, mci);
+    super::mci::MCIERR_CANNOT_LOAD_DRIVER
 }
 
 /// The DLL of the driver OpenDriver opens is loaded at `base` (0: it
@@ -172,16 +232,18 @@ pub(in crate::win32) fn loaded(cpu: &mut Cpu, resume: (u32, u32), base: u32) {
         return;
     };
     if base == 0 {
-        drivers.remove(i);
-        call::finish(cpu, resume, 0);
+        let mci = drivers.remove(i).mci;
+        let value = not_opened(cpu, mci);
+        call::finish(cpu, resume, value);
         return;
     }
     let wanted = Wanted::Name("DriverProc".to_string());
     let proc = crate::win32::with_process(cpu, |p, bus| loader::find_export(bus, p, base, &wanted));
     let drivers = &mut cpu.bus.win32.winmm.drivers;
     let Some(proc) = proc else {
-        drivers.remove(i);
-        crate::win32::kernel32::module::free_then(cpu, base, resume, 0);
+        let mci = drivers.remove(i).mci;
+        let value = not_opened(cpu, mci);
+        crate::win32::kernel32::module::free_then(cpu, base, resume, value);
         return;
     };
     let driver = &mut drivers[i];
@@ -210,33 +272,56 @@ const STEP_SEND: u32 = 3;
 const STEP_CLOSE: u32 = 4;
 const STEP_DISABLE: u32 = 5;
 const STEP_FREE: u32 = 6;
+const STEP_MCI: u32 = 7;
 
 /// Call the DriverProc of the driver `handle` with `message`, `p1` and
 /// `p2`, for `step`; `resume` is where the function of WinMM that called
 /// it returns to.
 fn send(cpu: &mut Cpu, handle: u32, step: u32, message: u32, p1: u32, p2: u32, resume: (u32, u32)) {
+    send_with(cpu, handle, step, message, p1, p2, resume, Vec::new());
+}
+
+/// `send`, with `data` for the step after the step and the handle.
+#[allow(clippy::too_many_arguments)]
+fn send_with(
+    cpu: &mut Cpu,
+    handle: u32,
+    step: u32,
+    message: u32,
+    p1: u32,
+    p2: u32,
+    resume: (u32, u32),
+    data: Vec<u32>,
+) {
     let Some(driver) = find(cpu, handle) else {
         call::finish(cpu, resume, 0);
         return;
     };
     let (proc, id) = (driver.proc, driver.id);
     let args = [id, handle, message, p1, p2];
-    if !call::call(cpu, proc, &args, call::DRIVER, resume, vec![step, handle]) {
+    let mut words = vec![step, handle];
+    words.extend(data);
+    if !call::call(cpu, proc, &args, call::DRIVER, resume, words) {
         crate::win32::fatal(cpu, "a thread's stack isn't there", None);
     }
 }
 
 /// A DriverProc returned `value`: the next step.
 pub(in crate::win32) fn returned(cpu: &mut Cpu, value: u32, call: Call) {
-    let &[step, handle] = call.data.as_slice() else {
+    let &[step, handle, ref data @ ..] = call.data.as_slice() else {
         return;
     };
     let resume = call.resume;
+    if step == STEP_MCI {
+        super::mci::driver::returned(cpu, handle, value, resume, data);
+        return;
+    }
     let Some(driver) = find(cpu, handle) else {
         call::finish(cpu, resume, 0);
         return;
     };
     let (param, module) = (driver.param, driver.module);
+    let (mci, result) = (driver.mci, driver.result);
     match step {
         STEP_LOAD if value != DRV_SUCCESS => fail(cpu, handle, module, resume),
         STEP_LOAD => send(cpu, handle, STEP_ENABLE, DRV_ENABLE, 0, 0, resume),
@@ -246,7 +331,11 @@ pub(in crate::win32) fn returned(cpu: &mut Cpu, value: u32, call: Call) {
             if let Some(driver) = find(cpu, handle) {
                 driver.id = value;
             }
-            call::finish(cpu, resume, handle);
+            if mci != 0 {
+                super::mci::driver::opened(cpu, mci, handle, resume);
+            } else {
+                call::finish(cpu, resume, handle);
+            }
         }
         STEP_CLOSE => {
             let pid = crate::win32::user32::current_pid(cpu);
@@ -260,19 +349,21 @@ pub(in crate::win32) fn returned(cpu: &mut Cpu, value: u32, call: Call) {
             if last {
                 send(cpu, handle, STEP_DISABLE, DRV_DISABLE, 0, 0, resume);
             } else {
-                remove(cpu, handle, module, resume, TRUE);
+                remove(cpu, handle, module, resume, result);
             }
         }
         STEP_DISABLE => send(cpu, handle, STEP_FREE, DRV_FREE, 0, 0, resume),
-        STEP_FREE => remove(cpu, handle, module, resume, TRUE),
+        STEP_FREE => remove(cpu, handle, module, resume, result),
         _ => call::finish(cpu, resume, value),
     }
 }
 
 /// The driver `handle` couldn't be opened: it goes, and OpenDriver
-/// returns 0.
+/// returns 0 (MCI_OPEN an error).
 fn fail(cpu: &mut Cpu, handle: u32, module: u32, resume: (u32, u32)) {
-    remove(cpu, handle, module, resume, 0);
+    let mci = find(cpu, handle).map_or(0, |d| d.mci);
+    let value = not_opened(cpu, mci);
+    remove(cpu, handle, module, resume, value);
 }
 
 /// The driver `handle` goes, and its DLL loses the reference OpenDriver

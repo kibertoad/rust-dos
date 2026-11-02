@@ -13,8 +13,13 @@
 //!
 //! Wave audio's device (waveaudio, waveaudio.rs) plays WAV files on the
 //! built-in sound device; it is installed when `WAVE_DRIVER` is set.
+//!
+//! Other device types are those the system names an installable MCI
+//! driver for (driver.rs), whose DriverProc gets mciSendCommandA's
+//! commands.
 
 pub mod cdaudio;
+pub mod driver;
 pub mod sequencer;
 pub mod string;
 pub mod waveaudio;
@@ -22,6 +27,7 @@ pub mod waveaudio;
 use super::callback;
 use super::*;
 use crate::cpu::Cpu;
+use crate::win32::call;
 use crate::win32::thread::{self, Wait};
 
 /// The commands.
@@ -153,6 +159,7 @@ pub const MCIERR_MISSING_PARAMETER: u32 = 273;
 pub const MCIERR_UNSUPPORTED_FUNCTION: u32 = 274;
 pub const MCIERR_FILE_NOT_FOUND: u32 = 275;
 pub const MCIERR_DEVICE_NOT_READY: u32 = 276;
+pub const MCIERR_INTERNAL: u32 = 277;
 pub const MCIERR_CANNOT_USE_ALL: u32 = 279;
 pub const MCIERR_EXTENSION_NOT_FOUND: u32 = 281;
 pub const MCIERR_OUTOFRANGE: u32 = 282;
@@ -256,12 +263,27 @@ pub struct Device {
     pub seq: sequencer::Seq,
     /// The waveaudio driver's own state.
     pub wave: waveaudio::Wav,
+    /// A driver's device (driver.rs): the driver's handle (0 for a
+    /// built-in device), the type it was opened as, the driver's data
+    /// (mciSetDriverData) and its command table. While the driver opens
+    /// it (`opening`), the open's parameters and the heap block that
+    /// holds what the driver is given.
+    pub driver: u32,
+    pub type_name: String,
+    pub private: u32,
+    pub table: u32,
+    pub opening: bool,
+    pub block: u32,
+    pub open_at: u32,
+    pub open_flags: u32,
 }
 
-/// MCI's state.
+/// MCI's state: the open devices, and the command tables drivers
+/// loaded.
 #[derive(Clone, Debug, Default)]
 pub struct Mci {
     pub devices: Vec<Device>,
+    pub tables: Vec<driver::Table>,
 }
 
 fn mci(cpu: &mut Cpu) -> &mut Mci {
@@ -277,7 +299,7 @@ fn find(cpu: &Cpu, id: u32) -> Option<usize> {
         .mci
         .devices
         .iter()
-        .position(|d| d.id == id && d.pid == pid)
+        .position(|d| d.id == id && d.pid == pid && !d.opening)
 }
 
 /// The device of the running process that `name` names.
@@ -289,7 +311,7 @@ pub fn find_name(cpu: &Cpu, name: &str) -> Option<usize> {
         .mci
         .devices
         .iter()
-        .position(|d| d.pid == pid && d.name.eq_ignore_ascii_case(name))
+        .position(|d| d.pid == pid && !d.opening && d.name.eq_ignore_ascii_case(name))
 }
 
 pub fn device(cpu: &mut Cpu, i: usize) -> &mut Device {
@@ -386,6 +408,9 @@ fn play_ended(cpu: &mut Cpu, i: usize) {
 /// When the open device `i`'s play ends, if it plays.
 fn busy_until(cpu: &Cpu, i: usize) -> Option<u64> {
     let d = &cpu.bus.win32.winmm.mci.devices[i];
+    if d.driver != 0 {
+        return None;
+    }
     match d.kind {
         MCI_DEVTYPE_CD_AUDIO => d.cd.end_at,
         MCI_DEVTYPE_SEQUENCER => sequencer::end_at(d),
@@ -473,6 +498,12 @@ pub fn wait_for_play(cpu: &mut Cpu, id: u32, msg: u32, flags: u32) -> bool {
 /// Close the device `i`: what it plays stops.
 pub fn close_device(cpu: &mut Cpu, i: usize) {
     abort(cpu, i);
+    if device(cpu, i).driver != 0 {
+        // Only a process that ended closes one here: its driver went
+        // with it.
+        mci(cpu).devices.remove(i);
+        return;
+    }
     match device(cpu, i).kind {
         MCI_DEVTYPE_CD_AUDIO => cdaudio::close(cpu, i),
         MCI_DEVTYPE_SEQUENCER => sequencer::close(cpu, i),
@@ -486,13 +517,61 @@ pub fn close_device(cpu: &mut Cpu, i: usize) {
     super::schedule(cpu);
 }
 
-/// MCI_OPEN: open a device of the running process. `auto` for one a
-/// command string opens for itself. Its id is in `p.ret`.
-pub fn open(cpu: &mut Cpu, flags: u32, p: &mut Parms, auto: bool) -> u32 {
-    if flags & MCI_OPEN_ELEMENT_ID != 0 {
-        return MCIERR_UNSUPPORTED_FUNCTION;
+/// What an open opens: a built-in device's type, or a device type a
+/// driver is named for (driver.rs).
+enum Target {
+    Kind(u32),
+    Driver(String),
+}
+
+/// The device type `name` names: a built-in one, or with `drivers` one
+/// the system names a driver for.
+fn target_of_name(cpu: &mut Cpu, name: &str, drivers: bool) -> Option<Target> {
+    if let Some(t) = type_of_name(name) {
+        return Some(Target::Kind(t));
     }
-    let element = if flags & MCI_OPEN_ELEMENT != 0 {
+    (drivers && driver::driver_file(cpu, name).is_some()).then(|| Target::Driver(name.to_string()))
+}
+
+/// The device type a file's extension names: a built-in one's, or with
+/// `drivers` the type the system names for it (WIN.INI's [mci
+/// extensions]) if a driver is named for that.
+fn target_of_file(cpu: &mut Cpu, element: &str, drivers: bool) -> Option<Target> {
+    if let Some(t) = type_of_file(element) {
+        return Some(Target::Kind(t));
+    }
+    let ext = element.rsplit_once('.')?.1;
+    if !drivers || ext.contains(['\\', '/']) {
+        return None;
+    }
+    let name = driver::type_of_extension(cpu, ext)?;
+    target_of_name(cpu, &name, drivers)
+}
+
+/// MCI_OPEN of a command string: open a device of the running process.
+/// `auto` for one a command string opens for itself. Its id is in
+/// `p.ret`. The command strings know only the built-in devices'
+/// keywords, so they open no driver's devices.
+pub fn open(cpu: &mut Cpu, flags: u32, p: &mut Parms, auto: bool) -> u32 {
+    open_device(cpu, flags, p, auto, None).unwrap_or(MCIERR_INTERNAL)
+}
+
+/// MCI_OPEN: open a device of the running process, with `parms` the
+/// program's MCI_OPEN_PARMS for mciSendCommandA, which can open a
+/// driver's device. Its id is in `p.ret`, or the driver's open gives it
+/// to the program: then None, the thread runs the driver.
+fn open_device(
+    cpu: &mut Cpu,
+    flags: u32,
+    p: &mut Parms,
+    auto: bool,
+    parms: Option<u32>,
+) -> Option<u32> {
+    let drivers = parms.is_some();
+    if flags & MCI_OPEN_ELEMENT_ID != 0 && !drivers {
+        return Some(MCIERR_UNSUPPORTED_FUNCTION);
+    }
+    let element = if flags & MCI_OPEN_ELEMENT != 0 && flags & MCI_OPEN_ELEMENT_ID == 0 {
         p.element.clone()
     } else {
         String::new()
@@ -502,41 +581,56 @@ pub fn open(cpu: &mut Cpu, flags: u32, p: &mut Parms, auto: bool) -> u32 {
         Some((t, e)) if flags & MCI_OPEN_TYPE == 0 => (Some(t.to_string()), e.to_string()),
         _ => (None, element),
     };
-    let kind = if flags & MCI_OPEN_TYPE != 0 {
+    let target = if flags & MCI_OPEN_TYPE != 0 {
         if flags & MCI_OPEN_TYPE_ID != 0 {
             let id = p.open_type_id & 0xFFFF;
             match installed().into_iter().find(|&(t, _)| t == id) {
-                Some((t, _)) => t,
-                None => return MCIERR_INVALID_DEVICE_NAME,
+                Some((t, _)) => Target::Kind(t),
+                None => return Some(MCIERR_INVALID_DEVICE_NAME),
             }
         } else {
-            match type_of_name(&p.open_type) {
+            match target_of_name(cpu, &p.open_type, drivers) {
                 Some(t) => t,
-                None => return MCIERR_INVALID_DEVICE_NAME,
+                None => return Some(MCIERR_INVALID_DEVICE_NAME),
             }
         }
     } else if let Some(t) = type_name_given {
-        match type_of_name(&t) {
+        match target_of_name(cpu, &t, drivers) {
             Some(t) => t,
-            None => return MCIERR_INVALID_DEVICE_NAME,
+            None => return Some(MCIERR_INVALID_DEVICE_NAME),
         }
     } else if !element.is_empty() {
         // A device's name as the element, or a file with an extension
         // that names its device.
-        match type_of_name(&element).or_else(|| type_of_file(&element)) {
-            Some(t) => {
-                if type_of_name(&element).is_some() {
-                    return open_kind(cpu, flags, p, t, String::new(), auto);
-                }
-                t
-            }
-            None if element.contains('.') => return MCIERR_EXTENSION_NOT_FOUND,
-            None => return MCIERR_INVALID_DEVICE_NAME,
+        if let Some(t) = target_of_name(cpu, &element, drivers) {
+            return open_target(cpu, flags, p, t, String::new(), auto, parms);
+        }
+        match target_of_file(cpu, &element, drivers) {
+            Some(t) => t,
+            None if element.contains('.') => return Some(MCIERR_EXTENSION_NOT_FOUND),
+            None => return Some(MCIERR_INVALID_DEVICE_NAME),
         }
     } else {
-        return MCIERR_MISSING_PARAMETER;
+        return Some(MCIERR_MISSING_PARAMETER);
     };
-    open_kind(cpu, flags, p, kind, element, auto)
+    open_target(cpu, flags, p, target, element, auto, parms)
+}
+
+fn open_target(
+    cpu: &mut Cpu,
+    flags: u32,
+    p: &mut Parms,
+    target: Target,
+    element: String,
+    auto: bool,
+    parms: Option<u32>,
+) -> Option<u32> {
+    match target {
+        Target::Kind(kind) => Some(open_kind(cpu, flags, p, kind, element, auto)),
+        Target::Driver(name) => {
+            driver::open(cpu, flags, p, &name, element, auto, parms.unwrap_or(0))
+        }
+    }
 }
 
 fn open_kind(
@@ -656,6 +750,21 @@ pub fn mci_send_command(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
     let &[id, msg, flags, at] = args else {
         unreachable!()
     };
+    // A driver's device gets the command as it is (driver.rs), and "close
+    // all" closes the drivers' devices one after another: the call starts
+    // again when one is closed, until only built-in devices are left.
+    if msg != MCI_OPEN && msg != MCI_SYSINFO {
+        if is_all(id) && msg == MCI_CLOSE {
+            if let Some(i) = driver::first(cpu) {
+                let again = (super::api_address("mciSendCommandA"), cpu.esp());
+                return driver::command(cpu, i, msg, flags, at, again);
+            }
+        } else if let Some(i) = find(cpu, id)
+            && device(cpu, i).driver != 0
+        {
+            return driver::command(cpu, i, msg, flags, at, call::here(cpu));
+        }
+    }
     // The size of each command's parameters, and whether it can go
     // without them.
     let size: u32 = match msg {
@@ -704,8 +813,8 @@ pub fn mci_send_command(cpu: &mut Cpu, args: &[u32]) -> Option<u32> {
             if flags & MCI_OPEN_ALIAS != 0 {
                 p.alias = read_string(cpu, al, 128)?;
             }
-            let error = open(cpu, flags, &mut p, false);
-            if error == 0 {
+            let error = open_device(cpu, flags, &mut p, false, Some(at))?;
+            if error == 0 && p.ret_kind == Ret::Int {
                 cpu.bus.guest_write_32(at + 4, p.ret);
             }
             return Some(error);
@@ -872,7 +981,7 @@ pub fn poll(cpu: &mut Cpu, pid: u32, now: u64) {
     let mut i = 0;
     while i < mci(cpu).devices.len() {
         let d = &mci(cpu).devices[i];
-        if d.pid != pid {
+        if d.pid != pid || d.driver != 0 {
             i += 1;
             continue;
         }
@@ -900,7 +1009,7 @@ pub fn next_due(cpu: &Cpu, pid: Option<u32>) -> Option<u64> {
         .mci
         .devices
         .iter()
-        .filter(|d| pid.is_none_or(|p| d.pid == p))
+        .filter(|d| pid.is_none_or(|p| d.pid == p) && d.driver == 0)
         .filter_map(|d| match d.kind {
             MCI_DEVTYPE_CD_AUDIO => d.cd.end_at,
             MCI_DEVTYPE_SEQUENCER => sequencer::next_due(d),
@@ -916,6 +1025,7 @@ pub fn process_ended(cpu: &mut Cpu, pid: u32) {
         device(cpu, i).pending = None;
         close_device(cpu, i);
     }
+    driver::process_ended(cpu, pid);
 }
 
 pub use string::{mci_execute, mci_get_error_string, mci_send_string};
@@ -933,6 +1043,14 @@ crate::state_fields!(Device {
     yield_data,
     cd,
     seq,
-    wave
+    wave,
+    driver,
+    type_name,
+    private,
+    table,
+    opening,
+    block,
+    open_at,
+    open_flags
 });
-crate::state_fields!(Mci { devices });
+crate::state_fields!(Mci { devices, tables });

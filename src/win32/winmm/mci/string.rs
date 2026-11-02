@@ -658,7 +658,6 @@ fn auto_open(cpu: &mut Cpu, name: &str, msg: u32, flags: u32) -> Result<usize, u
     }
 }
 
-const MCIERR_INTERNAL: u32 = 277;
 const MCIERR_MISSING_DEVICE_NAME: u32 = 292;
 const MCIERR_DEVICE_TYPE_REQUIRED: u32 = 287;
 

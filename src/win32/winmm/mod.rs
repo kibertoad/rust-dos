@@ -268,6 +268,23 @@ static APIS: &[Api] = &[
     stdcall("sndPlaySoundA", 441, 2, wave::snd_play_sound_a),
     stdcall("PlaySoundW", 442, 3, wave::play_sound_w),
     stdcall("sndPlaySoundW", 443, 2, wave::play_sound_w),
+    // What MCI's installable drivers call (mci/driver.rs).
+    stdcall("mciGetDriverData", 310, 1, mci::driver::mci_get_driver_data),
+    stdcall("mciSetDriverData", 311, 2, mci::driver::mci_set_driver_data),
+    stdcall("mciDriverYield", 312, 1, mci::driver::mci_driver_yield),
+    stdcall("mciDriverNotify", 313, 3, mci::driver::mci_driver_notify),
+    stdcall(
+        "mciLoadCommandResource",
+        314,
+        3,
+        mci::driver::mci_load_command_resource,
+    ),
+    stdcall(
+        "mciFreeCommandResource",
+        315,
+        1,
+        mci::driver::mci_free_command_resource,
+    ),
 ];
 
 /// Where the multimedia thread starts (callback.rs).
@@ -276,6 +293,16 @@ pub fn mm_thread_address() -> u32 {
         .iter()
         .position(|a| a.name == "MmThread")
         .expect("MmThread");
+    super::stubs::stub_address(dll_index(), index)
+}
+
+/// The address of WINMM's function `name`, which a call that starts over
+/// goes back to.
+pub fn api_address(name: &str) -> u32 {
+    let index = APIS
+        .iter()
+        .position(|a| a.name == name)
+        .expect("a function of WINMM");
     super::stubs::stub_address(dll_index(), index)
 }
 

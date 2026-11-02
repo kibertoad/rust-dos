@@ -952,6 +952,13 @@ pub fn resource_data(
     module::resource_data(cpu, module, kind, name)
 }
 
+/// The data of the resource `name` ("#number" for a number) of type
+/// `kind` in the module `module` (0: the program): its address and
+/// size, or None when the module hasn't one.
+pub fn resource_named(cpu: &mut Cpu, module: u32, kind: u32, name: &str) -> Option<(u32, u32)> {
+    module::resource_named(cpu, module, kind, name)
+}
+
 /// GlobalAlloc(flags, size) for a built-in DLL (the clipboard's data):
 /// the handle, or 0.
 pub fn global_alloc(cpu: &mut Cpu, flags: u32, size: u32) -> u32 {
@@ -977,6 +984,12 @@ pub fn global_free(cpu: &mut Cpu, handle: u32) {
 /// ANSI text in Unicode, by the ANSI code page.
 pub fn ansi_to_wide(bytes: &[u8]) -> Vec<u16> {
     text::ansi_to_wide(bytes)
+}
+
+/// Unicode text in ANSI, by the ANSI code page: '?' for a character it
+/// doesn't have.
+pub fn wide_to_ansi(units: &[u16]) -> Vec<u8> {
+    text::wide_to_ansi(units)
 }
 
 /// lstrcmpiA's comparison of two ANSI strings, without their zeros.
